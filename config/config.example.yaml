@@ -1,0 +1,38 @@
+app:
+  selfId: "douyin_bot_001"
+  logLevel: "info"
+
+browser:
+  userDataDir: "./douyin-profile"
+  headless: false
+  douyinUrl: "https://www.douyin.com/"
+
+douyin:
+  messagePageUrl: "https://www.douyin.com/chat"
+  hookMode: "network"
+
+onebot:
+  accessToken: ""
+  http:
+    enabled: true
+    host: "127.0.0.1"
+    port: 3001
+    publicBaseUrl: "http://127.0.0.1:3001"
+  reverseWs:
+    enabled: false
+    url: "ws://127.0.0.1:6700/onebot/v11/ws"
+  forwardWs:
+    enabled: true
+    host: "127.0.0.1"
+    port: 3002
+  mediaCache:
+    dir: "./media-cache"
+    ttlMs: 3600000
+    cleanupIntervalMs: 600000
+    transcodeVideoToH264: true
+    ffmpegPath: "ffmpeg"
+
+runtime:
+  reconnectIntervalMs: 5000
+  actionTimeoutMs: 15000
+  heartbeatIntervalMs: 30000

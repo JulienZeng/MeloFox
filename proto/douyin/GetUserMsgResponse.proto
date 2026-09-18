@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+message GetUserMsgResponse {
+  int32 field1 = 1;
+  int32 field2 = 2;
+  int32 field3 = 3;
+  string status = 4;
+  int32 field5 = 5;
+  ResponseData data = 6;
+}
+
+message ResponseData {
+  MessageContainer container = 2048;
+}
+
+message MessageContainer {
+  MessageInfo message_info = 1;
+}
+
+message MessageInfo {
+  int64 message_id = 1;
+  MessageContent content = 2;
+}
+
+message MessageContent {
+  int64 content_id = 1;
+  ContentDetails details = 2;
+}
+
+message ContentDetails {
+  string identifier = 1;
+  int32 type = 2;
+  int64 timestamp = 3;
+  int64 create_time = 4;
+  int64 user_id = 5;
+  int32 status_code = 6;
+  int64 share_id = 7;
+  string json_data = 8;
+}

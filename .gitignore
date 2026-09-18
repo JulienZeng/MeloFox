@@ -1,0 +1,18 @@
+node_modules/
+dist/
+douyin-profile/
+.env
+*.log
+
+# docs files
+docs/
+
+# file system files
+.DS_Store
+
+# cache files
+*cache/
+
+# debug & develop files
+captures/
+
