@@ -23,6 +23,7 @@ export interface DouyinMessage {
   senderId: string;
   senderName?: string;
   messageType?: number;
+  clientMessageId?: string;
   content?: string;
   text?: string;
   segments?: Array<{
@@ -43,11 +44,30 @@ export interface DouyinSendTarget {
 export interface DouyinSendMessageInput {
   target: DouyinSendTarget;
   text: string;
+  images?: string[];
+  mentions?: DouyinOutgoingMention[];
+  replyToMessageId?: string;
+  emojiReaction?: DouyinEmojiReaction;
+  operatorUserId?: string;
 }
 
 export interface DouyinSendMessageResult {
   messageId: string;
   raw?: unknown;
+}
+
+export interface DouyinOutgoingMention {
+  userId: string;
+  name?: string;
+  location: number;
+  length: number;
+}
+
+export interface DouyinEmojiReaction {
+  key: string;
+  iconUrl?: string;
+  text?: string;
+  propertyValue?: string;
 }
 
 export interface DouyinGroupMember {

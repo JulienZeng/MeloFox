@@ -1,8 +1,26 @@
 import type { AppConfig } from '../config/index.js';
 import { listDouyinFriends, listDouyinGroupMembers, listDouyinGroups } from '../douyin/conversation.js';
 import type { DouyinBridge } from '../douyin/bridge.js';
-import { extractPlainText, textSegment } from './message-segment.js';
-import type { OneBotActionRequest, OneBotActionResponse, OneBotStatus } from './types.js';
+import { textSegment } from './message-segment.js';
+import type { OneBotActionRequest, OneBotActionResponse, OneBotMessageSegment, OneBotStatus } from './types.js';
+
+interface OutgoingMessage {
+  text: string;
+  images: string[];
+  mentions: Array<{
+    userId: string;
+    name?: string;
+    location: number;
+    length: number;
+  }>;
+  replyToMessageId?: string;
+  emojiReaction?: {
+    key: string;
+    iconUrl?: string;
+    text?: string;
+    propertyValue?: string;
+  };
+}
 
 export class OneBotActionRouter {
   constructor(
@@ -102,13 +120,18 @@ export class OneBotActionRouter {
 
   private async sendPrivateMsg(params: Record<string, unknown>): Promise<{ message_id: string }> {
     const userId = requireString(params, 'user_id');
-    const text = requireMessageText(params);
+    const message = requireOutgoingMessage(params);
     const result = await this.bridge.sendMessage({
       target: {
         type: 'private',
         userId
       },
-      text
+      text: message.text,
+      images: message.images,
+      mentions: message.mentions,
+      replyToMessageId: message.replyToMessageId,
+      emojiReaction: message.emojiReaction,
+      operatorUserId: this.config.app.selfId
     });
 
     return { message_id: result.messageId };
@@ -116,13 +139,18 @@ export class OneBotActionRouter {
 
   private async sendGroupMsg(params: Record<string, unknown>): Promise<{ message_id: string }> {
     const groupId = requireString(params, 'group_id');
-    const text = requireMessageText(params);
+    const message = requireOutgoingMessage(params);
     const result = await this.bridge.sendMessage({
       target: {
         type: 'group',
         conversationShortId: groupId
       },
-      text
+      text: message.text,
+      images: message.images,
+      mentions: message.mentions,
+      replyToMessageId: message.replyToMessageId,
+      emojiReaction: message.emojiReaction,
+      operatorUserId: this.config.app.selfId
     });
 
     return { message_id: result.messageId };
@@ -186,10 +214,152 @@ function requireString(params: unknown, key: string): string {
   return String(value);
 }
 
-function requireMessageText(params: Record<string, unknown>): string {
-  const text = extractPlainText(params.message);
-  if (!text) {
-    throw new Error('Only non-empty text messages are supported in the current Douyin bridge');
+function requireOutgoingMessage(params: Record<string, unknown>): OutgoingMessage {
+  const message = params.message;
+  if (typeof message === 'string') {
+    if (!message) {
+      throw new Error('Message must contain text or image');
+    }
+    return {
+      text: message,
+      images: [],
+      mentions: []
+    };
   }
-  return text;
+
+  if (!Array.isArray(message)) {
+    throw new Error('Message must be a string or OneBot message segment array');
+  }
+
+  const out: OutgoingMessage = {
+    text: '',
+    images: [],
+    mentions: []
+  };
+  const segments = message.filter(isMessageSegment);
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (!isMessageSegment(segment)) {
+      continue;
+    }
+
+    if (segment.type === 'text') {
+      out.text += String(segment.data.text ?? '');
+      continue;
+    }
+    if (segment.type === 'at') {
+      const userId = String(segment.data.qq ?? segment.data.user_id ?? segment.data.id ?? '');
+      if (!userId || userId === 'all') {
+        throw new Error(`Unsupported outgoing at target: ${userId || '(empty)'}`);
+      }
+
+      const name = String(segment.data.name ?? segment.data.nickname ?? userId);
+      const next = segments[index + 1];
+      const nextText = next?.type === 'text' ? String(next.data.text ?? '') : '';
+      const display = nextText.startsWith(' ') || nextText.startsWith('\u3000') ? `@${name}` : `@${name} `;
+      const location = out.text.length;
+      out.text += display;
+      out.mentions.push({
+        userId,
+        name,
+        location,
+        length: display.length
+      });
+      continue;
+    }
+    if (segment.type === 'image') {
+      const file = segment.data.file;
+      if (typeof file === 'string' && file) {
+        out.images.push(file);
+      }
+      continue;
+    }
+    if (segment.type === 'reply') {
+      const messageId = segment.data.id ?? segment.data.message_id;
+      if (messageId !== undefined && messageId !== null && messageId !== '') {
+        out.replyToMessageId = String(messageId);
+      }
+      continue;
+    }
+    if (segment.type === 'face' || segment.type === 'emoji') {
+      out.emojiReaction = resolveEmojiReaction(segment);
+      continue;
+    }
+
+    throw new Error(`Unsupported outgoing message segment: ${segment.type}`);
+  }
+
+  if (out.emojiReaction) {
+    if (!out.replyToMessageId) {
+      throw new Error('Emoji reaction must include a reply segment with target message id');
+    }
+    if (out.text || out.images.length > 0 || out.mentions.length > 0) {
+      throw new Error('Emoji reaction cannot be mixed with text, image, or at segments');
+    }
+    return out;
+  }
+
+  if (!out.text && out.images.length === 0) {
+    throw new Error('Message must contain text, image, or reply+face/emoji');
+  }
+  return out;
+}
+
+function resolveEmojiReaction(segment: OneBotMessageSegment): { key: string; iconUrl?: string; text?: string; propertyValue?: string } {
+  const customKey = stringValue(segment.data.key ?? segment.data.emoji_key);
+  const customIconUrl = stringValue(segment.data.icon_url ?? segment.data.iconUrl);
+  const customText = stringValue(segment.data.text ?? segment.data.name);
+  const customPropertyValue = stringValue(segment.data.value ?? segment.data.property_value ?? segment.data.propertyValue, true);
+  if (customKey && customPropertyValue !== undefined) {
+    return {
+      key: customKey.startsWith('e:') || customKey.startsWith('se:') ? customKey : `e:${customKey}`,
+      propertyValue: customPropertyValue
+    };
+  }
+  if (customKey && customIconUrl && customText) {
+    return {
+      key: customKey.startsWith('e:') || customKey.startsWith('se:') ? customKey : `e:${customKey}`,
+      iconUrl: customIconUrl,
+      text: customText
+    };
+  }
+
+  const id = String(segment.data.id ?? segment.data.face_id ?? segment.data.name ?? segment.data.text ?? '').trim();
+  const normalized = id.replace(/^e:/, '').toLowerCase();
+  if (['ok', '[ok]', '👌'].includes(normalized)) {
+    return {
+      key: 'se:[OK]',
+      propertyValue: ''
+    };
+  }
+
+  if (['love', 'heart', '爱心', '\u2764\ufe0f', '66'].includes(normalized)) {
+    return {
+      key: 'e:love',
+      iconUrl: 'https://p6.douyinpic.com/aweme-client-static-resource/single_msg_emoji_love_1588747335.png~tplv-obj.image',
+      text: '\u2764\ufe0f'
+    };
+  }
+
+  throw new Error(`Unsupported Douyin emoji reaction: ${id || '(empty)'}`);
+}
+
+function stringValue(value: unknown, allowEmpty = false): string | undefined {
+  if (typeof value === 'string' && (allowEmpty || value)) {
+    return value;
+  }
+  if (typeof value === 'number' || typeof value === 'bigint') {
+    return String(value);
+  }
+  return undefined;
+}
+
+function isMessageSegment(value: unknown): value is OneBotMessageSegment {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as OneBotMessageSegment).type === 'string' &&
+    typeof (value as OneBotMessageSegment).data === 'object' &&
+    (value as OneBotMessageSegment).data !== null
+  );
 }

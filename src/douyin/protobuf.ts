@@ -46,6 +46,7 @@ export interface RealtimeMessageCandidate {
   conversationShortId?: string;
   sender?: string;
   messageType?: number;
+  clientMessageId?: string;
   text?: string;
   content?: string;
   mediaUrl?: string;
@@ -233,12 +234,28 @@ function normalizeMessageBody(source: string, body: Record<string, unknown>): Re
     conversationShortId: stringValue(body.conversationShortId),
     sender: stringValue(body.sender),
     messageType: numberValue(body.messageType ?? body.contentType),
+    clientMessageId: extractEntityValue(body.ext, 's:client_message_id'),
     content,
     text: parseTextContent(content),
     createTime: stringValue(body.createTime),
     reference: normalizeReference(body.__douyinOneBotReference),
     raw: body
   };
+}
+
+function extractEntityValue(value: unknown, key: string): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  for (const item of value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    if (stringValue(item.key) === key) {
+      return stringValue(item.value);
+    }
+  }
+  return undefined;
 }
 
 function collectMessageDetails(source: string, value: unknown, out: RealtimeMessageCandidate[]): void {

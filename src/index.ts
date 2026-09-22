@@ -309,6 +309,7 @@ function toDouyinMessage(candidate: RealtimeMessageCandidate): DouyinMessage | u
     conversationType: candidate.conversationType === 2 ? 'group' : 'private',
     senderId: candidate.sender ?? 'unknown',
     messageType: candidate.messageType,
+    clientMessageId: candidate.clientMessageId,
     content: candidate.content,
     text,
     segments: buildMessageSegments(candidate, parsedContent, text),

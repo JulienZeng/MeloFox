@@ -58,8 +58,16 @@ export function extractPlainText(message: unknown): string {
 
   return message
     .filter((segment): segment is OneBotMessageSegment => {
-      return typeof segment === 'object' && segment !== null && (segment as OneBotMessageSegment).type === 'text';
+      return typeof segment === 'object' && segment !== null && typeof (segment as OneBotMessageSegment).type === 'string';
     })
-    .map(segment => String(segment.data.text ?? ''))
+    .map(segment => {
+      if (segment.type === 'text') {
+        return String(segment.data.text ?? '');
+      }
+      if (segment.type === 'at') {
+        return `@${segment.data.name ?? segment.data.qq ?? ''}`;
+      }
+      return '';
+    })
     .join('');
 }

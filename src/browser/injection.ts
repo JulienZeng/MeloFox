@@ -67,6 +67,13 @@ export async function installDouyinInjection(context: BrowserContext, logger: Ap
       return currentConversationRawTitle().replace(/\(\d+\)$/, '').trim() || 'douyin_active_conversation';
     }
 
+    function firstContentLine(value: string): string {
+      return value
+        .split('\n')
+        .map(line => line.trim())
+        .find(Boolean) ?? '';
+    }
+
     function inferConversationType(title: string): 'private' | 'group' {
       return /群|\(\d+\)$/.test(title) ? 'group' : 'private';
     }
@@ -151,9 +158,17 @@ export async function installDouyinInjection(context: BrowserContext, logger: Ap
     };
 
     bridgeWindow.__DOUYIN_ONEBOT_GET_CONVERSATIONS__ = () => {
+      const seen = new Set<string>();
       return Array.from(document.querySelectorAll('[class*="conversationConversationItemtitle"]'))
-        .map(element => textOf(element))
+        .map(element => firstContentLine(textOf(element)))
         .filter(Boolean)
+        .filter(title => {
+          if (seen.has(title)) {
+            return false;
+          }
+          seen.add(title);
+          return true;
+        })
         .map(title => ({
           id: title,
           shortId: title,

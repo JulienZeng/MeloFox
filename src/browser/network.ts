@@ -10,7 +10,9 @@ export interface NetworkEvent {
   resourceType?: string;
   size?: number;
   payloadPreview?: string;
+  payloadBase64?: string;
   contentType?: string;
+  headers?: Record<string, string>;
 }
 
 export class NetworkRecorder {
@@ -45,13 +47,21 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
       return;
     }
 
-    recorder.add({
-      type: 'request',
-      method: request.method(),
-      url: sanitizeUrl(url),
-      resourceType: request.resourceType(),
-      payloadPreview: request.postData()?.slice(0, 2_000)
-    });
+    void request
+      .allHeaders()
+      .catch(() => request.headers())
+      .then(headers => {
+        recorder.add({
+          type: 'request',
+          method: request.method(),
+          url: sanitizeUrl(url),
+          resourceType: request.resourceType(),
+          headers: sanitizeHeaders(headers),
+          payloadPreview: request.postData()?.slice(0, 2_000),
+          payloadBase64: request.postDataBuffer()?.subarray(0, 65_536).toString('base64'),
+          size: request.postDataBuffer()?.byteLength
+        });
+      });
   });
 
   page.on('response', response => {
@@ -66,7 +76,8 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
       url: sanitizeUrl(url)
     });
 
-    if (/imapi\.douyin\.com|batch_play_info/i.test(url)) {
+    const contentType = response.headers()['content-type'] ?? '';
+    if (shouldCaptureResponseBody(url, contentType)) {
       void response
         .body()
         .then(body => {
@@ -75,7 +86,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
             status: response.status(),
             url: sanitizeUrl(url),
             size: body.byteLength,
-            contentType: response.headers()['content-type'],
+            contentType,
             payloadPreview: body.subarray(0, 65_536).toString('base64')
           });
         })
@@ -153,6 +164,14 @@ function isInterestingUrl(url: string): boolean {
   return /douyin|zijieapi|byte|frontier|im|conversation|message|chat/i.test(url);
 }
 
+function shouldCaptureResponseBody(url: string, contentType: string): boolean {
+  if (/imapi\.douyin\.com|batch_play_info/i.test(url)) {
+    return true;
+  }
+
+  return /(?:json|protobuf|text|x-www-form-urlencoded)/i.test(contentType);
+}
+
 function sanitizeUrl(input: string): string {
   try {
     const url = new URL(input);
@@ -165,4 +184,20 @@ function sanitizeUrl(input: string): string {
   } catch {
     return input;
   }
+}
+
+function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
+  const safe: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (/^authorization$/i.test(key)) {
+      safe[key] = value
+        .replace(/Credential=([^/,]+)(\/[^,]+)?/i, (_match, _accessKey, scope) => `Credential=[redacted]${scope ?? ''}`)
+        .replace(/Signature=([0-9a-f]+)/i, 'Signature=[redacted]');
+    } else if (/token|cookie|x-security-token/i.test(key)) {
+      safe[key] = '[redacted]';
+    } else {
+      safe[key] = value;
+    }
+  }
+  return safe;
 }

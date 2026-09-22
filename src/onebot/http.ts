@@ -63,6 +63,76 @@ export async function startOneBotHttpServer(
     };
   });
 
+  server.get('/_debug/dom', async () => {
+    if (!browser) {
+      return {
+        ok: false,
+        message: 'Browser runtime is not attached'
+      };
+    }
+
+    return {
+      ok: true,
+      dom: await browser.inspectDom()
+    };
+  });
+
+  server.get('/_debug/messages', async () => {
+    if (!browser) {
+      return {
+        ok: false,
+        message: 'Browser runtime is not attached'
+      };
+    }
+
+    return {
+      ok: true,
+      dom: await browser.inspectMessages()
+    };
+  });
+
+  server.post('/_debug/reply-message-text', async (request: FastifyRequest<{ Body: { text?: string; reply?: string } }>) => {
+    if (!browser) {
+      return {
+        ok: false,
+        message: 'Browser runtime is not attached'
+      };
+    }
+
+    if (!request.body.text || !request.body.reply) {
+      return {
+        ok: false,
+        message: 'Missing text or reply'
+      };
+    }
+
+    return {
+      ok: true,
+      result: await browser.replyToMessageText(request.body.text, request.body.reply)
+    };
+  });
+
+  server.post('/_debug/message-controls', async (request: FastifyRequest<{ Body: { text?: string } }>) => {
+    if (!browser) {
+      return {
+        ok: false,
+        message: 'Browser runtime is not attached'
+      };
+    }
+
+    if (!request.body.text) {
+      return {
+        ok: false,
+        message: 'Missing text'
+      };
+    }
+
+    return {
+      ok: true,
+      result: await browser.inspectMessageControls(request.body.text)
+    };
+  });
+
   server.post('/_debug/navigate', async (request: FastifyRequest<{ Body: { url?: string } }>) => {
     if (!browser) {
       return {
@@ -105,6 +175,27 @@ export async function startOneBotHttpServer(
     };
   });
 
+  server.post('/_debug/send-image-dom', async (request: FastifyRequest<{ Body: { file?: string } }>) => {
+    if (!browser) {
+      return {
+        ok: false,
+        message: 'Browser runtime is not attached'
+      };
+    }
+
+    if (!request.body.file) {
+      return {
+        ok: false,
+        message: 'Missing file'
+      };
+    }
+
+    return {
+      ok: true,
+      result: await browser.sendImageFromFile(request.body.file)
+    };
+  });
+
   server.get('/_debug/network', async () => {
     if (!browser) {
       return {
@@ -116,6 +207,20 @@ export async function startOneBotHttpServer(
     return {
       ok: true,
       events: browser.listNetworkEvents()
+    };
+  });
+
+  server.get('/_debug/network/set-property', async () => {
+    if (!browser) {
+      return {
+        ok: false,
+        message: 'Browser runtime is not attached'
+      };
+    }
+
+    return {
+      ok: true,
+      events: browser.listSetPropertyNetworkEvents()
     };
   });
 
