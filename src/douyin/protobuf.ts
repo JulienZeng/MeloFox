@@ -50,6 +50,7 @@ export interface RealtimeMessageCandidate {
   text?: string;
   content?: string;
   mediaUrl?: string;
+  mediaUnavailable?: boolean;
   createTime?: string;
   reference?: RealtimeMessageReference;
   raw: unknown;
@@ -69,13 +70,13 @@ export async function decodeNetworkResponseBodies(events: NetworkEvent[]): Promi
   const responseBodies = events.filter(
     event =>
       (event.type === 'response_body' || event.type === 'ws_frame_received' || event.type === 'ws_frame_sent') &&
-      event.payloadPreview &&
+      (event.payloadBase64 || event.payloadPreview) &&
       event.contentType !== 'text/plain'
   );
   const decoded: DecodedNetworkEvent[] = [];
 
   for (const event of responseBodies) {
-    const buffer = Buffer.from(event.payloadPreview ?? '', 'base64');
+    const buffer = Buffer.from(event.payloadBase64 ?? event.payloadPreview ?? '', 'base64');
     const decodedEvent: DecodedNetworkEvent = {
       url: event.url,
       size: event.size,

@@ -19,6 +19,7 @@ export async function resolveDouyinVideoUrl(page: Page, tosKey: string): Promise
     const response = await fetch(`/aweme/v1/web/maya/story/batch_play_info/v1/?${query.toString()}`, {
       method: 'POST',
       credentials: 'include',
+      signal: AbortSignal.timeout(15000),
       headers: {
         'content-type': 'application/json'
       },

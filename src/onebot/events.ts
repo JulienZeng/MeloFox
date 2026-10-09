@@ -1,5 +1,5 @@
 import type { AppConfig } from '../config/index.js';
-import type { DouyinMessage } from '../douyin/types.js';
+import type { DouyinMessage, DouyinRecall } from '../douyin/types.js';
 import { textSegment } from './message-segment.js';
 import type { OneBotEvent, OneBotMessageSegment } from './types.js';
 
@@ -30,6 +30,19 @@ export function toOneBotMessageEvent(config: AppConfig, message: DouyinMessage):
 
 export function toOneBotMessageSegments(message: DouyinMessage): OneBotMessageSegment[] {
   return message.segments?.length ? message.segments : [textSegment(message.text ?? '')];
+}
+
+export function toOneBotRecallEvent(config: AppConfig, notice: DouyinRecall): OneBotEvent {
+  const isGroup = notice.conversationType === 'group';
+  return removeUndefined({
+    time: Math.floor(notice.timestamp / 1000), self_id: config.app.selfId,
+    post_type: 'notice', notice_type: isGroup ? 'group_recall' : 'friend_recall',
+    group_id: isGroup ? notice.conversationShortId : undefined,
+    user_id: isGroup ? notice.senderId : notice.peerUserId,
+    operator_id: notice.operatorId,
+    message_id: notice.messageId,
+    platform: 'douyin', raw_event: notice.raw
+  });
 }
 
 export function lifecycleEvent(config: AppConfig, subType: 'connect' | 'enable' | 'disable'): OneBotEvent {

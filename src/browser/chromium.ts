@@ -3,6 +3,7 @@ import { basename, extname } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import type { AppConfig } from '../config/index.js';
 import type { AppLogger } from '../logger/index.js';
+import { SessionCleanupError } from '../runtime/supervisor.js';
 import { installDouyinInjection } from './injection.js';
 import { attachNetworkDiagnostics, type NetworkEvent } from './network.js';
 
@@ -58,12 +59,17 @@ export interface BrowserRuntime {
     pageText?: string;
   }>;
   listNetworkEvents(): NetworkEvent[];
+  isImConnected(): boolean;
   listSetPropertyNetworkEvents(): NetworkEvent[];
   clearNetworkEvents(): void;
   stop(): Promise<void>;
 }
 
-export async function startBrowserRuntime(config: AppConfig, logger: AppLogger): Promise<BrowserRuntime> {
+export async function startBrowserRuntime(
+  config: AppConfig,
+  logger: AppLogger,
+  options: { onNetworkEvent?: (event: NetworkEvent) => void } = {}
+): Promise<BrowserRuntime> {
   logger.info(
     {
       userDataDir: config.browser.userDataDir,
@@ -74,21 +80,31 @@ export async function startBrowserRuntime(config: AppConfig, logger: AppLogger):
 
   const context = await chromium.launchPersistentContext(config.browser.userDataDir, {
     headless: config.browser.headless,
-    viewport: {
-      width: 1710,
-      height: 1112
-    },
-    screen: {
-      width: 1710,
-      height: 1112
-    },
-    args: ['--window-size=1710,1112', '--start-maximized']
+    viewport: config.browser.headless ? { width: 1710, height: 1112 } : null,
+    screen: config.browser.headless ? { width: 1710, height: 1112 } : undefined,
+    args: config.browser.headless ? ['--window-size=1710,1112'] : []
   });
 
+  try {
+    return await attachBrowserRuntime(context, config, logger, options);
+  } catch (error) {
+    try { await context.close(); } catch (cleanupError) {
+      throw new SessionCleanupError([error, cleanupError], 'Browser startup cleanup failed');
+    }
+    throw error;
+  }
+}
+
+async function attachBrowserRuntime(
+  context: BrowserContext,
+  config: AppConfig,
+  logger: AppLogger,
+  options: { onNetworkEvent?: (event: NetworkEvent) => void }
+): Promise<BrowserRuntime> {
   await installDouyinInjection(context, logger);
 
   const page = await context.newPage();
-  await page.setViewportSize({ width: 1710, height: 1112 }).catch(() => undefined);
+  if (!config.browser.headless) await fitBrowserWindow(context, page, logger);
   await page.bringToFront();
 
   await Promise.all(
@@ -99,6 +115,9 @@ export async function startBrowserRuntime(config: AppConfig, logger: AppLogger):
   );
 
   const networkRecorder = attachNetworkDiagnostics(page, logger);
+  const unsubscribe = options.onNetworkEvent
+    ? networkRecorder.subscribe(options.onNetworkEvent, error => logger.error({ error }, 'network event subscriber failed'))
+    : undefined;
 
   await page.goto(config.douyin.messagePageUrl, {
     waitUntil: 'domcontentloaded'
@@ -414,6 +433,9 @@ export async function startBrowserRuntime(config: AppConfig, logger: AppLogger):
     listNetworkEvents() {
       return networkRecorder.list();
     },
+    isImConnected() {
+      return networkRecorder.isImConnected();
+    },
     listSetPropertyNetworkEvents() {
       return networkRecorder.list().filter(event => /\/v1\/message\/set_property/i.test(event.url));
     },
@@ -421,9 +443,34 @@ export async function startBrowserRuntime(config: AppConfig, logger: AppLogger):
       networkRecorder.clear();
     },
     async stop() {
+      unsubscribe?.();
       await context.close();
     }
   };
+}
+
+async function fitBrowserWindow(context: BrowserContext, page: Page, logger: AppLogger): Promise<void> {
+  const session = await context.newCDPSession(page);
+  try {
+    const available = await page.evaluate(() => {
+      const screen = window.screen as Screen & { availLeft?: number; availTop?: number };
+      return { width: screen.availWidth, height: screen.availHeight, left: screen.availLeft ?? 0, top: screen.availTop ?? 0 };
+    });
+    const { windowId } = await session.send('Browser.getWindowForTarget');
+    await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+    await session.send('Browser.setWindowBounds', { windowId, bounds: {
+      left: available.left + 16,
+      top: available.top + 16,
+      width: Math.max(1, available.width - 32),
+      height: Math.max(1, available.height - 32)
+    } });
+    const { bounds } = await session.send('Browser.getWindowBounds', { windowId });
+    logger.info({ available, bounds }, 'headed browser window fitted to available screen; viewport follows window');
+  } catch (error) {
+    logger.warn({ error }, 'could not fit headed browser window to screen');
+  } finally {
+    await session.detach();
+  }
 }
 
 async function loadImageData(file: string): Promise<{ base64: string; mimeType: string; name: string }> {

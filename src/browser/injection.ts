@@ -7,8 +7,12 @@ declare global {
   }
 }
 
-export async function installDouyinInjection(context: BrowserContext, logger: AppLogger): Promise<void> {
-  await context.addInitScript(() => {
+export async function installDouyinInjection(context: BrowserContext, logger: AppLogger, enableDomCapture = false): Promise<void> {
+  if (!enableDomCapture) {
+    logger.info('DOM capture disabled; using Playwright network events');
+    return;
+  }
+  await context.addInitScript(enableDomCapture => {
     type DouyinOneBotMessage = {
       messageId: string;
       conversationId: string;
@@ -20,6 +24,8 @@ export async function installDouyinInjection(context: BrowserContext, logger: Ap
       timestamp: number;
       raw: unknown;
     };
+
+    if (!enableDomCapture) return;
 
     const NativeWebSocket = window.WebSocket;
 
@@ -187,7 +193,7 @@ export async function installDouyinInjection(context: BrowserContext, logger: Ap
     bridgeWindow.__DOUYIN_ONEBOT_READ_ACTIVE_CONVERSATION__ = () => currentConversationTitle();
 
     setInterval(installMessageObserver, 1000);
-  });
+  }, enableDomCapture);
 
   logger.info('installed douyin browser injection');
 }

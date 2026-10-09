@@ -1,4 +1,4 @@
-import type { Page, WebSocket } from 'playwright';
+import type { Page, Request, WebSocket } from 'playwright';
 import type { AppLogger } from '../logger/index.js';
 
 export interface NetworkEvent {
@@ -17,22 +17,47 @@ export interface NetworkEvent {
 
 export class NetworkRecorder {
   private readonly events: NetworkEvent[] = [];
+  private readonly imSockets = new Set<WebSocket>();
+  private readonly listeners = new Map<(event: NetworkEvent) => void, (error: unknown) => void>();
 
   constructor(private readonly limit = 500) {}
 
   add(event: Omit<NetworkEvent, 'time'>): void {
-    this.events.push({
+    const recorded = {
       time: Date.now(),
       ...event
-    });
+    };
+    this.events.push(recorded);
 
     if (this.events.length > this.limit) {
       this.events.splice(0, this.events.length - this.limit);
     }
+    for (const [listener, onError] of this.listeners) {
+      try { listener(recorded); } catch (error) { onError(error); }
+    }
+  }
+
+  subscribe(listener: (event: NetworkEvent) => void, onError: (error: unknown) => void = () => {}): () => void {
+    this.listeners.set(listener, onError);
+    return () => { this.listeners.delete(listener); };
   }
 
   list(): NetworkEvent[] {
     return [...this.events];
+  }
+
+  trackWebSocket(socket: WebSocket): void {
+    if (!socket.url().includes('frontier-im.douyin.com')) return;
+    this.imSockets.add(socket);
+    socket.on('close', () => this.imSockets.delete(socket));
+  }
+
+  isImConnected(): boolean {
+    return this.imSockets.size > 0;
+  }
+
+  resetImConnections(): void {
+    this.imSockets.clear();
   }
 
   clear(): void {
@@ -41,6 +66,21 @@ export class NetworkRecorder {
 }
 
 export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder = new NetworkRecorder()): NetworkRecorder {
+  let documentNavigation: Request | undefined;
+  page.on('request', request => {
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) documentNavigation = request;
+  });
+  page.on('requestfailed', request => {
+    if (request === documentNavigation) documentNavigation = undefined;
+  });
+  page.on('framenavigated', frame => {
+    if (frame !== page.mainFrame()) return;
+    // Document teardown may omit WS close events; same-document SPA navigation must keep live sockets.
+    if (documentNavigation || /^(?:about|data):/.test(frame.url())) {
+      documentNavigation = undefined;
+      recorder.resetImConnections();
+    }
+  });
   page.on('request', request => {
     const url = request.url();
     if (!isInterestingUrl(url)) {
@@ -58,7 +98,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
           resourceType: request.resourceType(),
           headers: sanitizeHeaders(headers),
           payloadPreview: request.postData()?.slice(0, 2_000),
-          payloadBase64: request.postDataBuffer()?.subarray(0, 65_536).toString('base64'),
+          payloadBase64: request.postDataBuffer()?.toString('base64'),
           size: request.postDataBuffer()?.byteLength
         });
       });
@@ -87,6 +127,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
             url: sanitizeUrl(url),
             size: body.byteLength,
             contentType,
+            payloadBase64: /imapi\.douyin\.com/.test(url) ? body.toString('base64') : undefined,
             payloadPreview: body.subarray(0, 65_536).toString('base64')
           });
         })
@@ -95,6 +136,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
   });
 
   page.on('websocket', (ws: WebSocket) => {
+    recorder.trackWebSocket(ws);
     const safeUrl = sanitizeUrl(ws.url());
     recorder.add({
       type: 'ws_open',
@@ -113,6 +155,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
         url: safeUrl,
         size: typeof frame.payload === 'string' ? frame.payload.length : frame.payload.byteLength,
         contentType: typeof frame.payload === 'string' ? 'text/plain' : 'application/octet-stream',
+        payloadBase64: typeof frame.payload === 'string' ? undefined : Buffer.from(frame.payload).toString('base64'),
         payloadPreview: payload
       });
 
@@ -135,6 +178,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
         url: safeUrl,
         size: typeof frame.payload === 'string' ? frame.payload.length : frame.payload.byteLength,
         contentType: typeof frame.payload === 'string' ? 'text/plain' : 'application/octet-stream',
+        payloadBase64: typeof frame.payload === 'string' ? undefined : Buffer.from(frame.payload).toString('base64'),
         payloadPreview: payload
       });
 

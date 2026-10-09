@@ -1,7 +1,8 @@
 import type { AppConfig } from '../config/index.js';
-import { listDouyinFriends, listDouyinGroupMembers, listDouyinGroups } from '../douyin/conversation.js';
+import { listDouyinGroupMembers, listDouyinGroups } from '../douyin/conversation.js';
 import type { DouyinBridge } from '../douyin/bridge.js';
-import { textSegment } from './message-segment.js';
+import type { MediaRegistry } from '../media/registry.js';
+import { toOneBotMessageEvent } from './events.js';
 import type { OneBotActionRequest, OneBotActionResponse, OneBotMessageSegment, OneBotStatus } from './types.js';
 
 interface OutgoingMessage {
@@ -25,7 +26,8 @@ interface OutgoingMessage {
 export class OneBotActionRouter {
   constructor(
     private readonly config: AppConfig,
-    private readonly bridge: DouyinBridge
+    private readonly bridge: DouyinBridge,
+    private readonly mediaRegistry?: MediaRegistry
   ) {}
 
   async handle(request: OneBotActionRequest): Promise<OneBotActionResponse> {
@@ -49,37 +51,59 @@ export class OneBotActionRouter {
       case 'get_msg':
         return this.getMsg(request.params ?? {});
       case 'delete_msg':
-        throw unsupported('delete_msg is not supported until a reliable Douyin revoke entry is found');
-      case 'get_login_info':
+        await this.bridge.recallMessage(requireString(request.params, 'message_id'));
+        return null;
+      case 'get_login_info': {
+        const user = await this.bridge.getLoginInfo();
+        this.config.app.selfId = user.id;
         return {
-          user_id: this.config.app.selfId,
-          nickname: 'Douyin OneBot'
+          user_id: user.id,
+          nickname: user.name ?? ''
         };
+      }
       case 'get_friend_list':
-        return (await listDouyinFriends(this.bridge)).map(item => ({
+        return (await this.bridge.getFriends()).map(item => ({
           user_id: item.id,
           nickname: item.name ?? item.id,
           remark: item.name ?? ''
         }));
+      case 'get_stranger_info': {
+        const user = await this.bridge.getUser(requireString(request.params, 'user_id'), request.params?.no_cache === true);
+        return {
+          user_id: user.id,
+          nickname: user.name ?? user.id,
+          sex: 'unknown',
+          age: 0
+        };
+      }
       case 'get_group_list':
         return (await listDouyinGroups(this.bridge)).map(item => ({
           group_id: item.shortId ?? item.id,
           group_name: item.name ?? item.shortId ?? item.id,
           member_count: item.memberCount ?? 0,
-          max_member_count: 0
+          max_member_count: item.maxMemberCount ?? 0
         }));
+      case 'get_group_info': {
+        const group = await this.bridge.getGroupInfo(requireString(request.params, 'group_id'));
+        return {
+          group_id: group.shortId ?? group.id,
+          group_name: group.name ?? '',
+          member_count: group.memberCount ?? 0,
+          max_member_count: group.maxMemberCount ?? 0
+        };
+      }
       case 'get_group_member_list':
         return (await listDouyinGroupMembers(this.bridge, requireString(request.params, 'group_id'))).map(item => ({
           group_id: item.groupId,
           user_id: item.userId,
           nickname: item.nickname ?? item.userId,
-          card: item.card ?? item.nickname ?? '',
-          role: 'member'
+          card: item.card ?? '',
+          role: item.role ?? 'member'
         }));
       case 'get_group_member_info': {
         const groupId = requireString(request.params, 'group_id');
         const userId = requireString(request.params, 'user_id');
-        const members = await listDouyinGroupMembers(this.bridge, groupId);
+        const members = await this.bridge.getGroupMembers(groupId, request.params?.no_cache === true);
         const member = members.find(item => item.userId === userId);
         if (!member) {
           throw new Error(`Group member not found: ${groupId}/${userId}`);
@@ -88,15 +112,23 @@ export class OneBotActionRouter {
           group_id: member.groupId,
           user_id: member.userId,
           nickname: member.nickname ?? member.userId,
-          card: member.card ?? member.nickname ?? '',
-          role: 'member'
+          card: member.card ?? '',
+          role: member.role ?? 'member'
         };
       }
       case 'get_status':
-        return {
-          online: true,
-          good: true
-        } satisfies OneBotStatus;
+        return this.bridge.getStatus() satisfies OneBotStatus;
+      case 'can_send_image':
+        return { yes: true };
+      case 'can_send_record':
+        return { yes: false };
+      case 'get_image':
+        if (!this.mediaRegistry) throw new Error('Media cache is not available');
+        return this.mediaRegistry.getImage(requireString(request.params, 'file'));
+      case 'clean_cache':
+        if (!this.mediaRegistry) throw new Error('Media cache is not available');
+        await this.mediaRegistry.cleanCache();
+        return null;
       case 'get_version_info':
         return {
           app_name: 'douyin-onebot',
@@ -164,15 +196,8 @@ export class OneBotActionRouter {
     }
 
     return {
-      message_id: cached.messageId,
-      real_id: cached.messageId,
-      sender: {
-        user_id: cached.senderId,
-        nickname: cached.senderName ?? ''
-      },
-      time: Math.floor(cached.timestamp / 1000),
-      message: cached.segments?.length ? cached.segments : [textSegment(cached.text ?? '')],
-      raw_message: cached.text ?? ''
+      ...toOneBotMessageEvent(this.config, cached),
+      real_id: cached.messageId
     };
   }
 }

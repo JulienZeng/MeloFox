@@ -19,6 +19,8 @@ export interface DouyinSendProtocolContext {
 }
 
 export interface BuildTextSendRequestInput {
+  conversationId?: string;
+  inboxType?: number;
   conversationShortId: string;
   conversationType: 1 | 2;
   text: string;
@@ -30,6 +32,8 @@ export interface BuildTextSendRequestInput {
 }
 
 export interface BuildEmojiReactionRequestInput {
+  conversationId?: string;
+  inboxType?: number;
   conversationShortId: string;
   conversationType: 1 | 2;
   targetMessageId: string;
@@ -46,6 +50,8 @@ export interface BuildEmojiReactionRequestInput {
 }
 
 export interface BuildImageSendRequestInput {
+  conversationId?: string;
+  inboxType?: number;
   conversationShortId: string;
   conversationType: 1 | 2;
   image: DouyinUploadedImage;
@@ -84,6 +90,45 @@ export interface DecodedSendResponse {
   rawBase64: string;
 }
 
+export function buildImApiRequest(command: number, payload: Buffer, context: DouyinSendProtocolContext, inboxType = 0): Buffer {
+  const envelope = new ProtoWriter()
+    .uint32(1, command)
+    .uint32(2, nextSequenceId())
+    .string(3, '0.1.8')
+    .string(4, '')
+    .uint32(5, 3)
+    .uint32(6, inboxType)
+    .string(7, '0d50935:feat/pc-im-group')
+    .bytes(8, new ProtoWriter().bytes(command, payload).finish())
+    .string(9, '0')
+    .string(11, 'douyin_pc')
+    .string(14, '360000');
+  for (const [key, value] of buildCommonHeaders(context)) {
+    envelope.bytes(15, encodeKeyValue(key, value));
+  }
+  return envelope.uint32(18, 1).string(21, 'douyin_web').string(22, 'web_sdk').finish();
+}
+
+export function buildRecallRequest(input: {
+  conversationId: string;
+  conversationShortId: string;
+  conversationType: 1 | 2;
+  messageId: string;
+  context: DouyinSendProtocolContext;
+}): Buffer {
+  for (const id of [input.conversationShortId, input.messageId]) {
+    if (!/^[1-9]\d*$/.test(id) || BigInt(id) > 9223372036854775807n) throw new Error('Recall requires a valid numeric server message/conversation ID');
+  }
+  const payload = new ProtoWriter()
+    .string(1, input.conversationId)
+    .uint64(2, input.conversationShortId)
+    .uint32(3, input.conversationType)
+    .uint64(4, input.messageId)
+    .finish();
+  // Both captured private and group web recalls use inbox zero, unlike incoming notifications.
+  return buildImApiRequest(702, payload, input.context, 0);
+}
+
 export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: Buffer; clientMessageId: string } {
   const clientMessageId = input.clientMessageId ?? randomUUID();
   const content = buildTextContent(input.text, input.mentions ?? [], input.conversationShortId, Boolean(input.replyReference));
@@ -91,7 +136,7 @@ export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: 
   const stime = `${Date.now()}.${Math.floor(Math.random() * 10_000)}`;
 
   const sendBody = new ProtoWriter()
-    .string(1, input.conversationShortId)
+    .string(1, input.conversationId ?? input.conversationShortId)
     .uint32(2, input.conversationType)
     .uint64(3, input.conversationShortId)
     .string(4, JSON.stringify(content))
@@ -115,7 +160,7 @@ export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: 
     .string(3, '0.1.8')
     .string(4, '')
     .uint32(5, 3)
-    .uint32(6, 0)
+    .uint32(6, input.inboxType ?? 0)
     .string(7, '0d50935:feat/pc-im-group')
     .bytes(8, bodyWrapper)
     .string(9, '0')
@@ -151,7 +196,7 @@ export function buildEmojiReactionRequest(input: BuildEmojiReactionRequestInput)
     .finish();
 
   const body = new ProtoWriter()
-    .string(1, input.conversationShortId)
+    .string(1, input.conversationId ?? input.conversationShortId)
     .uint32(2, input.conversationType)
     .uint64(3, input.conversationShortId)
     .uint64(4, input.targetMessageId)
@@ -171,7 +216,7 @@ export function buildEmojiReactionRequest(input: BuildEmojiReactionRequestInput)
     .string(3, '0.1.8')
     .string(4, '')
     .uint32(5, 3)
-    .uint32(6, 0)
+    .uint32(6, input.inboxType ?? 0)
     .string(7, '0d50935:feat/pc-im-group')
     .bytes(8, bodyWrapper)
     .string(9, '0')
@@ -207,7 +252,7 @@ export function buildImageSendRequest(input: BuildImageSendRequestInput): { body
   const stime = `${Date.now()}.${Math.floor(Math.random() * 10_000)}`;
 
   const sendPayload = new ProtoWriter()
-    .string(1, input.conversationShortId)
+    .string(1, input.conversationId ?? input.conversationShortId)
     .uint32(2, input.conversationType)
     .uint64(3, input.conversationShortId)
     .string(4, JSON.stringify(content))
@@ -226,7 +271,7 @@ export function buildImageSendRequest(input: BuildImageSendRequestInput): { body
     .string(3, '0.1.8')
     .string(4, '')
     .uint32(5, 3)
-    .uint32(6, 0)
+    .uint32(6, input.inboxType ?? 0)
     .string(7, '0d50935:feat/pc-im-group')
     .bytes(8, bodyWrapper)
     .string(9, '0')

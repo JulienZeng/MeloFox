@@ -36,3 +36,7 @@ runtime:
   reconnectIntervalMs: 5000
   actionTimeoutMs: 15000
   heartbeatIntervalMs: 30000
+  sessionCheckIntervalMs: 30000
+  imDisconnectGraceMs: 60000
+  messageCacheLimit: 10000
+  messageCacheTtlMs: 86400000

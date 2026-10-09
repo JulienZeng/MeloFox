@@ -4,6 +4,7 @@ export interface DouyinUser {
   id: string;
   name?: string;
   avatar?: string;
+  secUid?: string;
 }
 
 export interface DouyinConversation {
@@ -12,6 +13,11 @@ export interface DouyinConversation {
   type: DouyinConversationType;
   name?: string;
   memberCount?: number;
+  maxMemberCount?: number;
+  peerUserId?: string;
+  inboxType?: number;
+  ownerId?: string;
+  participants?: DouyinGroupMember[];
   raw?: unknown;
 }
 
@@ -39,6 +45,19 @@ export interface DouyinSendTarget {
   conversationShortId?: string;
   userId?: string;
   type: DouyinConversationType;
+  inboxType?: number;
+}
+
+export interface DouyinRecall {
+  messageId: string;
+  conversationId: string;
+  conversationShortId: string;
+  conversationType: DouyinConversationType;
+  senderId?: string;
+  peerUserId?: string;
+  operatorId: string;
+  timestamp: number;
+  raw: unknown;
 }
 
 export interface DouyinSendMessageInput {
@@ -75,5 +94,7 @@ export interface DouyinGroupMember {
   userId: string;
   nickname?: string;
   card?: string;
+  secUid?: string;
+  role?: 'owner' | 'admin' | 'member';
   raw?: unknown;
 }

@@ -3,9 +3,11 @@ import type { BrowserRuntime } from '../browser/chromium.js';
 import type { AppConfig } from '../config/index.js';
 import { decodeNetworkResponseBodies, extractRealtimeMessageCandidates } from '../douyin/protobuf.js';
 import type { AppLogger } from '../logger/index.js';
+import type { RealtimeMessageProcessor } from '../douyin/realtime.js';
 import type { MediaRegistry } from '../media/registry.js';
 import type { OneBotActionRouter } from './actions.js';
 import type { OneBotActionRequest } from './types.js';
+import { parseOneBotJson, stringifyOneBotJson } from './json.js';
 
 export interface HttpServerRuntime {
   server: FastifyInstance;
@@ -17,9 +19,19 @@ export async function startOneBotHttpServer(
   logger: AppLogger,
   router: OneBotActionRouter,
   browser?: BrowserRuntime,
-  mediaRegistry?: MediaRegistry
+  mediaRegistry?: MediaRegistry,
+  realtime?: RealtimeMessageProcessor
 ): Promise<HttpServerRuntime> {
   const server = Fastify();
+  server.removeContentTypeParser('application/json');
+  server.addContentTypeParser('application/json', { parseAs: 'string' }, (_request, body, done) => {
+    try {
+      done(null, parseOneBotJson(String(body)));
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      done(Object.assign(failure, { statusCode: 400 }), undefined);
+    }
+  });
 
   server.addHook('preHandler', async (request, reply) => {
     if (!request.url.startsWith('/media/') && !isAuthorized(config, request)) {
@@ -35,6 +47,11 @@ export async function startOneBotHttpServer(
   server.get('/health', async () => ({
     ok: true,
     app: 'douyin-onebot'
+  }));
+
+  server.get('/_debug/realtime', async () => ({
+    ok: Boolean(realtime),
+    realtime: realtime?.getStats()
   }));
 
   server.get('/media/:id', async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
@@ -266,15 +283,15 @@ export async function startOneBotHttpServer(
     };
   });
 
-  server.post('/', async (request: FastifyRequest<{ Body: OneBotActionRequest }>) => {
-    return router.handle(request.body);
+  server.post('/', async (request: FastifyRequest<{ Body: OneBotActionRequest }>, reply) => {
+    return reply.serializer(stringifyOneBotJson).send(await router.handle(request.body));
   });
 
-  server.post('/:action', async (request: FastifyRequest<{ Params: { action: string }; Body: Record<string, unknown> }>) => {
-    return router.handle({
+  server.post('/:action', async (request: FastifyRequest<{ Params: { action: string }; Body: Record<string, unknown> }>, reply) => {
+    return reply.serializer(stringifyOneBotJson).send(await router.handle({
       action: request.params.action,
       params: request.body
-    });
+    }));
   });
 
   await server.listen({

@@ -3,7 +3,9 @@ import type { IncomingMessage } from 'node:http';
 import type { AppConfig } from '../config/index.js';
 import type { AppLogger } from '../logger/index.js';
 import type { OneBotActionRouter } from './actions.js';
-import type { OneBotEvent } from './types.js';
+import type { OneBotActionRequest, OneBotEvent } from './types.js';
+import { lifecycleEvent } from './events.js';
+import { parseOneBotJson, stringifyOneBotJson } from './json.js';
 
 export interface OneBotWebSocketRuntime {
   emit(event: OneBotEvent): void;
@@ -15,6 +17,8 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   private readonly servers: WebSocketServer[] = [];
   private reverseSocket?: WebSocket;
   private reverseReconnectTimer?: NodeJS.Timeout;
+  private stopped = true;
+  private stopPromise?: Promise<void>;
 
   constructor(
     private readonly config: AppConfig,
@@ -23,6 +27,8 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   ) {}
 
   async start(): Promise<void> {
+    this.stopped = false;
+    this.stopPromise = undefined;
     if (this.config.onebot.forwardWs.enabled) {
       await this.startForwardServer();
     }
@@ -36,18 +42,24 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     this.broadcast(event);
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopped = true;
     if (this.reverseReconnectTimer) {
       clearTimeout(this.reverseReconnectTimer);
+      this.reverseReconnectTimer = undefined;
     }
-
-    this.reverseSocket?.close();
-
-    for (const client of this.clients) {
-      client.close();
+    const sockets = new Set(this.clients);
+    for (const server of this.servers) {
+      for (const socket of server.clients) sockets.add(socket);
     }
-
-    await Promise.all(this.servers.map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+    if (this.reverseSocket) sockets.add(this.reverseSocket);
+    this.reverseSocket = undefined;
+    this.stopPromise = Promise.all([
+      ...Array.from(sockets, socket => this.closeSocket(socket)),
+      ...this.servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve())))
+    ]).then(() => { this.clients.clear(); });
+    return this.stopPromise;
   }
 
   private async startForwardServer(): Promise<void> {
@@ -57,6 +69,8 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     });
 
     server.on('connection', (socket, request) => {
+      socket.on('error', error => this.logger.warn({ error }, 'onebot forward websocket error'));
+      if (this.stopped) { socket.terminate(); return; }
       if (!this.isAuthorized(request)) {
         socket.close(1008, 'Unauthorized');
         return;
@@ -65,6 +79,13 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
       this.addClient(socket, 'forward websocket client connected');
     });
 
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => { server.off('listening', onListening); reject(error); };
+      const onListening = () => { server.off('error', onError); resolve(); };
+      server.once('error', onError);
+      server.once('listening', onListening);
+    });
+    server.on('error', error => this.logger.warn({ error }, 'onebot forward websocket server error'));
     this.servers.push(server);
     this.logger.info(
       {
@@ -76,24 +97,31 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   }
 
   private connectReverseWebSocket(): void {
+    if (this.stopped) return;
     const socket = new WebSocket(this.config.onebot.reverseWs.url, {
-      headers: this.config.onebot.accessToken
-        ? {
-            Authorization: `Bearer ${this.config.onebot.accessToken}`
-          }
-        : undefined
+      headers: {
+        'X-Self-ID': this.config.app.selfId,
+        'X-Client-Role': 'Universal',
+        ...(this.config.onebot.accessToken ? { Authorization: `Bearer ${this.config.onebot.accessToken}` } : {})
+      }
     });
 
     this.reverseSocket = socket;
 
     socket.on('open', () => {
+      if (this.stopped) { socket.close(); return; }
       this.addClient(socket, 'onebot reverse websocket connected');
     });
 
     socket.on('close', () => {
       this.clients.delete(socket);
+      if (this.reverseSocket === socket) this.reverseSocket = undefined;
+      if (this.stopped) return;
       this.logger.warn('onebot reverse websocket closed');
-      this.reverseReconnectTimer = setTimeout(() => this.connectReverseWebSocket(), this.config.runtime.reconnectIntervalMs);
+      this.reverseReconnectTimer = setTimeout(() => {
+        this.reverseReconnectTimer = undefined;
+        this.connectReverseWebSocket();
+      }, this.config.runtime.reconnectIntervalMs);
     });
 
     socket.on('error', error => {
@@ -112,34 +140,47 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     socket.on('close', () => {
       this.clients.delete(socket);
     });
+    this.send(socket, lifecycleEvent(this.config, 'connect'));
   }
 
   private async handleMessage(socket: WebSocket, payload: string): Promise<void> {
     try {
-      const request = JSON.parse(payload);
+      const request = parseOneBotJson(payload) as OneBotActionRequest;
       const response = await this.router.handle(request);
-      socket.send(JSON.stringify(response));
+      this.send(socket, response);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      socket.send(
-        JSON.stringify({
-          status: 'failed',
-          retcode: 10003,
-          data: null,
-          message,
-          wording: message
-        })
-      );
+      this.send(socket, {
+        status: 'failed',
+        retcode: 10003,
+        data: null,
+        message,
+        wording: message
+      });
     }
   }
 
   private broadcast(event: OneBotEvent): void {
-    const payload = JSON.stringify(event);
     for (const client of this.clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(payload);
-      }
+      this.send(client, event);
     }
+  }
+
+  private send(socket: WebSocket, value: unknown): void {
+    if (this.stopped || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(stringifyOneBotJson(value), error => {
+      if (error) this.logger.warn({ error }, 'onebot websocket send failed');
+    });
+  }
+
+  private closeSocket(socket: WebSocket): Promise<void> {
+    if (socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+    return new Promise(resolve => {
+      const timer = setTimeout(() => socket.terminate(), 1000);
+      socket.once('close', () => { clearTimeout(timer); resolve(); });
+      if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+      else socket.close();
+    });
   }
 
   private isAuthorized(request: IncomingMessage): boolean {
