@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import type { BrowserRuntime } from '../browser/chromium.js';
+import type { DouyinBridge } from '../douyin/bridge.js';
 import type { AppConfig } from '../config/index.js';
 import { decodeNetworkResponseBodies, extractRealtimeMessageCandidates } from '../douyin/protobuf.js';
 import type { AppLogger } from '../logger/index.js';
@@ -20,7 +21,8 @@ export async function startOneBotHttpServer(
   router: OneBotActionRouter,
   browser?: BrowserRuntime,
   mediaRegistry?: MediaRegistry,
-  realtime?: RealtimeMessageProcessor
+  realtime?: RealtimeMessageProcessor,
+  bridge?: DouyinBridge
 ): Promise<HttpServerRuntime> {
   const server = Fastify();
   server.removeContentTypeParser('application/json');
@@ -52,6 +54,11 @@ export async function startOneBotHttpServer(
   server.get('/_debug/realtime', async () => ({
     ok: Boolean(realtime),
     realtime: realtime?.getStats()
+  }));
+
+  server.get('/_debug/cache', async () => ({
+    messages: bridge?.getCacheStats(),
+    media: await mediaRegistry?.getStats()
   }));
 
   server.get('/media/:id', async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {

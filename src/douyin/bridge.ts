@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import type { Page } from 'playwright';
 import type { AppLogger } from '../logger/index.js';
-import { BoundedCache } from '../runtime/bounded-cache.js';
+import { RetainedCache } from '../runtime/retained-cache.js';
 import { ActionDeadline } from '../runtime/deadline.js';
 import { DouyinDirectory, decodeDirectoryResponse, encodeDirectoryPayload } from './directory.js';
 import { postImApi } from './im-client.js';
@@ -32,17 +32,19 @@ import type {
 export type DouyinMessageHandler = (message: DouyinMessage) => void | Promise<void>;
 
 export interface DouyinBridgeCache {
-  messages: BoundedCache<DouyinMessage>;
-  sentClientMessageIds: BoundedCache<string>;
-  sentTargets: BoundedCache<{ target: DouyinSendTarget; senderId: string }>;
-  recalls: BoundedCache<{ notice: DouyinRecall; emitted: boolean }>;
+  messages: RetainedCache<DouyinMessage>;
+  sentClientMessageIds: RetainedCache<string>;
+  sentTargets: RetainedCache<{ target: DouyinSendTarget; senderId: string }>;
+  recalls: RetainedCache<{ notice: DouyinRecall; emitted: boolean }>;
   accountId?: string;
+  restored?: boolean;
+  persist?: () => Promise<void>;
 }
 
-export function createDouyinBridgeCache(limit = 10000, ttlMs = 86400000): DouyinBridgeCache {
+export function createDouyinBridgeCache(limit = 10000, ttlMs = 7 * 86400000): DouyinBridgeCache {
   return {
-    messages: new BoundedCache(limit, ttlMs), sentClientMessageIds: new BoundedCache(limit, ttlMs),
-    sentTargets: new BoundedCache(limit, ttlMs), recalls: new BoundedCache(limit, ttlMs)
+    messages: new RetainedCache(limit, ttlMs, message => message.timestamp), sentClientMessageIds: new RetainedCache(limit, ttlMs),
+    sentTargets: new RetainedCache(limit, ttlMs), recalls: new RetainedCache(limit, ttlMs, state => state.notice.timestamp)
   };
 }
 
@@ -62,8 +64,8 @@ export class DouyinBridge {
   private readonly recallHandlers = new Set<(notice: DouyinRecall) => void | Promise<void>>();
   private readonly recalling = new Map<string, Promise<void>>();
   private readonly ingestingRecalls = new Map<string, Promise<void>>();
-  private readonly messageCache: BoundedCache<DouyinMessage>;
-  private readonly sentClientMessageIds: BoundedCache<string>;
+  private readonly messageCache: RetainedCache<DouyinMessage>;
+  private readonly sentClientMessageIds: RetainedCache<string>;
   private currentUserId: string | undefined;
   private readonly directory: DouyinDirectory;
   private readonly cache: DouyinBridgeCache;
@@ -118,8 +120,20 @@ export class DouyinBridge {
 
   getCachedMessage(messageId: string): DouyinMessage | undefined {
     this.synchronizeCacheAccount();
+    if (this.cache.restored) return undefined;
     if (this.cache.recalls.get(messageId)) return undefined;
-    return this.messageCache.get(messageId);
+    const message = this.messageCache.get(messageId);
+    const callbackStatus = message ? messageCallbackStatus(message) : undefined;
+    return callbackStatus !== undefined && callbackStatus !== 0 ? undefined : message;
+  }
+
+  getCacheStats(): { messages: number; sendReceipts: number; recalls: number;
+    retainedMessages: number; retainedSendReceipts: number; retainedRecalls: number; awaitingAccountVerification: boolean } {
+    this.synchronizeCacheAccount();
+    return { messages: this.cache.messages.size, sendReceipts: this.cache.sentTargets.size,
+      recalls: this.cache.recalls.size, retainedMessages: this.cache.messages.retainedSize,
+      retainedSendReceipts: this.cache.sentTargets.retainedSize, retainedRecalls: this.cache.recalls.retainedSize,
+      awaitingAccountVerification: Boolean(this.cache.restored) };
   }
 
   onRecall(handler: (notice: DouyinRecall) => void | Promise<void>): void {
@@ -147,12 +161,17 @@ export class DouyinBridge {
       peerUserId: peerUserId ?? sent?.target.userId ?? notice.peerUserId };
     const state = { notice, emitted: false };
     this.cache.recalls.set(notice.messageId, state);
+    this.messageCache.delete(notice.messageId);
+    this.cache.sentTargets.delete(notice.messageId);
+    await this.cache.persist?.();
     if (!notice.senderId || (notice.conversationType === 'private' && !notice.peerUserId)) {
       this.logger.warn({ messageId: notice.messageId }, 'recall author or peer is unknown; suppressing incomplete notice');
       return;
     }
     for (const handler of this.recallHandlers) await handler(notice);
     state.emitted = true;
+    this.cache.recalls.set(notice.messageId, state);
+    await this.cache.persist?.();
     this.logger.info({ messageId: notice.messageId, operatorId: notice.operatorId, conversationType: notice.conversationType }, 'received douyin recall');
   }
 
@@ -175,7 +194,7 @@ export class DouyinBridge {
       if (!this.accountId) throw new Error('Douyin account is not authenticated');
       if (!senderId) throw new Error(`Cannot recall message outside the realtime/send cache: ${messageId}`);
       if (senderId !== this.accountId) throw new Error('Recalling another user\'s message is not supported');
-      if (recalled) return;
+      if (recalled) { await this.cache.persist?.(); return; }
       const target: DouyinSendTarget | undefined = original ? {
         type: original.conversationType, conversationId: original.conversationId, conversationShortId: original.conversationShortId
       } : sent?.target;
@@ -193,6 +212,9 @@ export class DouyinBridge {
         conversationShortId: target.conversationShortId, conversationType: target.type, peerUserId: target.userId,
         timestamp: Date.now(), raw: { source: 'imapi', response: decoded }
       } });
+      this.messageCache.delete(messageId);
+      this.cache.sentTargets.delete(messageId);
+      await this.cache.persist?.();
       this.logger.info({ messageId, conversationId: target.conversationId }, 'recalled own douyin message through imapi');
     });
   }
@@ -248,7 +270,7 @@ export class DouyinBridge {
 
       const decoded = await this.postImProtobuf('message/send', request.body, deadline);
       if (!decoded.ok) {
-        throw new Error(`Douyin image message/send failed: ${decoded.status ?? decoded.statusCode ?? 'unknown'}`);
+        throw new Error(`Douyin image message/send failed: ${decoded.failureReason ?? decoded.status ?? decoded.statusCode ?? 'unknown'}`);
       }
 
       const messageId = decoded.serverMessageId ?? decoded.clientMessageId ?? request.clientMessageId;
@@ -306,7 +328,7 @@ export class DouyinBridge {
 
     const decoded = await this.postImProtobuf('message/send', request.body, deadline);
     if (!decoded.ok) {
-      throw new Error(`Douyin message/send failed: ${decoded.status ?? decoded.statusCode ?? 'unknown'}`);
+      throw new Error(`Douyin message/send failed: ${decoded.failureReason ?? decoded.status ?? decoded.statusCode ?? 'unknown'}`);
     }
 
     const messageId = decoded.serverMessageId ?? decoded.clientMessageId ?? request.clientMessageId;
@@ -333,7 +355,10 @@ export class DouyinBridge {
 
   private async postImProtobuf(endpoint: 'message/send' | 'message/set_property', body: Buffer, deadline: ActionDeadline) {
     const response = await postImApi(this.page, `v1/${endpoint}`, body, deadline.remainingMs());
-    return decodeSendResponse(response);
+    const decoded = decodeSendResponse(response);
+    const expectedCommand = endpoint === 'message/send' ? 100 : 705;
+    if (decoded.cmd !== expectedCommand) return { ...decoded, ok: false, failureReason: `Unexpected response command: ${decoded.cmd}` };
+    return decoded;
   }
 
   private async sendReactionViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
@@ -363,7 +388,7 @@ export class DouyinBridge {
 
     const decoded = await this.postImProtobuf('message/set_property', request.body, deadline);
     if (!decoded.ok) {
-      throw new Error(`Douyin message/set_property failed: ${decoded.status ?? decoded.statusCode ?? 'unknown'}`);
+      throw new Error(`Douyin message/set_property failed: ${decoded.failureReason ?? decoded.status ?? decoded.statusCode ?? 'unknown'}`);
     }
 
     this.logger.info(
@@ -840,6 +865,7 @@ export class DouyinBridge {
     if (!messageId) {
       return undefined;
     }
+    if (this.cache.restored) throw new Error('Restored message cache account is not authenticated');
     if (!/^\d+$/.test(messageId)) {
       throw new Error(`Direct Douyin reply requires a numeric message id: ${messageId}`);
     }
@@ -849,13 +875,15 @@ export class DouyinBridge {
     if (!cached) {
       throw new Error(`Cannot reply to message outside the realtime cache: ${messageId}`);
     }
+    const callbackStatus = messageCallbackStatus(cached);
+    if (callbackStatus !== undefined && callbackStatus !== 0) {
+      throw new Error(`Cannot reply to rejected message: ${messageId}`);
+    }
 
     const payload = isRecord(cached.raw) && isRecord(cached.raw.payload) ? cached.raw.payload : {};
-    const originalContent = normalizeReplyContent(
-      typeof payload.content === 'string' ? payload.content : cached.content,
-      cached.text ?? '',
-      cached.messageType ?? numberValue(payload.messageType) ?? 7
-    );
+    const content = typeof payload.content === 'string' && payload.content ? payload.content : cached.content;
+    if (!parseJsonObject(content)) throw new Error(`Cannot reply without the original protocol content: ${messageId}`);
+    const originalContent = content!;
     return {
       messageId,
       content: cached.text ?? '',
@@ -877,7 +905,7 @@ export class DouyinBridge {
     }
     if (this.cache.recalls.get(messageId)) throw new Error(`Cannot react to recalled message: ${messageId}`);
 
-    const cached = this.messageCache.get(messageId);
+    const cached = this.getCachedMessage(messageId);
     if (!cached) {
       throw new Error(`Cannot react to message outside the realtime cache: ${messageId}`);
     }
@@ -950,6 +978,7 @@ export class DouyinBridge {
 
   private async handleMessage(message: DouyinMessage): Promise<void> {
     this.synchronizeCacheAccount();
+    if (this.cache.restored) return;
     if (this.cache.recalls.get(message.messageId)) return;
     if (!message.senderName) {
       message = { ...message, senderName: this.directory.getCachedUser(message.senderId)?.name };
@@ -961,6 +990,11 @@ export class DouyinBridge {
     }
     if (isOwnEcho) {
       this.currentUserId = message.senderId;
+    }
+    const callbackStatus = messageCallbackStatus(message);
+    if (callbackStatus !== undefined && callbackStatus !== 0) {
+      this.logger.warn({ messageId: message.messageId, callbackStatus }, 'received rejected message echo; not publishing as a chat message');
+      return;
     }
     this.logger.info(
       {
@@ -983,7 +1017,9 @@ export class DouyinBridge {
 
   private synchronizeCacheAccount(): void {
     const accountId = this.accountId;
-    if (!accountId || this.cache.accountId === accountId) return;
+    if (!accountId) return;
+    this.cache.restored = false;
+    if (this.cache.accountId === accountId) return;
     if (this.cache.accountId !== undefined) {
       this.messageCache.clear();
       this.sentClientMessageIds.clear();
@@ -1014,24 +1050,10 @@ function normalizeConversationText(value: string): string {
   );
 }
 
-function normalizeReplyContent(content: string | undefined, text: string, messageType: number): string {
-  const parsed = parseJsonObject(content);
-  if (parsed && typeof parsed.instruction_type === 'number' && typeof parsed.item_type_local === 'number') {
-    return JSON.stringify(parsed);
-  }
-
-  const parsedText = parsed ? stringValue(parsed.text) : undefined;
-  const parsedAweType = parsed ? numberValue(parsed.aweType) : undefined;
-  return JSON.stringify({
-    type: 0,
-    instruction_type: 0,
-    item_type_local: -1,
-    text: parsedText ?? text,
-    createdAt: 0,
-    is_card: false,
-    msgHint: '',
-    aweType: parsedAweType ?? (messageType === 7 ? 700 : messageType)
-  });
+function messageCallbackStatus(message: DouyinMessage): number | undefined {
+  const payload = isRecord(message.raw) && isRecord(message.raw.payload) ? message.raw.payload : {};
+  const value = extractEntityValue(payload.ext, 'im_callback_status_code');
+  return value !== undefined && /^[0-9]+$/.test(value) ? Number(value) : undefined;
 }
 
 function parseJsonObject(value: string | undefined): Record<string, unknown> | undefined {
@@ -1040,7 +1062,7 @@ function parseJsonObject(value: string | undefined): Record<string, unknown> | u
   }
   try {
     const parsed = JSON.parse(value) as unknown;
-    return isRecord(parsed) ? parsed : undefined;
+    return isRecord(parsed) && !Array.isArray(parsed) ? parsed : undefined;
   } catch {
     return undefined;
   }

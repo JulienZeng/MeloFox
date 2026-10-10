@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
-import { copyFile, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { AppConfig } from '../config/index.js';
 import type { AppLogger } from '../logger/index.js';
+import { z } from 'zod';
+import { readCacheJson, writeCacheJson } from '../runtime/cache-file.js';
 import { decodeDouyinImage, imageFormat } from './image.js';
 
 interface CacheOptions {
@@ -24,12 +26,27 @@ export interface RegisteredMedia {
   size: number;
 }
 
+const mediaIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-zA-Z0-9]{1,10}$/;
+const ownedFilePattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-zA-Z0-9]{1,10}(?:\.download|\.transcoded\.mp4|\.normalize\.failed)?$/;
+const mediaIndexSchema = z.object({ version: z.literal(1), items: z.array(z.object({
+  id: z.string().regex(mediaIdPattern), sourceUrl: z.string().url(),
+  contentType: z.string().regex(/^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+(?:;[^\r\n]*)?$/),
+  createdAt: z.number().finite().nonnegative(), size: z.number().int().nonnegative().safe()
+})) });
+
 export class MediaRegistry {
   private readonly items = new Map<string, RegisteredMedia>();
   private readonly sourceToId = new Map<string, string>();
   private readonly downloads = new Map<string, Promise<string>>();
   private readonly cacheDir: string;
   private readonly cleanupTimer: NodeJS.Timeout;
+  private ready?: Promise<void>;
+  private maintenance: Promise<unknown> = Promise.resolve();
+  private readonly activeIds = new Set<string>();
+  private readonly readers = new Map<string, number>();
+  private readonly retired = new Map<string, RegisteredMedia>();
+  private readonly shutdown = new AbortController();
+  private stopPromise?: Promise<void>;
 
   constructor(
     private readonly config: AppConfig,
@@ -42,27 +59,139 @@ export class MediaRegistry {
     this.cleanupTimer.unref();
   }
 
+  initialize(): Promise<void> {
+    return this.ready ??= this.restoreIndex();
+  }
+
+  private async restoreIndex(): Promise<void> {
+    await mkdir(this.cacheDir, { recursive: true, mode: 0o700 });
+    try {
+      const raw = await readCacheJson(resolve(this.cacheDir, '.index.json'));
+      if (raw !== undefined) {
+        const index = mediaIndexSchema.parse(raw);
+        for (const saved of index.items) {
+          const filePath = resolve(this.cacheDir, saved.id);
+          const info = await lstat(filePath).catch(() => undefined);
+          if (!info?.isFile() || info.size !== saved.size || saved.createdAt > Date.now()) continue;
+          await chmod(filePath, 0o600);
+          this.items.set(saved.id, { ...saved, filePath });
+          this.sourceToId.set(saved.sourceUrl, saved.id);
+        }
+      } else {
+        // Pre-index releases already used UUID names. Preserve their URLs without renewing TTL.
+        for (const entry of await readdir(this.cacheDir)) {
+          if (!mediaIdPattern.test(entry)) continue;
+          const filePath = resolve(this.cacheDir, entry);
+          const info = await lstat(filePath).catch(() => undefined);
+          if (!info?.isFile()) continue;
+          await chmod(filePath, 0o600);
+          const item = { id: entry, sourceUrl: `legacy-cache:///${entry}`, filePath,
+            contentType: legacyContentType(extname(entry)), createdAt: info.mtimeMs, size: info.size };
+          this.items.set(entry, item);
+          this.sourceToId.set(item.sourceUrl, entry);
+        }
+      }
+    } catch (error) {
+      this.logger?.warn({ error }, 'media index cannot be restored; cleaning owned orphan files');
+    }
+    await this.pruneCompleted();
+    await this.sweepOrphans();
+    await this.persistIndex();
+  }
+
+  private exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const pending = this.maintenance.catch(() => undefined).then(operation);
+    this.maintenance = pending;
+    return pending;
+  }
+
+  private async persistIndex(): Promise<void> {
+    const path = resolve(this.cacheDir, '.index.json');
+    await writeCacheJson(path, JSON.stringify({ version: 1, items: [...this.items.values()].map(({ filePath: _path, ...item }) => item) }));
+  }
+
+  private expired(item: RegisteredMedia): boolean {
+    return Date.now() - item.createdAt >= this.config.onebot.mediaCache.ttlMs;
+  }
+
+  private async removeItem(item: RegisteredMedia): Promise<void> {
+    this.items.delete(item.id);
+    if (this.sourceToId.get(item.sourceUrl) === item.id) this.sourceToId.delete(item.sourceUrl);
+    if (this.readers.has(item.id)) this.retired.set(item.id, item);
+    else await rm(item.filePath, { force: true });
+  }
+
+  private usage(): { files: number; bytes: number } {
+    const all = [...this.items.values(), ...this.retired.values()];
+    return { files: all.length, bytes: all.reduce((sum, item) => sum + item.size, 0) };
+  }
+
+  private async pruneCompleted(reserveBytes = 0, reserveFiles = 0): Promise<void> {
+    for (const item of [...this.items.values()]) {
+      const info = await lstat(item.filePath).catch(() => undefined);
+      if (this.expired(item) || !info?.isFile() || info.size !== item.size || item.size > this.config.onebot.mediaCache.maxFileBytes) {
+        await this.removeItem(item);
+      }
+    }
+    const ordered = [...this.items.values()].sort((a, b) => a.createdAt - b.createdAt);
+    const { maxBytes, maxFiles } = this.config.onebot.mediaCache;
+    for (const item of ordered) {
+      const usage = this.usage();
+      if (usage.bytes + reserveBytes <= maxBytes && usage.files + reserveFiles <= maxFiles) break;
+      if (!this.readers.has(item.id)) await this.removeItem(item);
+    }
+    const usage = this.usage();
+    if (reserveFiles && (usage.bytes + reserveBytes > maxBytes || usage.files + reserveFiles > maxFiles)) {
+      throw new Error('Media cache capacity exhausted by active readers');
+    }
+  }
+
+  private async sweepOrphans(): Promise<void> {
+    for (const entry of await readdir(this.cacheDir, { withFileTypes: true })) {
+      const name = entry.name;
+      const owned = ownedFilePattern.test(name) || /^\.index\.json\.[0-9a-f-]+\.tmp$/.test(name);
+      if (!owned || entry.isDirectory() || this.items.has(name) || this.retired.has(name) ||
+        [...this.activeIds].some(id => name.startsWith(`${id}.`))) continue;
+      await rm(resolve(this.cacheDir, name), { force: true });
+    }
+  }
+
+  async getStats(): Promise<{ files: number; bytes: number; activeDownloads: number; activeReaders: number; maxBytes: number; maxFiles: number }> {
+    await this.initialize();
+    return { ...this.usage(), activeDownloads: this.downloads.size,
+      activeReaders: [...this.readers.values()].reduce((sum, count) => sum + count, 0),
+      maxBytes: this.config.onebot.mediaCache.maxBytes, maxFiles: this.config.onebot.mediaCache.maxFiles };
+  }
+
   async cacheRemote(
     sourceUrl: string,
     contentType = 'application/octet-stream',
     extension?: string,
     options: CacheOptions = {}
   ): Promise<string> {
-    options.signal?.throwIfAborted();
-    const existingId = this.sourceToId.get(sourceUrl);
-    if (existingId) {
-      const existing = this.items.get(existingId);
-      if (existing && (await fileExists(existing.filePath))) {
-        return this.publicUrl(existingId);
-      }
-    }
+    const signal = options.signal ? AbortSignal.any([options.signal, this.shutdown.signal]) : this.shutdown.signal;
+    signal.throwIfAborted();
+    if (extension) pickExtension(extension, sourceUrl, contentType);
+    await this.initialize();
+    const reused = await this.exclusive(async () => {
+      const existingId = this.sourceToId.get(sourceUrl);
+      const existing = existingId ? this.items.get(existingId) : undefined;
+      if (!existing) return undefined;
+      const info = await lstat(existing.filePath).catch(() => undefined);
+      if (!this.expired(existing) && info?.isFile() && info.size === existing.size) return this.publicUrl(existing.id);
+      await this.removeItem(existing);
+      await this.persistIndex();
+      return undefined;
+    });
+    signal.throwIfAborted();
+    if (reused) return reused;
 
     const downloading = this.downloads.get(sourceUrl);
     if (downloading) {
       return downloading;
     }
 
-    const promise = this.downloadRemote(sourceUrl, contentType, extension, options).finally(() => {
+    const promise = this.downloadRemote(sourceUrl, contentType, extension, { ...options, signal }).finally(() => {
       this.downloads.delete(sourceUrl);
     });
     this.downloads.set(sourceUrl, promise);
@@ -70,81 +199,126 @@ export class MediaRegistry {
   }
 
   async serve(request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply): Promise<void> {
-    const item = this.items.get(request.params.id);
-    if (!item) {
-      await reply.code(404).send({
-        status: 'failed',
-        message: 'Media not found'
+    await this.initialize();
+    const served = await this.exclusive(async () => {
+      const item = this.items.get(request.params.id);
+      if (!item) return undefined;
+      const info = await lstat(item.filePath).catch(() => undefined);
+      if (this.expired(item) || !info?.isFile() || info.size !== item.size) {
+        await this.removeItem(item);
+        await this.persistIndex();
+        return undefined;
+      }
+      const range = parseRange(request.headers.range, info.size);
+      this.readers.set(item.id, (this.readers.get(item.id) ?? 0) + 1);
+      const stream = createReadStream(item.filePath, range);
+      stream.once('close', () => {
+        void this.exclusive(async () => {
+          const count = (this.readers.get(item.id) ?? 1) - 1;
+          if (count) this.readers.set(item.id, count);
+          else {
+            this.readers.delete(item.id);
+            if (this.retired.delete(item.id)) await rm(item.filePath, { force: true });
+          }
+        }).catch(error => this.logger?.warn({ error }, 'media reader cleanup failed'));
       });
-      return;
-    }
-
-    const fileStat = await stat(item.filePath).catch(() => undefined);
-    if (!fileStat) {
-      this.items.delete(item.id);
-      this.sourceToId.delete(item.sourceUrl);
-      await reply.code(404).send({
-        status: 'failed',
-        message: 'Media file not found'
-      });
-      return;
-    }
+      return { item, size: info.size, range, stream };
+    });
+    if (!served) { await reply.code(404).send({ status: 'failed', message: 'Media not found or expired' }); return; }
+    const { item, size, range, stream } = served;
 
     reply.header('accept-ranges', 'bytes');
-    reply.header('cache-control', 'private, max-age=300');
+    reply.header('cache-control', 'private, no-store');
     reply.header('content-type', item.contentType);
 
-    const range = parseRange(request.headers.range, fileStat.size);
     if (range) {
       reply.code(206);
-      reply.header('content-range', `bytes ${range.start}-${range.end}/${fileStat.size}`);
+      reply.header('content-range', `bytes ${range.start}-${range.end}/${size}`);
       reply.header('content-length', String(range.end - range.start + 1));
-      await reply.send(createReadStream(item.filePath, range));
+      await reply.send(stream);
       return;
     }
 
-    reply.header('content-length', String(fileStat.size));
-    await reply.send(createReadStream(item.filePath));
+    reply.header('content-length', String(size));
+    await reply.send(stream);
   }
 
   async cleanupExpired(): Promise<void> {
-    const expiresBefore = Date.now() - this.config.onebot.mediaCache.ttlMs;
-    for (const item of this.items.values()) {
-      if (item.createdAt >= expiresBefore) {
-        continue;
-      }
-
-      this.items.delete(item.id);
-      this.sourceToId.delete(item.sourceUrl);
-      await rm(item.filePath, { force: true }).catch(() => undefined);
-    }
+    await this.initialize();
+    await this.exclusive(async () => {
+      await this.pruneCompleted();
+      await this.sweepOrphans();
+      await this.persistIndex();
+    });
   }
 
   async getImage(file: string): Promise<{ size: number; filename: string; file: string; url: string }> {
-    const item = [...this.items.values()].find(value =>
-      value.id === file || value.sourceUrl === file || value.filePath === file || this.publicUrl(value.id) === file);
-    if (!item || !/^image\//i.test(item.contentType)) throw new Error('Image not found in registered media cache');
-    if (Date.now() - item.createdAt >= this.config.onebot.mediaCache.ttlMs) {
-      await this.cleanupExpired();
-      throw new Error('Image cache expired');
-    }
-    const fileStat = await stat(item.filePath);
-    return { size: fileStat.size, filename: item.id, file: item.filePath, url: this.publicUrl(item.id) };
+    await this.initialize();
+    return this.exclusive(async () => {
+      const item = this.findItem(file);
+      if (!item || !/^image\//i.test(item.contentType)) throw new Error('Image not found in registered media cache');
+      if (this.expired(item)) {
+        await this.removeItem(item);
+        await this.persistIndex();
+        throw new Error('Image cache expired');
+      }
+      const fileStat = await lstat(item.filePath).catch(() => undefined);
+      if (!fileStat?.isFile() || fileStat.size !== item.size) {
+        await this.removeItem(item);
+        await this.persistIndex();
+        throw new Error('Image cache file is missing or invalid');
+      }
+      return { size: fileStat.size, filename: item.id, file: item.filePath, url: this.publicUrl(item.id) };
+    });
+  }
+
+  async resolveCachedUrl(file: string): Promise<string | undefined> {
+    await this.initialize();
+    return this.exclusive(async () => {
+      const item = this.findItem(file);
+      if (!item) return undefined;
+      const info = await lstat(item.filePath).catch(() => undefined);
+      if (this.expired(item) || !info?.isFile() || info.size !== item.size) {
+        await this.removeItem(item);
+        await this.persistIndex();
+        return undefined;
+      }
+      return this.publicUrl(item.id);
+    });
+  }
+
+  private findItem(file: string): RegisteredMedia | undefined {
+    const exact = [...this.items.values()].find(value => value.id === file || value.sourceUrl === file || value.filePath === file);
+    if (exact) return exact;
+    try {
+      const path = new URL(file).pathname;
+      const id = path.startsWith('/media/') ? path.slice('/media/'.length) : '';
+      return mediaIdPattern.test(id) ? this.items.get(id) : undefined;
+    } catch { return undefined; }
   }
 
   async cleanCache(): Promise<void> {
-    // Snapshot completed registrations only; never remove an active download's output.
-    const items = [...this.items.values()];
-    for (const item of items) {
-      this.items.delete(item.id);
-      this.sourceToId.delete(item.sourceUrl);
-    }
-    await Promise.all(items.map(item => rm(item.filePath, { force: true })));
+    await this.initialize();
+    await this.exclusive(async () => {
+      for (const item of [...this.items.values()]) await this.removeItem(item);
+      await this.sweepOrphans();
+      await this.persistIndex();
+    });
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return this.stopPromise ??= this.close();
+  }
+
+  private async close(): Promise<void> {
     clearInterval(this.cleanupTimer);
+    this.shutdown.abort(new Error('Media registry stopped'));
     await Promise.allSettled([...this.downloads.values()]);
+    await this.maintenance.catch(() => undefined);
+    if (this.ready) {
+      await this.ready;
+      await this.exclusive(() => this.persistIndex());
+    }
   }
 
   private async downloadRemote(
@@ -153,7 +327,6 @@ export class MediaRegistry {
     extension: string | undefined,
     options: CacheOptions
   ): Promise<string> {
-    await mkdir(this.cacheDir, { recursive: true });
     await this.cleanupExpired();
 
     const upstream = await fetch(sourceUrl, {
@@ -162,6 +335,7 @@ export class MediaRegistry {
       headers: buildUpstreamHeaders()
     });
     if (!upstream.ok) {
+      await upstream.body?.cancel().catch(() => undefined);
       throw new Error(`Failed to download media: ${upstream.status}`);
     }
 
@@ -172,8 +346,9 @@ export class MediaRegistry {
     let filePath = resolve(this.cacheDir, id);
     const downloadPath = `${filePath}.download`;
     let completed = false;
+    this.activeIds.add(cacheId);
     try {
-      let buffer: Buffer = Buffer.from(await upstream.arrayBuffer());
+      let buffer = await readBoundedMedia(upstream, Math.min(this.config.onebot.mediaCache.maxFileBytes, this.config.onebot.mediaCache.maxBytes), options.signal);
       options.signal?.throwIfAborted();
       let transcodeImage = false;
       if (options.normalizeImage) {
@@ -184,7 +359,7 @@ export class MediaRegistry {
         filePath = resolve(this.cacheDir, id);
         transcodeImage = Boolean(format.transcode);
       }
-      await writeFile(downloadPath, buffer);
+      await writeFile(downloadPath, buffer, { mode: 0o600 });
       this.logger?.debug(
         { id, bytes: buffer.length, contentType: resolvedContentType, sourceHost: safeUrlHost(sourceUrl) },
         'downloaded media candidate'
@@ -219,17 +394,30 @@ export class MediaRegistry {
       if (!normalized.ok && !transcodeImage) await rename(downloadPath, filePath);
 
       const fileStat = await stat(filePath);
+      await chmod(filePath, 0o600);
       options.signal?.throwIfAborted();
-      this.items.set(id, {
-        id, sourceUrl, filePath, contentType: resolvedContentType, createdAt: Date.now(), size: fileStat.size
+      if (fileStat.size > this.config.onebot.mediaCache.maxFileBytes || fileStat.size > this.config.onebot.mediaCache.maxBytes) {
+        throw new Error('Normalized media exceeds cache size limit');
+      }
+      await this.exclusive(async () => {
+        options.signal?.throwIfAborted();
+        await this.pruneCompleted(fileStat.size, 1);
+        this.items.set(id, { id, sourceUrl, filePath, contentType: resolvedContentType, createdAt: Date.now(), size: fileStat.size });
+        this.sourceToId.set(sourceUrl, id);
+        try { await this.persistIndex(); }
+        catch (error) {
+          this.items.delete(id);
+          if (this.sourceToId.get(sourceUrl) === id) this.sourceToId.delete(sourceUrl);
+          throw error;
+        }
       });
-      this.sourceToId.set(sourceUrl, id);
       completed = true;
       return this.publicUrl(id);
     } finally {
       if (!completed) {
         await Promise.allSettled([downloadPath, filePath, `${filePath}.transcoded.mp4`].map(path => rm(path, { force: true })));
       }
+      this.activeIds.delete(cacheId);
     }
   }
 
@@ -274,11 +462,12 @@ function parseRange(rangeHeader: string | undefined, size: number): { start: num
 
 function pickExtension(preferred: string | undefined, sourceUrl: string, contentType: string): string {
   if (preferred) {
+    if (!/^\.?[a-zA-Z0-9]{1,10}$/.test(preferred)) throw new Error('Invalid media extension');
     return preferred.startsWith('.') ? preferred : `.${preferred}`;
   }
 
   const pathExt = extname(new URL(sourceUrl).pathname);
-  if (pathExt) {
+  if (/^\.[a-zA-Z0-9]{1,10}$/.test(pathExt)) {
     return pathExt;
   }
 
@@ -296,6 +485,39 @@ function pickExtension(preferred: string | undefined, sourceUrl: string, content
   }
 
   return '.bin';
+}
+
+function legacyContentType(extension: string): string {
+  const known: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp', '.gif': 'image/gif', '.mp4': 'video/mp4', '.mp3': 'audio/mpeg',
+    '.ogg': 'audio/ogg', '.wav': 'audio/wav' };
+  return known[extension.toLowerCase()] ?? 'application/octet-stream';
+}
+
+async function readBoundedMedia(response: Response, limit: number, signal?: AbortSignal): Promise<Buffer> {
+  const length = Number(response.headers.get('content-length'));
+  if (length > limit) {
+    await response.body?.cancel();
+    throw new Error('Media download exceeds cache size limit');
+  }
+  if (!response.body) throw new Error('Media download has no body');
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > limit) throw new Error('Media download exceeds cache size limit');
+      chunks.push(Buffer.from(chunk.value));
+    }
+    return Buffer.concat(chunks, size);
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }
 
 async function fileExists(path: string): Promise<boolean> {

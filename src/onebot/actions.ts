@@ -3,6 +3,7 @@ import { listDouyinGroupMembers, listDouyinGroups } from '../douyin/conversation
 import type { DouyinBridge } from '../douyin/bridge.js';
 import type { MediaRegistry } from '../media/registry.js';
 import { toOneBotMessageEvent } from './events.js';
+import { parseCqMessage } from './cq.js';
 import type { OneBotActionRequest, OneBotActionResponse, OneBotMessageSegment, OneBotStatus } from './types.js';
 
 interface OutgoingMessage {
@@ -144,10 +145,10 @@ export class OneBotActionRouter {
 
   private async sendMsg(params: Record<string, unknown>): Promise<{ message_id: string }> {
     const messageType = String(params.message_type ?? '');
-    if (messageType === 'group' || params.group_id !== undefined) {
-      return this.sendGroupMsg(params);
-    }
-    return this.sendPrivateMsg(params);
+    if (messageType === 'group') return this.sendGroupMsg(params);
+    if (messageType === 'private') return this.sendPrivateMsg(params);
+    if (messageType) throw new Error(`Unsupported outgoing message_type: ${messageType}`);
+    return params.group_id !== undefined ? this.sendGroupMsg(params) : this.sendPrivateMsg(params);
   }
 
   private async sendPrivateMsg(params: Record<string, unknown>): Promise<{ message_id: string }> {
@@ -188,15 +189,21 @@ export class OneBotActionRouter {
     return { message_id: result.messageId };
   }
 
-  private getMsg(params: Record<string, unknown>): unknown {
+  private async getMsg(params: Record<string, unknown>): Promise<unknown> {
     const messageId = requireString(params, 'message_id');
     const cached = this.bridge.getCachedMessage(messageId);
     if (!cached) {
       throw new Error(`Message not found in cache: ${messageId}`);
     }
 
+    const segments = this.mediaRegistry && cached.segments ? await Promise.all(cached.segments.map(async segment => {
+      if (!['image', 'video', 'record'].includes(segment.type)) return segment;
+      const file = typeof segment.data.file === 'string' ? segment.data.file : segment.data.url;
+      const url = typeof file === 'string' ? await this.mediaRegistry!.resolveCachedUrl(file) : undefined;
+      return url ? { ...segment, data: { ...segment.data, file: url, url } } : segment;
+    })) : cached.segments;
     return {
-      ...toOneBotMessageEvent(this.config, cached),
+      ...toOneBotMessageEvent(this.config, { ...cached, segments }),
       real_id: cached.messageId
     };
   }
@@ -240,16 +247,15 @@ function requireString(params: unknown, key: string): string {
 }
 
 function requireOutgoingMessage(params: Record<string, unknown>): OutgoingMessage {
-  const message = params.message;
+  let message = params.message;
   if (typeof message === 'string') {
     if (!message) {
       throw new Error('Message must contain text or image');
     }
-    return {
-      text: message,
-      images: [],
-      mentions: []
-    };
+    if (params.auto_escape !== undefined && typeof params.auto_escape !== 'boolean') {
+      throw new Error('auto_escape must be a boolean for string messages');
+    }
+    message = params.auto_escape === true ? [{ type: 'text', data: { text: message } }] : parseCqMessage(message);
   }
 
   if (!Array.isArray(message)) {
@@ -261,15 +267,13 @@ function requireOutgoingMessage(params: Record<string, unknown>): OutgoingMessag
     images: [],
     mentions: []
   };
-  const segments = message.filter(isMessageSegment);
+  if (!message.every(isMessageSegment)) throw new Error('Invalid OneBot message segment');
+  const segments = message as OneBotMessageSegment[];
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index];
-    if (!isMessageSegment(segment)) {
-      continue;
-    }
-
     if (segment.type === 'text') {
-      out.text += String(segment.data.text ?? '');
+      if (typeof segment.data.text !== 'string') throw new Error('Text segment must contain a string text');
+      out.text += segment.data.text;
       continue;
     }
     if (segment.type === 'at') {
@@ -296,17 +300,19 @@ function requireOutgoingMessage(params: Record<string, unknown>): OutgoingMessag
       const file = segment.data.file;
       if (typeof file === 'string' && file) {
         out.images.push(file);
-      }
+      } else throw new Error('Image segment must contain a non-empty file');
       continue;
     }
     if (segment.type === 'reply') {
       const messageId = segment.data.id ?? segment.data.message_id;
       if (messageId !== undefined && messageId !== null && messageId !== '') {
+        if (out.replyToMessageId) throw new Error('Message cannot contain multiple reply segments');
         out.replyToMessageId = String(messageId);
-      }
+      } else throw new Error('Reply segment must contain a message id');
       continue;
     }
     if (segment.type === 'face' || segment.type === 'emoji') {
+      if (out.emojiReaction) throw new Error('Message cannot contain multiple emoji reactions');
       out.emojiReaction = resolveEmojiReaction(segment);
       continue;
     }
@@ -385,6 +391,7 @@ function isMessageSegment(value: unknown): value is OneBotMessageSegment {
     value !== null &&
     typeof (value as OneBotMessageSegment).type === 'string' &&
     typeof (value as OneBotMessageSegment).data === 'object' &&
-    (value as OneBotMessageSegment).data !== null
+    (value as OneBotMessageSegment).data !== null &&
+    !Array.isArray((value as OneBotMessageSegment).data)
   );
 }

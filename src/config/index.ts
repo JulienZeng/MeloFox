@@ -36,8 +36,11 @@ const ConfigSchema = z.object({
     }),
     mediaCache: z.object({
       dir: z.string().min(1).default('./media-cache'),
-      ttlMs: z.number().int().positive().default(60 * 60 * 1000),
+      ttlMs: z.number().int().positive().default(7 * 86400000),
       cleanupIntervalMs: z.number().int().positive().default(10 * 60 * 1000),
+      maxBytes: z.number().int().positive().safe().default(1024 * 1024 * 1024),
+      maxFiles: z.number().int().positive().default(1000),
+      maxFileBytes: z.number().int().positive().safe().default(128 * 1024 * 1024),
       transcodeVideoToH264: z.boolean().default(true),
       ffmpegPath: z.string().min(1).default('ffmpeg')
     })
@@ -49,7 +52,10 @@ const ConfigSchema = z.object({
     sessionCheckIntervalMs: z.number().int().positive().default(30000),
     imDisconnectGraceMs: z.number().int().positive().default(60000),
     messageCacheLimit: z.number().int().positive().default(10000),
-    messageCacheTtlMs: z.number().int().positive().default(86400000),
+    messageCacheTtlMs: z.number().int().positive().default(7 * 86400000),
+    messageCachePersist: z.boolean().default(true),
+    messageCacheDir: z.string().min(1).default('./message-cache'),
+    messageCacheFlushIntervalMs: z.number().int().positive().default(5000),
     realtimeQueueLimit: z.number().int().positive().default(10000),
     realtimeMediaConcurrency: z.number().int().positive().default(2),
     realtimeMediaDetailWaitMs: z.number().int().positive().default(5000),
@@ -115,6 +121,9 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
         dir: envString('MEDIA_CACHE_DIR') ?? config.onebot.mediaCache.dir,
         ttlMs: envNumber('MEDIA_CACHE_TTL_MS') ?? config.onebot.mediaCache.ttlMs,
         cleanupIntervalMs: envNumber('MEDIA_CACHE_CLEANUP_INTERVAL_MS') ?? config.onebot.mediaCache.cleanupIntervalMs,
+        maxBytes: envNumber('MEDIA_CACHE_MAX_BYTES') ?? config.onebot.mediaCache.maxBytes,
+        maxFiles: envNumber('MEDIA_CACHE_MAX_FILES') ?? config.onebot.mediaCache.maxFiles,
+        maxFileBytes: envNumber('MEDIA_CACHE_MAX_FILE_BYTES') ?? config.onebot.mediaCache.maxFileBytes,
         transcodeVideoToH264:
           envBoolean('MEDIA_TRANSCODE_VIDEO_TO_H264') ?? config.onebot.mediaCache.transcodeVideoToH264,
         ffmpegPath: envString('MEDIA_FFMPEG_PATH') ?? config.onebot.mediaCache.ffmpegPath
@@ -129,6 +138,9 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
       imDisconnectGraceMs: envNumber('RUNTIME_IM_DISCONNECT_GRACE_MS') ?? config.runtime.imDisconnectGraceMs,
       messageCacheLimit: envNumber('RUNTIME_MESSAGE_CACHE_LIMIT') ?? config.runtime.messageCacheLimit,
       messageCacheTtlMs: envNumber('RUNTIME_MESSAGE_CACHE_TTL_MS') ?? config.runtime.messageCacheTtlMs,
+      messageCachePersist: envBoolean('RUNTIME_MESSAGE_CACHE_PERSIST') ?? config.runtime.messageCachePersist,
+      messageCacheDir: envString('RUNTIME_MESSAGE_CACHE_DIR') ?? config.runtime.messageCacheDir,
+      messageCacheFlushIntervalMs: envNumber('RUNTIME_MESSAGE_CACHE_FLUSH_INTERVAL_MS') ?? config.runtime.messageCacheFlushIntervalMs,
       realtimeQueueLimit: envNumber('RUNTIME_REALTIME_QUEUE_LIMIT') ?? config.runtime.realtimeQueueLimit,
       realtimeMediaConcurrency: envNumber('RUNTIME_REALTIME_MEDIA_CONCURRENCY') ?? config.runtime.realtimeMediaConcurrency,
       realtimeMediaDetailWaitMs: envNumber('RUNTIME_REALTIME_MEDIA_DETAIL_WAIT_MS') ?? config.runtime.realtimeMediaDetailWaitMs,

@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config/index.js';
 import type { DouyinMessage, DouyinRecall } from '../douyin/types.js';
 import { textSegment } from './message-segment.js';
+import { serializeCqMessage } from './cq.js';
 import type { OneBotEvent, OneBotMessageSegment } from './types.js';
 
 export function toOneBotMessageEvent(config: AppConfig, message: DouyinMessage): OneBotEvent {
@@ -15,7 +16,7 @@ export function toOneBotMessageEvent(config: AppConfig, message: DouyinMessage):
     message_id: message.messageId,
     user_id: message.senderId,
     group_id: isGroup ? message.conversationShortId ?? message.conversationId : undefined,
-    raw_message: message.text ?? '',
+    raw_message: serializeCqMessage(segments),
     message: segments,
     font: 0,
     sender: {

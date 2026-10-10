@@ -27,8 +27,11 @@ onebot:
     port: 3002
   mediaCache:
     dir: "./media-cache"
-    ttlMs: 3600000
+    ttlMs: 604800000
     cleanupIntervalMs: 600000
+    maxBytes: 1073741824
+    maxFiles: 1000
+    maxFileBytes: 134217728
     transcodeVideoToH264: true
     ffmpegPath: "ffmpeg"
 
@@ -39,4 +42,7 @@ runtime:
   sessionCheckIntervalMs: 30000
   imDisconnectGraceMs: 60000
   messageCacheLimit: 10000
-  messageCacheTtlMs: 86400000
+  messageCacheTtlMs: 604800000
+  messageCachePersist: true
+  messageCacheDir: "./message-cache"
+  messageCacheFlushIntervalMs: 5000

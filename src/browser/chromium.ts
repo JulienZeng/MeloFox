@@ -104,8 +104,10 @@ async function attachBrowserRuntime(
   await installDouyinInjection(context, logger);
 
   const page = await context.newPage();
-  if (!config.browser.headless) await fitBrowserWindow(context, page, logger);
-  await page.bringToFront();
+  if (!config.browser.headless) {
+    await fitBrowserWindow(context, page, logger);
+    await page.bringToFront();
+  }
 
   await Promise.all(
     context
@@ -357,7 +359,7 @@ async function attachBrowserRuntime(
       await page.goto(url, {
         waitUntil: 'domcontentloaded'
       });
-      await page.bringToFront();
+      if (!config.browser.headless) await page.bringToFront();
 
       return {
         url: page.url(),

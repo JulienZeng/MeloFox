@@ -82,8 +82,14 @@ export interface DouyinReplyReference {
 
 export interface DecodedSendResponse {
   ok: boolean;
+  cmd?: number;
   statusCode?: number;
   status?: string;
+  messageStatus?: number;
+  checkCode?: string;
+  checkMessage?: string;
+  callbackStatusCode?: number;
+  failureReason?: string;
   serverMessageId?: string;
   clientMessageId?: string;
   logId?: string;
@@ -291,6 +297,7 @@ export function buildImageSendRequest(input: BuildImageSendRequestInput): { body
 
 export function decodeSendResponse(buffer: Buffer): DecodedSendResponse {
   const fields = readProtoFields(buffer);
+  const cmd = asNumber(firstField(fields, 1)?.value);
   const statusCode = asNumber(firstField(fields, 3)?.value);
   const status = asString(firstField(fields, 4)?.value);
   const logId = asString(firstField(fields, 7)?.value);
@@ -300,11 +307,41 @@ export function decodeSendResponse(buffer: Buffer): DecodedSendResponse {
   const nested = nestedPayload?.wireType === 2 && Buffer.isBuffer(nestedPayload.value) ? readProtoFields(nestedPayload.value) : [];
   const serverMessageId = valueToString(firstField(nested, 1)?.value);
   const clientMessageId = asString(firstField(nested, 4)?.value);
+  const messageStatus = asNumber(firstField(nested, 3)?.value);
+  const checkCode = valueToString(firstField(nested, 5)?.value);
+  const checkMessage = asString(firstField(nested, 6)?.value);
+  let callbackStatusCode: number | undefined;
+  let failureReason: string | undefined;
+  if (statusCode !== 0 || (status && status !== 'OK')) failureReason = `status_code=${statusCode ?? 'missing'} ${status ?? ''}`;
+  else if (cmd !== 100 && cmd !== 705) failureReason = `Unexpected send response command: ${cmd ?? 'missing'}`;
+  else if (cmd === 100) {
+    if (messageStatus !== 0) failureReason = `message status=${messageStatus ?? 'missing'}`;
+    else if (checkCode !== undefined && checkCode !== '0') failureReason = `check_code=${checkCode}`;
+    if (checkMessage) {
+      try {
+        const check = JSON.parse(checkMessage) as { status_code?: unknown } | null;
+        const code = check?.status_code;
+        if ((typeof code !== 'number' && typeof code !== 'string') || !/^[0-9]+$/.test(String(code))) {
+          failureReason ??= 'Invalid business check status';
+        } else {
+          callbackStatusCode = Number(code);
+          if (callbackStatusCode !== 0) failureReason ??= `business status_code=${callbackStatusCode}`;
+        }
+      } catch { failureReason ??= 'Invalid business check message'; }
+    }
+    if (!serverMessageId || !/^[1-9]\d*$/.test(serverMessageId)) failureReason ??= 'Missing numeric server message id';
+  }
 
   return {
-    ok: statusCode === 0 && (!status || status === 'OK'),
+    ok: !failureReason,
+    cmd,
     statusCode,
     status,
+    messageStatus,
+    checkCode,
+    checkMessage,
+    callbackStatusCode,
+    failureReason,
     serverMessageId,
     clientMessageId,
     logId,

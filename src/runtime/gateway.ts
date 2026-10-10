@@ -77,7 +77,7 @@ export async function startGatewaySession(config: AppConfig, logger: AppLogger, 
     const actionRouter = new OneBotActionRouter(config, bridge, mediaRegistry);
     wsHub = new OneBotWebSocketHub(config, logger, actionRouter);
     await wsHub.start();
-    if (config.onebot.http.enabled) httpServer = await startOneBotHttpServer(config, logger, actionRouter, browser, mediaRegistry, realtime);
+    if (config.onebot.http.enabled) httpServer = await startOneBotHttpServer(config, logger, actionRouter, browser, mediaRegistry, realtime, bridge);
     registerDouyinMessageListener(bridge, message => {
       if (bridge.accountId) config.app.selfId = bridge.accountId;
       wsHub!.emit(toOneBotMessageEvent(config, message));
