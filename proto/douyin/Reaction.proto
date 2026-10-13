@@ -1,0 +1,30 @@
+syntax = "proto3";
+import "ChatMessage.proto";
+
+message ReactionQueryRequest {
+  string conversationId = 1;
+  int32 conversationType = 2;
+  int64 conversationShortId = 3;
+  int64 serverMessageId = 4;
+  bool onlyStatus = 5;
+}
+
+message ReactionQueryResponse {
+  int32 cmd = 1;
+  int32 statusCode = 3;
+  string errorDesc = 4;
+  ReactionQueryResponseBody body = 6;
+}
+
+message ReactionQueryResponseBody {
+  ReactionQueryResult result = 211;
+}
+
+message ReactionQueryResult {
+  ReactionMessageInfo msgInfo = 1;
+}
+
+message ReactionMessageInfo {
+  int32 status = 1;
+  MessageBody body = 2;
+}

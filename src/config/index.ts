@@ -42,12 +42,18 @@ const ConfigSchema = z.object({
       maxFiles: z.number().int().positive().default(1000),
       maxFileBytes: z.number().int().positive().safe().default(128 * 1024 * 1024),
       transcodeVideoToH264: z.boolean().default(true),
-      ffmpegPath: z.string().min(1).default('ffmpeg')
+      ffmpegPath: z.string().min(1).default('ffmpeg'),
+      ffprobePath: z.string().min(1).default('ffprobe')
     })
   }),
   runtime: z.object({
     reconnectIntervalMs: z.number().int().positive().default(5000),
     actionTimeoutMs: z.number().int().positive().default(15000),
+    videoSendTimeoutMs: z.number().int().positive().default(120000),
+    fileSendAllowedDirs: z.array(z.string().min(1)).default([]),
+    fileSendEnabled: z.boolean().default(false),
+    shareAsText: z.boolean().default(false),
+    stickerAsText: z.boolean().default(true),
     heartbeatIntervalMs: z.number().int().positive().default(30000),
     sessionCheckIntervalMs: z.number().int().positive().default(30000),
     imDisconnectGraceMs: z.number().int().positive().default(60000),
@@ -126,13 +132,19 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
         maxFileBytes: envNumber('MEDIA_CACHE_MAX_FILE_BYTES') ?? config.onebot.mediaCache.maxFileBytes,
         transcodeVideoToH264:
           envBoolean('MEDIA_TRANSCODE_VIDEO_TO_H264') ?? config.onebot.mediaCache.transcodeVideoToH264,
-        ffmpegPath: envString('MEDIA_FFMPEG_PATH') ?? config.onebot.mediaCache.ffmpegPath
+        ffmpegPath: envString('MEDIA_FFMPEG_PATH') ?? config.onebot.mediaCache.ffmpegPath,
+        ffprobePath: envString('MEDIA_FFPROBE_PATH') ?? config.onebot.mediaCache.ffprobePath
       }
     },
     runtime: {
       ...config.runtime,
       reconnectIntervalMs: envNumber('RUNTIME_RECONNECT_INTERVAL_MS') ?? config.runtime.reconnectIntervalMs,
       actionTimeoutMs: envNumber('RUNTIME_ACTION_TIMEOUT_MS') ?? config.runtime.actionTimeoutMs,
+      videoSendTimeoutMs: envNumber('RUNTIME_VIDEO_SEND_TIMEOUT_MS') ?? config.runtime.videoSendTimeoutMs,
+      fileSendAllowedDirs: envString('RUNTIME_FILE_SEND_ALLOWED_DIRS') === undefined ? config.runtime.fileSendAllowedDirs : JSON.parse(envString('RUNTIME_FILE_SEND_ALLOWED_DIRS')!),
+      fileSendEnabled: envBoolean('RUNTIME_FILE_SEND_ENABLED') ?? config.runtime.fileSendEnabled,
+      shareAsText: envBoolean('RUNTIME_SHARE_AS_TEXT') ?? config.runtime.shareAsText,
+      stickerAsText: envBoolean('RUNTIME_STICKER_AS_TEXT') ?? config.runtime.stickerAsText,
       heartbeatIntervalMs: envNumber('RUNTIME_HEARTBEAT_INTERVAL_MS') ?? config.runtime.heartbeatIntervalMs,
       sessionCheckIntervalMs: envNumber('RUNTIME_SESSION_CHECK_INTERVAL_MS') ?? config.runtime.sessionCheckIntervalMs,
       imDisconnectGraceMs: envNumber('RUNTIME_IM_DISCONNECT_GRACE_MS') ?? config.runtime.imDisconnectGraceMs,

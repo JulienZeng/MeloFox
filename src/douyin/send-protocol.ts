@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DouyinOutgoingMention } from './types.js';
+import type { UploadedFile } from './file-upload.js';
+import { uploadedVideoSchema, type UploadedVideo } from './video-upload.js';
 
 export interface DouyinSendProtocolContext {
   userAgent: string;
@@ -44,6 +46,8 @@ export interface BuildEmojiReactionRequestInput {
     iconUrl?: string;
     text?: string;
     propertyValue?: string;
+    additionalProperties?: Array<{ key: string; value: string }>;
+    operation?: 0 | 1;
   };
   context: DouyinSendProtocolContext;
   sequenceId?: number;
@@ -94,6 +98,8 @@ export interface DecodedSendResponse {
   clientMessageId?: string;
   logId?: string;
   rawBase64: string;
+  propertyStatus?: number;
+  propertyVersion?: string;
 }
 
 export function buildImApiRequest(command: number, payload: Buffer, context: DouyinSendProtocolContext, inboxType = 0): Buffer {
@@ -133,6 +139,49 @@ export function buildRecallRequest(input: {
     .finish();
   // Both captured private and group web recalls use inbox zero, unlike incoming notifications.
   return buildImApiRequest(702, payload, input.context, 0);
+}
+
+export function buildFileSendRequest(input: {
+  conversationId?: string;
+  conversationShortId: string;
+  conversationType: 1 | 2;
+  inboxType?: number;
+  file: UploadedFile;
+  context: DouyinSendProtocolContext;
+  clientMessageId?: string;
+}): { body: Buffer; clientMessageId: string; content: string } {
+  if (!/^[1-9]\d*$/.test(input.conversationShortId) || BigInt(input.conversationShortId) > 9223372036854775807n) throw new Error('File send requires a valid conversation ID');
+  const file = input.file;
+  if (!file.name || /[\\/\x00-\x1f\x7f]/.test(file.name) || !Number.isSafeInteger(file.size) || file.size < 1 ||
+    !/^[a-f0-9]{32}$/i.test(file.md5) || !/^[a-f0-9]{64}$/i.test(file.skey) || !/^tos-[a-z0-9-]+\/[a-z0-9/_-]+$/i.test(file.uri)) {
+    throw new Error('Invalid uploaded file metadata');
+  }
+  const clientMessageId = input.clientMessageId ?? randomUUID();
+  const content = JSON.stringify({ name: file.name, format: file.format, data_size: file.size, md5: file.md5,
+    skey: file.skey, uri: file.uri, createdAt: 0, is_card: false, msgHint: '', aweType: 15001 });
+  const payload = new ProtoWriter().string(1, input.conversationId ?? input.conversationShortId)
+    .uint32(2, input.conversationType).uint64(3, input.conversationShortId).string(4, content)
+    .bytes(5, encodeKeyValue('s:mentioned_users', ''))
+    .bytes(5, encodeKeyValue('s:client_message_id', clientMessageId))
+    .bytes(5, encodeKeyValue('s:stime', `${Date.now()}.${Math.floor(Math.random() * 10000)}`))
+    .uint32(6, 150).string(8, clientMessageId).finish();
+  return { body: buildImApiRequest(100, payload, input.context, input.inboxType), clientMessageId, content };
+}
+
+export function buildVideoSendRequest(input: {
+  conversationId?: string; conversationShortId: string; conversationType: 1 | 2; inboxType?: number;
+  video: UploadedVideo; context: DouyinSendProtocolContext; clientMessageId?: string
+}): { body: Buffer; clientMessageId: string; content: string } {
+  if (!/^[1-9]\d*$/.test(input.conversationShortId) || BigInt(input.conversationShortId) > 9223372036854775807n) throw new Error('Video send requires a valid conversation ID');
+  const content = JSON.stringify(uploadedVideoSchema.parse(input.video));
+  const clientMessageId = input.clientMessageId ?? randomUUID();
+  const payload = new ProtoWriter().string(1, input.conversationId ?? input.conversationShortId)
+    .uint32(2, input.conversationType).uint64(3, input.conversationShortId).string(4, content)
+    .bytes(5, encodeKeyValue('s:mentioned_users', ''))
+    .bytes(5, encodeKeyValue('s:client_message_id', clientMessageId))
+    .bytes(5, encodeKeyValue('s:stime', `${Date.now()}.${Math.floor(Math.random() * 10000)}`))
+    .uint32(6, 30).string(8, clientMessageId).finish();
+  return { body: buildImApiRequest(100, payload, input.context, input.inboxType), clientMessageId, content };
 }
 
 export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: Buffer; clientMessageId: string } {
@@ -185,6 +234,10 @@ export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: 
 }
 
 export function buildEmojiReactionRequest(input: BuildEmojiReactionRequestInput): { body: Buffer } {
+  for (const id of [input.conversationShortId, input.targetMessageId, input.operatorUserId]) {
+    if (!/^[1-9]\d*$/.test(id) || BigInt(id) > 9223372036854775807n) throw new Error('Reaction requires valid numeric IDs');
+  }
+  if (!input.targetClientMessageId) throw new Error('Reaction requires the original client message ID');
   const propertyValue = input.emoji.propertyValue ?? JSON.stringify({
     emoji_data: {
       icon_url: input.emoji.iconUrl ?? '',
@@ -194,24 +247,24 @@ export function buildEmojiReactionRequest(input: BuildEmojiReactionRequestInput)
     type: 1
   });
 
-  const property = new ProtoWriter()
-    .uint32(1, 0)
-    .string(2, input.emoji.key)
-    .string(3, propertyValue)
-    .string(4, input.operatorUserId)
-    .finish();
-
   const body = new ProtoWriter()
     .string(1, input.conversationId ?? input.conversationShortId)
     .uint32(2, input.conversationType)
     .uint64(3, input.conversationShortId)
     .uint64(4, input.targetMessageId)
-    .string(5, input.targetClientMessageId)
-    .bytes(6, property)
-    .finish();
+    .string(5, input.targetClientMessageId);
+  const properties = [{ key: input.emoji.key, value: propertyValue }, ...(input.emoji.additionalProperties ?? [])];
+  if (properties.length > 8 || new Set(properties.map(property => property.key)).size !== properties.length) throw new Error('Invalid reaction property batch');
+  const operation = input.emoji.operation ?? 0;
+  if (operation !== 0 && operation !== 1) throw new Error('Invalid reaction operation');
+  for (const property of properties) {
+    if (!/^(e:[a-zA-Z0-9_]+|se:\[[^\[\]\x00-\x1f\x7f]{1,64}\])$/.test(property.key) || property.value.length > 8192) throw new Error('Invalid reaction property');
+    body.bytes(6, new ProtoWriter().uint32(1, operation).string(2, property.key)
+      .string(3, property.value).string(4, input.operatorUserId).finish());
+  }
 
   const command = new ProtoWriter()
-    .bytes(1, body)
+    .bytes(1, body.finish())
     .finish();
 
   const bodyWrapper = new ProtoWriter().bytes(705, command).finish();
@@ -310,10 +363,15 @@ export function decodeSendResponse(buffer: Buffer): DecodedSendResponse {
   const messageStatus = asNumber(firstField(nested, 3)?.value);
   const checkCode = valueToString(firstField(nested, 5)?.value);
   const checkMessage = asString(firstField(nested, 6)?.value);
+  const propertyPayload = firstField(wrapped, 705);
+  const propertyFields = propertyPayload?.wireType === 2 && Buffer.isBuffer(propertyPayload.value) ? readProtoFields(propertyPayload.value) : undefined;
+  const propertyStatus = propertyFields ? asNumber(firstField(propertyFields, 1)?.value) ?? 0 : undefined;
+  const propertyVersion = propertyFields ? valueToString(firstField(propertyFields, 2)?.value) : undefined;
   let callbackStatusCode: number | undefined;
   let failureReason: string | undefined;
   if (statusCode !== 0 || (status && status !== 'OK')) failureReason = `status_code=${statusCode ?? 'missing'} ${status ?? ''}`;
   else if (cmd !== 100 && cmd !== 705) failureReason = `Unexpected send response command: ${cmd ?? 'missing'}`;
+  else if (cmd === 705 && propertyStatus !== 0 && propertyStatus !== 1) failureReason = `modify property status=${propertyStatus ?? 'missing'}`;
   else if (cmd === 100) {
     if (messageStatus !== 0) failureReason = `message status=${messageStatus ?? 'missing'}`;
     else if (checkCode !== undefined && checkCode !== '0') failureReason = `check_code=${checkCode}`;
@@ -341,6 +399,8 @@ export function decodeSendResponse(buffer: Buffer): DecodedSendResponse {
     checkCode,
     checkMessage,
     callbackStatusCode,
+    propertyStatus,
+    propertyVersion,
     failureReason,
     serverMessageId,
     clientMessageId,

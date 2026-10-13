@@ -28,6 +28,7 @@ export interface RealtimeProcessorOptions {
   emit: (message: DouyinMessage) => Promise<void>;
   emitRecall?: (notice: DouyinRecall) => Promise<void>;
   enrich: (candidate: RealtimeMessageCandidate, signal: AbortSignal) => Promise<RealtimeMessageCandidate>;
+  stickerAsText?: boolean;
   decode?: (event: NetworkEvent) => Promise<DecodedMessages>;
   queueLimit?: number;
   mediaConcurrency?: number;
@@ -174,7 +175,7 @@ export class RealtimeMessageProcessor {
           const job = this.pending.get(detail.serverMessageId);
           if (job?.state === 'waiting') {
             job.candidate = mergeRealtimeMessageDetail(job.candidate, detail);
-            if (!shouldWaitForMessageDetail(job.candidate)) await this.ready(job);
+            if (!this.waitForDetail(job.candidate)) await this.ready(job);
           }
         }
         // HTTP details enrich a WS notification, never generate a fresh message event.
@@ -201,7 +202,7 @@ export class RealtimeMessageProcessor {
       return;
     }
     // Read-index/command updates are transport state, not user messages.
-    if (candidate.messageType === 50001) return;
+    if ([50001, 50002, 70001, 70002].includes(candidate.messageType ?? 0)) return;
     const id = candidate.serverMessageId;
     if (!id) return;
     if (this.seen.has(id) || this.recalls.has(id)) { this.counters.duplicates += 1; return; }
@@ -209,14 +210,14 @@ export class RealtimeMessageProcessor {
     if (existing) { this.counters.duplicates += 1; return; }
     const detail = this.details.get(id)?.candidate;
     const merged = mergeRealtimeMessageDetail(candidate, detail);
-    if (candidate.messageType !== 27 && candidate.messageType !== 30 && !shouldWaitForMessageDetail(merged)) {
+    if (!this.needsMedia(merged) && !this.waitForDetail(merged)) {
       await this.deliver(merged);
       return;
     }
     if (this.pending.size >= this.queueLimit) { this.overflow('pending message'); return; }
     const job: PendingMessage = { candidate: merged, state: 'waiting' };
     this.pending.set(id, job);
-    if (shouldWaitForMessageDetail(job.candidate)) {
+    if (this.waitForDetail(job.candidate)) {
       job.timer = setTimeout(() => {
         if (job.candidate.messageType === 7) {
           this.options.logger.warn({ messageId: id }, 'text message detail timed out; reporting a fallback');
@@ -224,6 +225,15 @@ export class RealtimeMessageProcessor {
         this.track(this.ready(job));
       }, this.detailWaitMs);
     } else await this.ready(job);
+  }
+
+  private needsMedia(candidate: RealtimeMessageCandidate): boolean {
+    return [27, 30, 150].includes(candidate.messageType ?? 0) || (candidate.messageType === 5 && this.options.stickerAsText === false);
+  }
+
+  private waitForDetail(candidate: RealtimeMessageCandidate): boolean {
+    if (candidate.messageType === 5 && this.options.stickerAsText !== false) return !candidate.content?.trim();
+    return shouldWaitForMessageDetail(candidate);
   }
 
   private async recall(notice: DouyinRecall): Promise<void> {
@@ -260,7 +270,7 @@ export class RealtimeMessageProcessor {
   private async ready(job: PendingMessage): Promise<void> {
     if (this.stopped || job.recalled || job.state !== 'waiting') return;
     clearTimeout(job.timer);
-    if (job.candidate.messageType !== 27 && job.candidate.messageType !== 30) {
+    if (!this.needsMedia(job.candidate)) {
       job.state = 'running';
       try { await this.deliver(job.candidate); }
       finally { this.pending.delete(job.candidate.serverMessageId!); this.notifyIdle(); }
@@ -296,7 +306,7 @@ export class RealtimeMessageProcessor {
     } catch (error) {
       if (this.stopped || job.recalled) return;
       this.counters.mediaFailures += 1;
-      if (candidate.messageType === 27) candidate = { ...candidate, mediaUnavailable: true, mediaUrl: undefined };
+      if ([5, 27, 150].includes(candidate.messageType ?? 0)) candidate = { ...candidate, mediaUnavailable: true, mediaUrl: undefined };
       this.options.logger.warn({ error, messageId: candidate.serverMessageId }, 'media enrichment failed; reporting original message');
     } finally {
       clearTimeout(timer);
@@ -307,7 +317,7 @@ export class RealtimeMessageProcessor {
 
   private async deliver(candidate: RealtimeMessageCandidate): Promise<void> {
     if (this.stopped || (candidate.serverMessageId && this.recalls.has(candidate.serverMessageId))) return;
-    const message = toDouyinMessage(candidate);
+    const message = toDouyinMessage(candidate, this.options.stickerAsText !== false);
     if (!message) return;
     try {
       await this.options.emit(message);

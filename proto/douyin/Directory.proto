@@ -14,6 +14,7 @@ message DirectoryResponseBody {
   LegacyInitResponse init = 203;
   ParticipantsResponse participants = 605;
   ConversationInfoResponse info = 610;
+  SetConversationCoreInfoResponse set_core_info = 902;
   InitResponse message_by_init = 2043;
 }
 
@@ -78,6 +79,22 @@ message ConversationCoreInfo {
   map<string, string> ext = 11;
   int64 owner = 12;
   int64 create_time = 18;
+}
+
+message SetConversationCoreInfoRequest {
+  string conversation_id = 1;
+  int64 conversation_short_id = 2;
+  int32 conversation_type = 3;
+  string name = 4;
+  bool is_name_set = 8;
+}
+
+message SetConversationCoreInfoResponse {
+  ConversationCoreInfo conversation_core_info = 1;
+  int32 status = 2;
+  string extra_info = 3;
+  int64 check_code = 4;
+  string check_message = 5;
 }
 
 message ParticipantsRequest {

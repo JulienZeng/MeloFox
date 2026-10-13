@@ -1,4 +1,7 @@
-import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { signVodRequest, crc32Hex, type UploadCredentials } from './upload-signing.js';
+import { loadOutgoingFile, uploadOutgoingFile } from './file-upload.js';
+import { prepareOutgoingVideo, uploadOutgoingVideo } from './video-upload.js';
 import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import type { Page } from 'playwright';
@@ -7,10 +10,19 @@ import { RetainedCache } from '../runtime/retained-cache.js';
 import { ActionDeadline } from '../runtime/deadline.js';
 import { DouyinDirectory, decodeDirectoryResponse, encodeDirectoryPayload } from './directory.js';
 import { postImApi } from './im-client.js';
+import { enrichRealtimeFile } from './file.js';
+import { fetchSmallEmojiCatalog } from './emoji.js';
+import { decodeReactionQuery, encodeReactionQuery, type ReactionState } from './reaction.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { resolveDouyinFileUrl, type DouyinFileResource } from './file-url.js';
+import { enrichRealtimeMedia, toDouyinMessage } from './message-adapter.js';
+import type { MediaRegistry } from '../media/registry.js';
 import {
   buildEmojiReactionRequest,
   buildImApiRequest,
   buildImageSendRequest,
+  buildFileSendRequest,
+  buildVideoSendRequest,
   buildRecallRequest,
   buildTextSendRequest,
   decodeSendResponse,
@@ -51,6 +63,11 @@ export function createDouyinBridgeCache(limit = 10000, ttlMs = 7 * 86400000): Do
 export interface DouyinBridgeOptions {
   enableDomMessageCapture?: boolean;
   actionTimeoutMs?: number;
+  maxFileBytes?: number;
+  fileSendAllowedDirs?: string[];
+  videoSendTimeoutMs?: number;
+  ffmpegPath?: string;
+  ffprobePath?: string;
   isImConnected?: () => boolean;
   isRealtimeHealthy?: () => boolean;
   isSessionHealthy?: () => boolean;
@@ -64,6 +81,11 @@ export class DouyinBridge {
   private readonly recallHandlers = new Set<(notice: DouyinRecall) => void | Promise<void>>();
   private readonly recalling = new Map<string, Promise<void>>();
   private readonly ingestingRecalls = new Map<string, Promise<void>>();
+  private readonly receivingFiles = new Map<string, Promise<DouyinMessage>>();
+  private readonly receivingStickers = new Map<string, Promise<DouyinMessage>>();
+  private readonly receivingVideos = new Map<string, Promise<DouyinMessage>>();
+  private emojiCatalog?: { accountId: string; tokens: string[]; expiresAt: number };
+  private loadingEmojiCatalog?: { accountId: string; promise: Promise<string[]> };
   private readonly messageCache: RetainedCache<DouyinMessage>;
   private readonly sentClientMessageIds: RetainedCache<string>;
   private currentUserId: string | undefined;
@@ -78,8 +100,8 @@ export class DouyinBridge {
     this.cache = options.cache ?? createDouyinBridgeCache(options.messageCacheLimit, options.messageCacheTtlMs);
     this.messageCache = this.cache.messages;
     this.sentClientMessageIds = this.cache.sentClientMessageIds;
-    this.directory = new DouyinDirectory(page, async (command, type, params, path, inboxType) => {
-      const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    this.directory = new DouyinDirectory(page, async (command, type, params, path, inboxType, actionDeadline) => {
+      const deadline = actionDeadline ?? new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
       return deadline.run(async () => {
         const context = await this.readSendProtocolContext();
         const payload = await encodeDirectoryPayload(type, params);
@@ -123,8 +145,96 @@ export class DouyinBridge {
     if (this.cache.restored) return undefined;
     if (this.cache.recalls.get(messageId)) return undefined;
     const message = this.messageCache.get(messageId);
+    if (message && [50001, 50002, 70001, 70002].includes(message.messageType ?? 0)) return undefined;
     const callbackStatus = message ? messageCallbackStatus(message) : undefined;
     return callbackStatus !== undefined && callbackStatus !== 0 ? undefined : message;
+  }
+
+  resolveFileUrl(resource: DouyinFileResource): Promise<string> {
+    return resolveDouyinFileUrl(this.page, resource);
+  }
+
+  receiveCachedFile(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const existing = this.receivingFiles.get(messageId);
+    if (existing) return existing;
+    const promise = this.downloadCachedFile(messageId, registry).finally(() => this.receivingFiles.delete(messageId));
+    this.receivingFiles.set(messageId, promise);
+    return promise;
+  }
+
+  private async downloadCachedFile(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const cached = this.getCachedMessage(messageId);
+    if (!cached || cached.messageType !== 150) throw new Error('File message not found in cache');
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    const candidate = await deadline.run(() => enrichRealtimeFile(registry, {
+      source: 'wss://frontier-im.douyin.com/ws/v2', serverMessageId: messageId,
+      conversationId: cached.conversationId, conversationShortId: cached.conversationShortId,
+      conversationType: cached.conversationType === 'group' ? 2 : 1, sender: cached.senderId,
+      messageType: 150, content: cached.content, createTime: String(cached.timestamp), raw: cached.raw
+    }, deadline.signal, resource => this.resolveFileUrl(resource)));
+    deadline.signal.throwIfAborted();
+    if (this.getCachedMessage(messageId) !== cached) throw new Error('File message expired, recalled or changed during download');
+    const replies = cached.segments?.filter(segment => segment.type === 'reply') ?? [];
+    const message = { ...cached, segments: [...replies, ...toDouyinMessage(candidate)!.segments!] };
+    this.messageCache.set(messageId, message);
+    await this.cache.persist?.();
+    return message;
+  }
+
+  receiveCachedSticker(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const existing = this.receivingStickers.get(messageId);
+    if (existing) return existing;
+    const promise = this.downloadCachedSticker(messageId, registry).finally(() => this.receivingStickers.delete(messageId));
+    this.receivingStickers.set(messageId, promise);
+    return promise;
+  }
+
+  private async downloadCachedSticker(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const cached = this.getCachedMessage(messageId);
+    if (!cached || cached.messageType !== 5) throw new Error('Sticker message not found in cache');
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    const candidate = await deadline.run(() => enrichRealtimeMedia(this.page, registry, this.logger, {
+      source: 'wss://frontier-im.douyin.com/ws/v2', serverMessageId: messageId,
+      conversationId: cached.conversationId, conversationShortId: cached.conversationShortId,
+      conversationType: cached.conversationType === 'group' ? 2 : 1, sender: cached.senderId,
+      messageType: 5, content: cached.content, createTime: String(cached.timestamp), raw: cached.raw
+    }, deadline.signal));
+    deadline.signal.throwIfAborted();
+    if (this.getCachedMessage(messageId) !== cached) throw new Error('Sticker message expired, recalled or changed during download');
+    const replies = cached.segments?.filter(segment => segment.type === 'reply') ?? [];
+    const message = { ...cached, segments: [...replies, ...toDouyinMessage(candidate)!.segments!] };
+    this.messageCache.set(messageId, message);
+    await this.cache.persist?.();
+    return message;
+  }
+
+  receiveCachedVideo(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const existing = this.receivingVideos.get(messageId);
+    if (existing) return existing;
+    const promise = this.downloadCachedVideo(messageId, registry).finally(() => this.receivingVideos.delete(messageId));
+    this.receivingVideos.set(messageId, promise);
+    return promise;
+  }
+
+  private async downloadCachedVideo(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const cached = this.getCachedMessage(messageId);
+    if (!cached || cached.messageType !== 30) throw new Error('Video message not found in cache');
+    const accountId = this.accountId;
+    const deadline = new ActionDeadline(this.options.videoSendTimeoutMs ?? 120000);
+    const candidate = await deadline.run(() => enrichRealtimeMedia(this.page, registry, this.logger, {
+      source: 'wss://frontier-im.douyin.com/ws/v2', serverMessageId: messageId,
+      conversationId: cached.conversationId, conversationShortId: cached.conversationShortId,
+      conversationType: cached.conversationType === 'group' ? 2 : 1, sender: cached.senderId,
+      messageType: 30, content: cached.content, createTime: String(cached.timestamp), raw: cached.raw
+    }, deadline.signal));
+    deadline.remainingMs();
+    if (this.accountId !== accountId || this.getCachedMessage(messageId) !== cached) throw new Error('Video message expired, recalled or changed during download');
+    if (!candidate.mediaUrl) throw new Error('Video resource is unavailable');
+    const replies = cached.segments?.filter(segment => segment.type === 'reply') ?? [];
+    const message = { ...cached, segments: [...replies, { type: 'video', data: { file: candidate.mediaUrl } }] };
+    this.messageCache.set(messageId, message);
+    await this.cache.persist?.();
+    return message;
   }
 
   getCacheStats(): { messages: number; sendReceipts: number; recalls: number;
@@ -223,12 +333,44 @@ export class DouyinBridge {
     await this.handleMessage(message);
   }
 
+  getEmojiList(noCache = false, deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000)): Promise<string[]> {
+    const accountId = this.accountId;
+    if (!accountId) return Promise.reject(new Error('Douyin account is not authenticated'));
+    if (!noCache && this.emojiCatalog?.accountId === accountId && this.emojiCatalog.expiresAt > Date.now()) {
+      return Promise.resolve([...this.emojiCatalog.tokens]);
+    }
+    if (this.loadingEmojiCatalog?.accountId === accountId) return deadline.run(() => this.loadingEmojiCatalog!.promise);
+    const promise = deadline.run(async () => {
+      const tokens = await fetchSmallEmojiCatalog(this.page, deadline.remainingMs());
+      deadline.signal.throwIfAborted();
+      if (this.accountId !== accountId) throw new Error('Douyin account changed while loading emoji catalog');
+      this.emojiCatalog = { accountId, tokens: [...tokens], expiresAt: Date.now() + 6 * 60 * 60 * 1000 };
+      return tokens;
+    }).finally(() => { if (this.loadingEmojiCatalog?.promise === promise) this.loadingEmojiCatalog = undefined; });
+    this.loadingEmojiCatalog = { accountId, promise };
+    return promise;
+  }
+
   async sendMessage(input: DouyinSendMessageInput): Promise<DouyinSendMessageResult> {
-    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    const deadline = new ActionDeadline(input.video ? this.options.videoSendTimeoutMs ?? 120000 : this.options.actionTimeoutMs ?? 15000);
     return deadline.run(async () => {
+      if (input.emojiTokens?.length) {
+        const catalog = new Set(await this.getEmojiList(false, deadline));
+        for (const token of input.emojiTokens) {
+          if (!catalog.has(token)) throw new Error(`Unsupported or hidden Douyin emoji: ${token}`);
+        }
+      }
+      if (input.video && (input.text || input.file || input.images?.length || input.mentions?.length || input.replyToMessageId || input.emojiReaction)) {
+        throw new Error('Video must be sent without text, image, at, reply, file, or emoji');
+      }
+      if (input.file && (input.text || input.video || input.images?.length || input.mentions?.length || input.replyToMessageId || input.emojiReaction)) {
+        throw new Error('File must be sent without text, image, at, reply, or emoji');
+      }
       input = { ...input, target: await this.directory.resolveTarget(input.target) };
       this.synchronizeCacheAccount();
       deadline.remainingMs();
+      if (input.video) return this.sendVideoViaImApi(input, deadline);
+      if (input.file) return this.sendFileViaImApi(input, deadline);
       if (input.emojiReaction) {
         return this.sendReactionViaImApi(input, deadline);
       }
@@ -304,6 +446,72 @@ export class DouyinBridge {
     return lastResult;
   }
 
+  private async sendVideoViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
+    const conversationShortId = pickNumericConversationId(input);
+    if (!conversationShortId || !input.video) throw new Error('Video send requires an existing conversation and one video');
+    const accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    const video = await prepareOutgoingVideo(input.video, { maxBytes: this.options.maxFileBytes ?? 128 * 1024 * 1024,
+      allowedDirs: this.options.fileSendAllowedDirs ?? [], ffmpegPath: this.options.ffmpegPath ?? 'ffmpeg',
+      ffprobePath: this.options.ffprobePath ?? 'ffprobe' }, deadline);
+    const config = await this.readImageUploadConfig(deadline.remainingMs());
+    const uploaded = await uploadOutgoingVideo(video, config, deadline);
+    if (this.accountId !== accountId) throw new Error('Douyin account changed during video upload; message was not sent');
+    const context = await this.readSendProtocolContext();
+    deadline.remainingMs();
+    if (this.accountId !== accountId) throw new Error('Douyin account changed before video send; message was not sent');
+    const request = buildVideoSendRequest({ conversationShortId, conversationId: input.target.conversationId,
+      conversationType: input.target.type === 'group' ? 2 : 1, inboxType: input.target.inboxType, video: uploaded, context });
+    const decoded = await this.postImProtobuf('message/send', request.body, deadline);
+    if (!decoded.ok || !decoded.serverMessageId || !/^[1-9]\d*$/.test(decoded.serverMessageId)) {
+      throw new Error(`Douyin video message/send failed: ${decoded.failureReason ?? 'no valid server message receipt; do not retry automatically'}`);
+    }
+    if (this.accountId !== accountId) throw new Error('Douyin account changed after video send; delivery may have succeeded, do not retry automatically');
+    const messageId = decoded.serverMessageId;
+    this.sentClientMessageIds.set(messageId, request.clientMessageId);
+    this.rememberSentTarget(messageId, input.target);
+    if (!this.messageCache.get(messageId) && !this.cache.recalls.get(messageId)) {
+      this.messageCache.set(messageId, { messageId, clientMessageId: request.clientMessageId, messageType: 30,
+        conversationId: input.target.conversationId ?? conversationShortId, conversationShortId, conversationType: input.target.type,
+        senderId: accountId, timestamp: Date.now(), content: request.content, text: '[视频]',
+        raw: { source: 'imapi', payload: { content: request.content, messageType: 30 } } });
+    }
+    await this.cache.persist?.().catch(error => this.logger.warn({ messageId, error: error instanceof Error ? error.message : String(error) }, 'video delivered but send cache persistence failed'));
+    this.logger.info({ messageId, conversationShortId, videoSize: video.bytes.length, width: uploaded.width, height: uploaded.height }, 'sent douyin video through imapi');
+    return { messageId, raw: { source: 'imapi', response: decoded } };
+  }
+
+  private async sendFileViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
+    const conversationShortId = pickNumericConversationId(input);
+    if (!conversationShortId || !input.file) throw new Error('File send requires an existing conversation and one file');
+    const accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    const file = await loadOutgoingFile(input.file, this.options.maxFileBytes ?? 128 * 1024 * 1024, deadline.signal, this.options.fileSendAllowedDirs);
+    const context = await this.readSendProtocolContext();
+    const config = await this.readImageUploadConfig(deadline.remainingMs());
+    const uploaded = await uploadOutgoingFile(file, config, deadline);
+    if (this.accountId !== accountId) throw new Error('Douyin account changed during file upload; message was not sent');
+    const request = buildFileSendRequest({ conversationShortId, conversationId: input.target.conversationId,
+      conversationType: input.target.type === 'group' ? 2 : 1, inboxType: input.target.inboxType, file: uploaded, context });
+    const decoded = await this.postImProtobuf('message/send', request.body, deadline);
+    if (!decoded.ok || !decoded.serverMessageId || !/^[1-9]\d*$/.test(decoded.serverMessageId)) {
+      throw new Error(`Douyin file message/send failed: ${decoded.failureReason ?? 'no valid server message receipt; do not retry automatically'}`);
+    }
+    if (this.accountId !== accountId) throw new Error('Douyin account changed after file send; delivery may have succeeded, do not retry automatically');
+    const messageId = decoded.serverMessageId;
+    this.sentClientMessageIds.set(messageId, request.clientMessageId);
+    this.rememberSentTarget(messageId, input.target);
+    if (!this.messageCache.get(messageId) && !this.cache.recalls.get(messageId)) {
+      this.messageCache.set(messageId, { messageId, clientMessageId: request.clientMessageId, messageType: 150,
+        conversationId: input.target.conversationId ?? conversationShortId, conversationShortId, conversationType: input.target.type,
+        senderId: accountId, timestamp: Date.now(), content: request.content, text: `[文件: ${uploaded.name}]`,
+        raw: { source: 'imapi', payload: { content: request.content, messageType: 150 } } });
+    }
+    await this.cache.persist?.().catch(error => this.logger.warn({ messageId, error: error instanceof Error ? error.message : String(error) }, 'file delivered but send cache persistence failed'));
+    this.logger.info({ messageId, conversationShortId, fileName: uploaded.name, fileSize: uploaded.size }, 'sent douyin file message through imapi');
+    return { messageId, raw: { source: 'imapi', response: decoded } };
+  }
+
   private async sendViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
     const conversationShortId = pickNumericConversationId(input);
     if (!conversationShortId) {
@@ -373,6 +581,8 @@ export class DouyinBridge {
     }
 
     const target = this.buildReactionTarget(input.replyToMessageId, input.target);
+    const accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
     const context = await this.readSendProtocolContext();
     const request = buildEmojiReactionRequest({
       conversationId: input.target.conversationId,
@@ -381,7 +591,7 @@ export class DouyinBridge {
       conversationType: target.conversationType,
       targetMessageId: input.replyToMessageId,
       targetClientMessageId: target.clientMessageId,
-      operatorUserId: this.directory.accountId ?? context.userId ?? this.currentUserId ?? input.operatorUserId ?? '0',
+      operatorUserId: accountId,
       emoji: input.emojiReaction,
       context
     });
@@ -391,11 +601,32 @@ export class DouyinBridge {
       throw new Error(`Douyin message/set_property failed: ${decoded.failureReason ?? decoded.status ?? decoded.statusCode ?? 'unknown'}`);
     }
 
+    const properties = [{ key: input.emojiReaction.key, value: input.emojiReaction.propertyValue }, ...(input.emojiReaction.additionalProperties ?? [])];
+    let verified = false;
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const state = await this.getMessageReactions(input.replyToMessageId, deadline);
+        const versionMatches = !decoded.propertyVersion || BigInt(state.version) >= BigInt(decoded.propertyVersion);
+        verified = versionMatches && properties.every(property => {
+          const items = state.properties[property.key]?.items ?? [];
+          if (input.emojiReaction!.operation === 1) return !items.some(item => item.uid === accountId);
+          const item = items.find(item => item.uid === accountId && item.idempotentId === accountId);
+          return Boolean(item && (property.value === undefined || item.value === property.value));
+        });
+        if (verified) break;
+        if (attempt < 2) await delay(200, undefined, { signal: deadline.signal });
+      }
+    } catch (error) {
+      throw new Error('Reaction acknowledged but verification failed; delivery may have succeeded, do not retry automatically', { cause: error });
+    }
+    if (!verified || this.accountId !== accountId) throw new Error('Reaction request acknowledged but target properties were not verified; delivery may have succeeded, do not retry automatically');
+
     this.logger.info(
       {
         conversationShortId: target.conversationShortId,
         messageId: input.replyToMessageId,
-        emoji: input.emojiReaction.key
+        emoji: input.emojiReaction.key,
+        operation: input.emojiReaction.operation === 1 ? 'remove' : 'add'
       },
       'sent douyin emoji reaction through imapi'
     );
@@ -407,6 +638,26 @@ export class DouyinBridge {
         response: decoded
       }
     };
+  }
+
+  async getMessageReactions(messageId: string, deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000)): Promise<ReactionState> {
+    return deadline.run(async () => {
+      const cached = this.getCachedMessage(messageId);
+      if (!cached?.conversationShortId) throw new Error('Reaction target is not available in the message cache');
+      const accountId = this.accountId;
+      if (!accountId) throw new Error('Douyin account is not authenticated');
+      const context = await this.readSendProtocolContext();
+      const payload = await encodeReactionQuery({ messageId, conversationId: cached.conversationId,
+        conversationShortId: cached.conversationShortId, conversationType: cached.conversationType === 'group' ? 2 : 1 });
+      const raw = await postImApi(this.page, 'v1/message/get_message_by_server_id', buildImApiRequest(211, payload, context), deadline.remainingMs());
+      const state = await decodeReactionQuery(raw);
+      if (state.messageId !== messageId || state.conversationId !== cached.conversationId ||
+        state.conversationShortId !== cached.conversationShortId || state.conversationType !== (cached.conversationType === 'group' ? 2 : 1)) {
+        throw new Error('Reaction query returned a different target');
+      }
+      if (this.accountId !== accountId || this.getCachedMessage(messageId) !== cached) throw new Error('Reaction target expired, recalled or changed during query');
+      return state;
+    });
   }
 
   private async uploadImageViaVod(imageData: LoadedImageData, deadline: ActionDeadline): Promise<DouyinUploadedImage> {
@@ -875,6 +1126,7 @@ export class DouyinBridge {
     if (!cached) {
       throw new Error(`Cannot reply to message outside the realtime cache: ${messageId}`);
     }
+
     const callbackStatus = messageCallbackStatus(cached);
     if (callbackStatus !== undefined && callbackStatus !== 0) {
       throw new Error(`Cannot reply to rejected message: ${messageId}`);
@@ -908,6 +1160,10 @@ export class DouyinBridge {
     const cached = this.getCachedMessage(messageId);
     if (!cached) {
       throw new Error(`Cannot react to message outside the realtime cache: ${messageId}`);
+    }
+    if (cached.conversationType !== fallbackTarget.type || (fallbackTarget.conversationId && fallbackTarget.conversationId !== cached.conversationId) ||
+      (fallbackTarget.conversationShortId && fallbackTarget.conversationShortId !== cached.conversationShortId)) {
+      throw new Error('Reaction target belongs to a different conversation');
     }
 
     const payload = isRecord(cached.raw) && isRecord(cached.raw.payload) ? cached.raw.payload : {};
@@ -947,6 +1203,11 @@ export class DouyinBridge {
 
   async getGroupInfo(groupId: string): Promise<DouyinConversation> {
     return this.directory.getGroupInfo(groupId);
+  }
+
+  async setGroupName(groupId: string, name: string): Promise<void> {
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    await deadline.run(() => this.directory.setGroupName(groupId, name, deadline));
   }
 
   async getFriends(): Promise<DouyinUser[]> {
@@ -1098,13 +1359,6 @@ interface LoadedImageData {
   name: string;
 }
 
-interface UploadCredentials {
-  accessKeyId: string;
-  secretAccessKey: string;
-  sessionToken: string;
-  spaceName: string;
-}
-
 export async function loadImageData(file: string, signal?: AbortSignal): Promise<LoadedImageData> {
   signal?.throwIfAborted();
   if (/^base64:\/\//i.test(file)) {
@@ -1166,81 +1420,6 @@ function normalizeUploadCredentials(value: unknown): UploadCredentials {
   };
 }
 
-function signVodRequest(
-  method: 'GET' | 'POST',
-  url: URL,
-  body: Buffer,
-  credentials: UploadCredentials
-): Record<string, string> {
-  const now = new Date();
-  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
-  const date = amzDate.slice(0, 8);
-  const payloadHash = sha256Hex(body);
-  const baseHeaders: Record<string, string> = {
-    'x-amz-date': amzDate,
-    'x-amz-security-token': credentials.sessionToken
-  };
-  if (method === 'POST') {
-    baseHeaders['x-amz-content-sha256'] = payloadHash;
-  }
-
-  const signedHeaderNames = Object.keys(baseHeaders).sort();
-  const canonicalHeaders = signedHeaderNames.map(key => `${key}:${baseHeaders[key].trim()}\n`).join('');
-  const canonicalRequest = [
-    method,
-    url.pathname || '/',
-    canonicalQueryString(url.searchParams),
-    canonicalHeaders,
-    signedHeaderNames.join(';'),
-    payloadHash
-  ].join('\n');
-  const credentialScope = `${date}/cn-north-1/vod/aws4_request`;
-  const stringToSign = [
-    'AWS4-HMAC-SHA256',
-    amzDate,
-    credentialScope,
-    sha256Hex(Buffer.from(canonicalRequest, 'utf8'))
-  ].join('\n');
-
-  const signingKey = hmac(
-    hmac(
-      hmac(hmac(Buffer.from(`AWS4${credentials.secretAccessKey}`, 'utf8'), date), 'cn-north-1'),
-      'vod'
-    ),
-    'aws4_request'
-  );
-  const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex');
-  return {
-    ...baseHeaders,
-    authorization: `AWS4-HMAC-SHA256 Credential=${credentials.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaderNames.join(';')}, Signature=${signature}`
-  };
-}
-
-function hmac(key: Buffer, value: string): Buffer {
-  return createHmac('sha256', key).update(value).digest();
-}
-
-function sha256Hex(value: Buffer): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-function canonicalQueryString(params: URLSearchParams): string {
-  return [...params.entries()]
-    .map(([key, value]) => [encodeRfc3986(key), encodeRfc3986(value)] as const)
-    .sort(([leftKey, leftValue], [rightKey, rightValue]) => {
-      if (leftKey === rightKey) {
-        return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
-      }
-      return leftKey < rightKey ? -1 : 1;
-    })
-    .map(([key, value]) => `${key}=${value}`)
-    .join('&');
-}
-
-function encodeRfc3986(value: string): string {
-  return encodeURIComponent(value).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-}
-
 async function readJsonResponse(response: Response, label: string): Promise<Record<string, unknown>> {
   const text = await response.text();
   if (!response.ok) {
@@ -1260,26 +1439,6 @@ async function readJsonResponse(response: Response, label: string): Promise<Reco
   }
   return record;
 }
-
-function crc32Hex(buffer: Buffer): string {
-  let crc = 0xffffffff;
-  for (const byte of buffer) {
-    crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
-  }
-  return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
-}
-
-const CRC32_TABLE = (() => {
-  const table: number[] = [];
-  for (let index = 0; index < 256; index += 1) {
-    let value = index;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
-    }
-    table[index] = value >>> 0;
-  }
-  return table;
-})();
 
 function randomId(length: number): string {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';

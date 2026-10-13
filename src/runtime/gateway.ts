@@ -26,13 +26,15 @@ export async function startGatewaySession(config: AppConfig, logger: AppLogger, 
   // Capture starts before navigation; consumption waits until OneBot is ready.
   const realtime = new RealtimeMessageProcessor({
     logger,
+    stickerAsText: config.runtime.stickerAsText,
     queueLimit: config.runtime.realtimeQueueLimit,
     mediaConcurrency: config.runtime.realtimeMediaConcurrency,
     mediaDetailWaitMs: config.runtime.realtimeMediaDetailWaitMs,
     mediaTimeoutMs: config.runtime.realtimeMediaTimeoutMs,
     emit: message => bridge.ingestMessage(message),
     emitRecall: notice => bridge.ingestRecall(notice),
-    enrich: (candidate, signal) => enrichRealtimeMedia(browser!.page, mediaRegistry, logger, candidate, signal)
+    enrich: (candidate, signal) => enrichRealtimeMedia(browser!.page, mediaRegistry, logger, candidate, signal,
+      resource => bridge.resolveFileUrl(resource))
   });
   const stop = (): Promise<void> => stopPromise ??= (async () => {
     stopping = true;
@@ -50,6 +52,11 @@ export async function startGatewaySession(config: AppConfig, logger: AppLogger, 
     browser = await startBrowserRuntime(config, logger, { onNetworkEvent: event => { realtime.enqueue(event); } });
     bridge = new DouyinBridge(browser.page, logger, {
       actionTimeoutMs: config.runtime.actionTimeoutMs,
+      videoSendTimeoutMs: config.runtime.videoSendTimeoutMs,
+      ffmpegPath: config.onebot.mediaCache.ffmpegPath,
+      ffprobePath: config.onebot.mediaCache.ffprobePath,
+      maxFileBytes: config.onebot.mediaCache.maxFileBytes,
+      fileSendAllowedDirs: [config.onebot.mediaCache.dir, ...config.runtime.fileSendAllowedDirs],
       messageCacheLimit: config.runtime.messageCacheLimit,
       messageCacheTtlMs: config.runtime.messageCacheTtlMs,
       cache: sharedMessageCache,

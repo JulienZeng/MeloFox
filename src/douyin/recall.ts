@@ -2,7 +2,10 @@ import type { RealtimeMessageCandidate } from './protobuf.js';
 import type { DouyinRecall } from './types.js';
 
 export function isRecallMessage(candidate: RealtimeMessageCandidate): boolean {
-  return candidate.messageType === 50002 || candidate.messageType === 40001;
+  if (candidate.messageType === 40001) return true;
+  if (candidate.messageType !== 50002) return false;
+  const raw = candidate.raw as { ext?: Array<{ key: string; value: string }> };
+  return Array.isArray(raw?.ext) && raw.ext.some(item => item.key === 's:is_recalled' && item.value === 'true');
 }
 
 export function toDouyinRecall(candidate: RealtimeMessageCandidate): DouyinRecall | undefined {
@@ -21,7 +24,7 @@ export function toDouyinRecall(candidate: RealtimeMessageCandidate): DouyinRecal
     conversationId: candidate.conversationId,
     conversationShortId: candidate.conversationShortId,
     conversationType: candidate.conversationType === 2 ? 'group' : 'private',
-    // Role zero is a self recall. For moderator recalls, resolve the author from the original cache.
+    // Role zero identifies a self recall; unfamiliar roles need a cached author, not an assumed permission.
     senderId: ext.get('s:recall_role') === '0' ? operatorId : undefined,
     timestamp: Number.isFinite(createTime) && createTime > 0 ? (createTime < 1e12 ? createTime * 1000 : createTime) : Date.now(),
     raw: { source: candidate.source, payload: candidate.raw }

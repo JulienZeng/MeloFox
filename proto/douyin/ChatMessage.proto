@@ -71,5 +71,18 @@ message MessageBody {
   int32 status = 12;
   int64 orderInConversation = 13;
   string secSender = 14;
+  map<string, ReactionPropertyItemList> propertyList = 15;
   int64 indexInConversationV2 = 17;
+}
+
+message ReactionPropertyItemList {
+  repeated ReactionPropertyItem items = 1;
+}
+
+message ReactionPropertyItem {
+  int64 uid = 1;
+  string secUid = 2;
+  int64 createTime = 3;
+  string idempotentId = 4;
+  string value = 5;
 }

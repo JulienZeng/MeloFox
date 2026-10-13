@@ -8,16 +8,21 @@ import type { AppConfig } from '../config/index.js';
 import type { AppLogger } from '../logger/index.js';
 import { z } from 'zod';
 import { readCacheJson, writeCacheJson } from '../runtime/cache-file.js';
-import { decodeDouyinImage, imageFormat } from './image.js';
+import { decodeDouyinImage, imageFormat, type ImageFormat } from './image.js';
+import { decodeDouyinFile, type FilePayload } from './file.js';
 
 interface CacheOptions {
+  filePayload?: FilePayload;
   douyinDecryptKeyHex?: string;
   normalizeImage?: boolean;
+  validateImage?: (bytes: Buffer, format: ImageFormat, signal?: AbortSignal) => Promise<void>;
   douyinImageKeyHex?: string;
   signal?: AbortSignal;
 }
 
 export interface RegisteredMedia {
+  fileName?: string;
+  fileMd5?: string;
   id: string;
   sourceUrl: string;
   filePath: string;
@@ -31,7 +36,9 @@ const ownedFilePattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 const mediaIndexSchema = z.object({ version: z.literal(1), items: z.array(z.object({
   id: z.string().regex(mediaIdPattern), sourceUrl: z.string().url(),
   contentType: z.string().regex(/^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+(?:;[^\r\n]*)?$/),
-  createdAt: z.number().finite().nonnegative(), size: z.number().int().nonnegative().safe()
+  createdAt: z.number().finite().nonnegative(), size: z.number().int().nonnegative().safe(),
+  fileName: z.string().min(1).max(255).regex(/^[^\x00-\x1f\x7f/\\]+$/).optional(),
+  fileMd5: z.string().regex(/^[a-f0-9]{32}$/).optional()
 })) });
 
 export class MediaRegistry {
@@ -184,18 +191,46 @@ export class MediaRegistry {
       return undefined;
     });
     signal.throwIfAborted();
-    if (reused) return reused;
+    if (reused) return this.validateFileCache(reused, options.filePayload);
 
     const downloading = this.downloads.get(sourceUrl);
     if (downloading) {
-      return downloading;
+      return this.validateFileCache(await downloading, options.filePayload);
     }
 
     const promise = this.downloadRemote(sourceUrl, contentType, extension, { ...options, signal }).finally(() => {
       this.downloads.delete(sourceUrl);
     });
     this.downloads.set(sourceUrl, promise);
-    return promise;
+    return this.validateFileCache(await promise, options.filePayload);
+  }
+
+  assertFileSize(size: number): void {
+    if (!Number.isSafeInteger(size) || size < 0 || size > this.config.onebot.mediaCache.maxFileBytes ||
+        size > this.config.onebot.mediaCache.maxBytes) throw new Error('File exceeds cache size limit');
+  }
+
+  private async validateFileCache(url: string, file?: FilePayload): Promise<string> {
+    if (file) {
+      const cached = await this.getFile(url);
+      if (cached.size !== file.size || cached.md5 !== file.md5.toLowerCase()) throw new Error('Cached file integrity metadata mismatch');
+    }
+    return url;
+  }
+
+  async getFile(file: string): Promise<{ size: number; file_name: string; file: string; url: string; md5: string }> {
+    await this.initialize();
+    return this.exclusive(async () => {
+      const item = this.findItem(file);
+      if (!item?.fileName || !item.fileMd5) throw new Error('File not found in verified media cache');
+      const info = await lstat(item.filePath).catch(() => undefined);
+      if (this.expired(item) || !info?.isFile() || info.size !== item.size) {
+        await this.removeItem(item);
+        await this.persistIndex();
+        throw new Error('File cache expired or missing');
+      }
+      return { size: item.size, file_name: item.fileName, file: item.filePath, url: this.publicUrl(item.id), md5: item.fileMd5 };
+    });
   }
 
   async serve(request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply): Promise<void> {
@@ -230,6 +265,10 @@ export class MediaRegistry {
     reply.header('accept-ranges', 'bytes');
     reply.header('cache-control', 'private, no-store');
     reply.header('content-type', item.contentType);
+    if (item.fileName) {
+      reply.header('content-disposition', `attachment; filename="file.${extname(item.id).slice(1)}"; filename*=UTF-8''${encodeURIComponent(item.fileName).replace(/['()*]/g, char => `%${char.charCodeAt(0).toString(16)}`)}`);
+      reply.header('x-content-type-options', 'nosniff');
+    }
 
     if (range) {
       reply.code(206);
@@ -328,6 +367,7 @@ export class MediaRegistry {
     options: CacheOptions
   ): Promise<string> {
     await this.cleanupExpired();
+    if (options.filePayload) this.assertFileSize(options.filePayload.size);
 
     const upstream = await fetch(sourceUrl, {
       redirect: 'follow',
@@ -340,7 +380,7 @@ export class MediaRegistry {
     }
 
     const upstreamContentType = upstream.headers.get('content-type');
-    let resolvedContentType = upstreamContentType && /^(?:audio|image|video)\//i.test(upstreamContentType) ? upstreamContentType : contentType;
+    let resolvedContentType = !options.filePayload && upstreamContentType && /^(?:audio|image|video)\//i.test(upstreamContentType) ? upstreamContentType : contentType;
     const cacheId = randomUUID();
     let id = `${cacheId}${pickExtension(extension, sourceUrl, resolvedContentType)}`;
     let filePath = resolve(this.cacheDir, id);
@@ -348,8 +388,10 @@ export class MediaRegistry {
     let completed = false;
     this.activeIds.add(cacheId);
     try {
-      let buffer = await readBoundedMedia(upstream, Math.min(this.config.onebot.mediaCache.maxFileBytes, this.config.onebot.mediaCache.maxBytes), options.signal);
+      const fileLimit = Math.min(this.config.onebot.mediaCache.maxFileBytes, this.config.onebot.mediaCache.maxBytes);
+      let buffer = await readBoundedMedia(upstream, options.filePayload ? fileLimit * 2 + 256 : fileLimit, options.signal);
       options.signal?.throwIfAborted();
+      if (options.filePayload) buffer = decodeDouyinFile(buffer, options.filePayload);
       let transcodeImage = false;
       if (options.normalizeImage) {
         buffer = decodeDouyinImage(buffer, options.douyinImageKeyHex);
@@ -358,6 +400,7 @@ export class MediaRegistry {
         id = `${cacheId}${format.extension}`;
         filePath = resolve(this.cacheDir, id);
         transcodeImage = Boolean(format.transcode);
+        if (transcodeImage && options.validateImage) throw new Error('Sticker format requires conversion that could discard animation');
       }
       await writeFile(downloadPath, buffer, { mode: 0o600 });
       this.logger?.debug(
@@ -372,10 +415,13 @@ export class MediaRegistry {
         if (result.exitCode !== 0) throw new Error('Failed to convert HEIF image to PNG');
         await rm(downloadPath, { force: true });
       } else if (options.normalizeImage) {
-        const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath,
-          ['-hide_banner', '-loglevel', 'error', '-i', downloadPath, '-frames:v', '1', '-f', 'null', '-'], options.signal);
+        if (options.validateImage) await options.validateImage(buffer, imageFormat(buffer)!, options.signal);
+        else {
+          const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath,
+            ['-hide_banner', '-loglevel', 'error', '-i', downloadPath, '-frames:v', '1', '-f', 'null', '-'], options.signal);
+          if (result.exitCode !== 0) throw new Error('Image payload cannot be decoded');
+        }
         options.signal?.throwIfAborted();
-        if (result.exitCode !== 0) throw new Error('Image payload cannot be decoded');
       }
       const isVideo = /video\//i.test(resolvedContentType);
       const shouldProcessVideo = isVideo && (this.config.onebot.mediaCache.transcodeVideoToH264 || Boolean(options.douyinDecryptKeyHex));
@@ -402,7 +448,8 @@ export class MediaRegistry {
       await this.exclusive(async () => {
         options.signal?.throwIfAborted();
         await this.pruneCompleted(fileStat.size, 1);
-        this.items.set(id, { id, sourceUrl, filePath, contentType: resolvedContentType, createdAt: Date.now(), size: fileStat.size });
+        this.items.set(id, { id, sourceUrl, filePath, contentType: resolvedContentType, createdAt: Date.now(), size: fileStat.size,
+          fileName: options.filePayload?.name, fileMd5: options.filePayload?.md5.toLowerCase() });
         this.sourceToId.set(sourceUrl, id);
         try { await this.persistIndex(); }
         catch (error) {

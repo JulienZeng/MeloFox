@@ -2,6 +2,7 @@ import { resolve } from 'node:path';
 import protobuf from 'protobufjs';
 import type { Page } from 'playwright';
 import type { AppLogger } from '../logger/index.js';
+import type { ActionDeadline } from '../runtime/deadline.js';
 import type { DouyinConversation, DouyinGroupMember, DouyinSendTarget, DouyinUser } from './types.js';
 
 interface WireParticipant {
@@ -35,6 +36,9 @@ export interface DirectoryResponse {
   body?: {
     messageByInit?: { messages?: Array<{ conversations?: WireConversation }>; hasMore?: boolean; version?: string; nextInitVersion?: string };
     info?: { conversationInfoList?: WireConversation[] };
+    setCoreInfo?: { conversationCoreInfo?: NonNullable<WireConversation['conversationCoreInfo']> & {
+      conversationId?: string; conversationShortId?: string; conversationType?: number;
+    }; status?: number; extraInfo?: string; checkCode?: string; checkMessage?: string };
     participants?: { participantsPage?: ParticipantsPage };
   };
 }
@@ -80,11 +84,11 @@ function mapParticipant(value: WireParticipant, groupId: string, ownerId?: strin
     userId: value.userId,
     secUid: value.secUid,
     card: value.alias || undefined,
-    role: value.userId === ownerId || value.role === 1 ? 'owner' : value.role === 2 ? 'admin' : 'member'
+    role: value.userId === ownerId || value.role === 1 ? 'owner' : 'member'
   };
 }
 
-type DirectoryRequester = (command: number, type: string, params: Record<string, unknown>, path: string, inboxType: number) => Promise<DirectoryResponse>;
+type DirectoryRequester = (command: number, type: string, params: Record<string, unknown>, path: string, inboxType: number, deadline?: ActionDeadline) => Promise<DirectoryResponse>;
 
 export class DouyinDirectory {
   private readonly conversations = new Map<string, DouyinConversation>();
@@ -154,8 +158,10 @@ export class DouyinDirectory {
     throw new Error('Douyin conversation pagination exceeded limit');
   }
 
-  private async query(command: number, type: string, params: Record<string, unknown>, path: string, inboxType: number): Promise<DirectoryResponse> {
-    const response = await this.request(command, type, params, path, inboxType);
+  private async query(command: number, type: string, params: Record<string, unknown>, path: string, inboxType: number, deadline?: ActionDeadline): Promise<DirectoryResponse> {
+    deadline?.remainingMs();
+    const response = await this.request(command, type, params, path, inboxType, deadline);
+    deadline?.remainingMs();
     if (response.cmd !== command || response.statusCode !== 0) {
       if (command === 2043) this.authenticated = false;
       throw new Error(`Douyin ${path} failed: ${response.statusCode} ${response.errorDesc ?? ''}`);
@@ -228,17 +234,42 @@ export class DouyinDirectory {
     return user;
   }
 
-  async getGroupInfo(groupId: string): Promise<DouyinConversation> {
+  async getGroupInfo(groupId: string, deadline?: ActionDeadline): Promise<DouyinConversation> {
     if (!/^[1-9]\d*$/.test(groupId)) throw new Error('group_id must be a numeric Douyin conversation ID');
     const response = await this.query(610, 'ConversationInfoRequest', {
       conversationInfoList: [{ conversationId: groupId, conversationShortId: groupId, conversationType: 2 }]
-    }, 'v2/conversation/get_info_list', 0);
+    }, 'v2/conversation/get_info_list', 0, deadline);
     const value = response.body?.info?.conversationInfoList?.find(item => item.conversationType === 2 && item.conversationShortId === groupId);
     if (!value) throw new Error(`Douyin group not found: ${groupId}`);
     const conversation = mapConversation(value, this.selfId ?? '');
     this.conversations.set(conversation.id, conversation);
     await this.enrichConversations([conversation]);
     return conversation;
+  }
+
+  async setGroupName(groupId: string, name: string, deadline?: ActionDeadline): Promise<void> {
+    if (!/^[1-9]\d*$/.test(groupId) || BigInt(groupId) > 9223372036854775807n) {
+      throw new Error('group_id must be a positive int64 Douyin conversation ID');
+    }
+    if (typeof name !== 'string' || !name.trim()) throw new Error('group_name must be a non-empty string');
+    const conversation = await this.getGroupInfo(groupId, deadline);
+    const response = await this.query(902, 'SetConversationCoreInfoRequest', {
+      conversationId: conversation.id, conversationShortId: conversation.shortId,
+      conversationType: 2, name, isNameSet: true
+    }, 'v1/conversation/set_core_info', conversation.inboxType ?? 0, deadline);
+    const result = response.body?.setCoreInfo;
+    if (!result || result.status !== 0 || (result.checkCode !== undefined && result.checkCode !== '0')) {
+      throw new Error(`Douyin group name update failed: status=${result?.status ?? 'missing'}, check_code=${result?.checkCode ?? 'missing'}; ${result?.checkMessage || result?.extraInfo || response.errorDesc || 'missing successful business response'}`);
+    }
+    const core = result.conversationCoreInfo;
+    if (!core || core.conversationId !== conversation.id || core.conversationShortId !== conversation.shortId ||
+        core.conversationType !== 2 || core.name !== name) {
+      this.refreshedAt = 0;
+      throw new Error('Douyin group name update returned no matching conversation and applied name; result is unconfirmed, do not retry automatically');
+    }
+    const current = this.conversations.get(conversation.id);
+    if (current) this.conversations.set(conversation.id, { ...current, name: core.name });
+    this.logger.info({ groupId }, 'updated douyin group name through imapi');
   }
 
   async getGroupMembers(groupId: string, noCache = false): Promise<DouyinGroupMember[]> {

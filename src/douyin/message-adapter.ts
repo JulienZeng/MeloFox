@@ -1,4 +1,5 @@
 import type { Page } from 'playwright';
+import { parse, parseNumberAndBigInt, stringify } from 'lossless-json';
 import type { AppLogger } from '../logger/index.js';
 import type { MediaRegistry } from '../media/registry.js';
 import { atSegment, imageSegment, recordSegment, replySegment, textSegment, videoSegment } from '../onebot/message-segment.js';
@@ -6,10 +7,15 @@ import type { OneBotMessageSegment } from '../onebot/types.js';
 import type { RealtimeMessageCandidate } from './protobuf.js';
 import type { DouyinMessage } from './types.js';
 import { extractDouyinVideoKey, extractDouyinVideoSkey, resolveDouyinVideoUrl } from './video-url.js';
+import { enrichRealtimeFile, parseDouyinFile } from './file.js';
+import type { DouyinFileResource } from './file-url.js';
+import { parseDouyinShare, shareDisplayText, shareMessageSegment } from './share.js';
+import { parseDouyinSticker, stickerSegment, stickerText, validateStickerImage } from './sticker.js';
 
 export function shouldWaitForMessageDetail(candidate: RealtimeMessageCandidate): boolean {
   // Mobile quoted text may have an empty WS body; HTTP supplies text and mentions.
   if (candidate.messageType === 7) return !candidate.content?.trim();
+  if (candidate.messageType === 5) return !parseDouyinSticker(candidate.content, 5)?.url;
 
   if (candidate.messageType !== 27 && candidate.messageType !== 30) {
     return false;
@@ -92,8 +98,22 @@ export async function enrichRealtimeVideoUrl(
 
 export async function enrichRealtimeMedia(
   page: Page, mediaRegistry: MediaRegistry, logger: AppLogger,
-  candidate: RealtimeMessageCandidate, signal: AbortSignal
+  candidate: RealtimeMessageCandidate, signal: AbortSignal,
+  resolveFileUrl?: (resource: DouyinFileResource) => Promise<string>
 ): Promise<RealtimeMessageCandidate> {
+  if (candidate.messageType === 5) {
+    const sticker = parseDouyinSticker(candidate.content, 5);
+    if (!sticker?.url) throw new Error('Sticker message has no downloadable resource');
+    const mediaUrl = await mediaRegistry.cacheRemote(sticker.url, 'image/webp', undefined, {
+      normalizeImage: true, signal,
+      validateImage: (bytes, format, validationSignal) => validateStickerImage(page, bytes, format, validationSignal)
+    });
+    return { ...candidate, mediaUrl };
+  }
+  if (candidate.messageType === 150) {
+    if (!resolveFileUrl) throw new Error('File URL resolver is not available');
+    return enrichRealtimeFile(mediaRegistry, candidate, signal, resolveFileUrl);
+  }
   if (candidate.messageType !== 27) return enrichRealtimeVideoUrl(page, mediaRegistry, logger, candidate, signal);
   const content = parseJson(candidate.content);
   const url = candidate.mediaUrl ?? pickImageUrls(content, collectUrls(content ?? candidate.raw))[0];
@@ -107,10 +127,12 @@ export async function enrichRealtimeMedia(
 }
 
 function mergeMessageContent(content: string | undefined, detail: string | undefined): string | undefined {
-  const original = parseJson(content);
-  const additional = parseJson(detail);
-  if (!isRecord(original) || !isRecord(additional)) return content || detail;
-  return JSON.stringify(mergeContentObjects(original, additional));
+  try {
+    const original = parse(content ?? '', undefined, parseNumberAndBigInt);
+    const additional = parse(detail ?? '', undefined, parseNumberAndBigInt);
+    if (!isRecord(original) || !isRecord(additional)) return content || detail;
+    return stringify(mergeContentObjects(original, additional)) ?? content ?? detail;
+  } catch { return content || detail; }
 }
 
 function mergeContentObjects(original: Record<string, unknown>, additional: Record<string, unknown>): Record<string, unknown> {
@@ -124,7 +146,8 @@ function mergeContentObjects(original: Record<string, unknown>, additional: Reco
   return result;
 }
 
-export function toDouyinMessage(candidate: RealtimeMessageCandidate): DouyinMessage | undefined {
+export function toDouyinMessage(candidate: RealtimeMessageCandidate, stickerAsText = false): DouyinMessage | undefined {
+  if ([50001, 50002, 70001, 70002].includes(candidate.messageType ?? 0)) return undefined;
   if (!candidate.source.includes('frontier-im.douyin.com')) {
     return undefined;
   }
@@ -135,7 +158,9 @@ export function toDouyinMessage(candidate: RealtimeMessageCandidate): DouyinMess
 
   const timestamp = Number(candidate.createTime);
   const parsedContent = parseJson(candidate.content);
-  const text = getDisplayText(candidate, parsedContent);
+  const share = parseDouyinShare(candidate.content, candidate.messageType);
+  const text = candidate.messageType === 5 && stickerAsText ? stickerText(parseDouyinSticker(candidate.content, 5))
+    : share ? shareDisplayText(share) : getDisplayText(candidate, parsedContent);
 
   return {
     messageId: candidate.serverMessageId,
@@ -147,7 +172,7 @@ export function toDouyinMessage(candidate: RealtimeMessageCandidate): DouyinMess
     clientMessageId: candidate.clientMessageId,
     content: candidate.content,
     text,
-    segments: buildMessageSegments(candidate, parsedContent, text),
+    segments: buildMessageSegments(candidate, parsedContent, text, stickerAsText),
     timestamp: Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now(),
     raw: {
       source: candidate.source,
@@ -159,7 +184,8 @@ export function toDouyinMessage(candidate: RealtimeMessageCandidate): DouyinMess
 function buildMessageSegments(
   candidate: RealtimeMessageCandidate,
   parsedContent: unknown,
-  fallbackText: string
+  fallbackText: string,
+  stickerAsText: boolean
 ): OneBotMessageSegment[] {
   const segments: OneBotMessageSegment[] = [];
   if (candidate.reference?.messageId) {
@@ -171,8 +197,31 @@ function buildMessageSegments(
     return segments;
   }
 
+  if (candidate.messageType === 5) {
+    segments.push(stickerAsText ? textSegment(fallbackText)
+      : stickerSegment(parseDouyinSticker(candidate.content, 5), candidate.mediaUnavailable ? undefined : candidate.mediaUrl));
+    return segments;
+  }
+
+  if (candidate.messageType === 150) {
+    try {
+      const file = parseDouyinFile(candidate.content);
+      segments.push(candidate.mediaUrl && !candidate.mediaUnavailable
+        ? { type: 'file', data: { file_id: candidate.serverMessageId, name: file.name, file_name: file.name,
+          file: candidate.mediaUrl, url: candidate.mediaUrl, file_size: file.size, md5: file.md5 } }
+        : textSegment(`[文件暂不可用: ${file.name}]`));
+    } catch { segments.push(textSegment('[文件暂不可用: 元数据无效]')); }
+    return segments;
+  }
+
   if (candidate.messageType === 27 && candidate.mediaUnavailable) {
     segments.push(textSegment('[图片暂不可用]'));
+    return segments;
+  }
+
+  const share = parseDouyinShare(candidate.content, candidate.messageType);
+  if (share) {
+    segments.push(shareMessageSegment(share));
     return segments;
   }
 
@@ -272,6 +321,10 @@ function buildTextSegments(parsedContent: unknown, fallbackText: string): OneBot
 }
 
 function getDisplayText(candidate: RealtimeMessageCandidate, parsedContent: unknown): string {
+  if (candidate.messageType === 5) {
+    const name = parseDouyinSticker(candidate.content, 5)?.name;
+    return `[表情${name ? `: ${name}` : ''}]`;
+  }
   if (candidate.messageType === 7 && candidate.text) {
     return candidate.text;
   }

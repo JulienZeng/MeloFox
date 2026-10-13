@@ -63,7 +63,10 @@ export interface DouyinRecall {
 export interface DouyinSendMessageInput {
   target: DouyinSendTarget;
   text: string;
+  emojiTokens?: string[];
   images?: string[];
+  file?: { file: string; name?: string };
+  video?: { file: string };
   mentions?: DouyinOutgoingMention[];
   replyToMessageId?: string;
   emojiReaction?: DouyinEmojiReaction;
@@ -87,6 +90,8 @@ export interface DouyinEmojiReaction {
   iconUrl?: string;
   text?: string;
   propertyValue?: string;
+  additionalProperties?: Array<{ key: string; value: string }>;
+  operation?: 0 | 1;
 }
 
 export interface DouyinGroupMember {
@@ -95,6 +100,6 @@ export interface DouyinGroupMember {
   nickname?: string;
   card?: string;
   secUid?: string;
-  role?: 'owner' | 'admin' | 'member';
+  role?: 'owner' | 'member';
   raw?: unknown;
 }
