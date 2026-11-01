@@ -1,4 +1,5 @@
 import { buildInteractiveEmoji } from './interactive-emoji.js';
+import { dyCommandReply, isDyCommand } from './local-command.js';
 import { buildGroupCard } from './group-card.js';
 import { OutgoingMediaCache } from '../media/outgoing.js';
 import { groupNotices, modifiedGroupMembers, removedAdminNotices, type DouyinGroupNotice } from './group-notice.js';
@@ -114,6 +115,7 @@ export class DouyinBridge {
   private readonly recallHandlers = new Set<(notice: DouyinRecall) => void | Promise<void>>();
   private readonly groupNoticeHandlers = new Set<(notice: DouyinGroupNotice) => void | Promise<void>>();
   private readonly groupRequestHandlers = new Set<(request: import('./directory.js').GroupApplyInfo, flag: string) => void | Promise<void>>();
+  private groupRequestPoll?: Promise<void>;
   private readonly reactionHandlers = new Set<(notice: DouyinReactionNotice) => void | Promise<void>>();
   private readonly reactionDeliveries = new Map<string, Promise<void>>();
   private readonly groupNoticeDeliveries = new Map<string, Promise<void>>();
@@ -195,9 +197,13 @@ export class DouyinBridge {
 
   onGroupRequest(handler: (request: import('./directory.js').GroupApplyInfo, flag: string) => void | Promise<void>): void { this.groupRequestHandlers.add(handler); }
 
-  async pollGroupRequests(): Promise<void> {
+  pollGroupRequests(): Promise<void> {
+    return this.groupRequestPoll ??= this.deliverGroupRequests().finally(() => { this.groupRequestPoll = undefined; });
+  }
+
+  private async deliverGroupRequests(): Promise<void> {
     const accountId = this.accountId;
-    if (!accountId || !this.groupRequestHandlers.size) return;
+    if (!accountId || this.signedOut || !this.groupRequestHandlers.size) return;
     this.synchronizeCacheAccount();
     const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
     await deadline.run(async () => {
@@ -211,7 +217,9 @@ export class DouyinBridge {
             if (this.accountId !== accountId) throw new Error('Account changed while delivering group requests');
             for (const handler of this.groupRequestHandlers) await handler(request, flag);
             if (this.accountId !== accountId) throw new Error('Account changed while delivering group requests');
-            this.cache.notifications.set(flag, true); await this.cache.persist?.();
+            this.cache.notifications.set(flag, true);
+            try { await this.cache.persist?.(); }
+            catch (error) { this.cache.notifications.delete(flag); throw error; }
           }
         } catch (error) {
           deadline.remainingMs();
@@ -1758,6 +1766,11 @@ export class DouyinBridge {
     if (!message.senderName) {
       message = { ...message, senderName: this.directory.getCachedUser(message.senderId)?.name };
     }
+    if (message.conversationType === 'group') {
+      const member = this.directory.getCachedGroupMember?.(message.conversationShortId ?? message.conversationId, message.senderId);
+      if (member) message = { ...message, senderName: message.senderName ?? member.nickname,
+        senderCard: member.card ?? '', senderRole: member.role === 'owner' || [0, 2].includes(member.rawRole ?? -1) ? member.role : undefined };
+    }
     this.messageCache.set(message.messageId, message);
     const isOwnEcho = Boolean(message.clientMessageId && this.sentClientMessageIds.get(message.messageId) === message.clientMessageId);
     if (message.clientMessageId) {
@@ -1772,6 +1785,10 @@ export class DouyinBridge {
       return;
     }
     if (this.cache.notifications.get(`message:${message.messageId}`)) return;
+    if (isDyCommand(message)) {
+      await this.replyToLocalCommand(message);
+      return;
+    }
     this.logger.info(
       {
         messageId: message.messageId,
@@ -1786,6 +1803,32 @@ export class DouyinBridge {
       await handler(message);
     }
     if (this.messageHandlers.size) this.cache.notifications.set(`message:${message.messageId}`, true);
+  }
+
+  private async replyToLocalCommand(message: DouyinMessage): Promise<void> {
+    const accountId = this.accountId;
+    // Own-device commands and reply echoes must never start a reply loop.
+    if (!accountId || message.senderId === accountId || !message.conversationId) return;
+    const key = `local-command:${message.messageId}`;
+    if (this.cache.notifications.get(key)) return;
+    // Claim before sending: a reconnect, duplicate push or lost receipt must
+    // not repeat an already attempted reply. Persistence failure prevents send.
+    this.cache.notifications.set(key, true);
+    try {
+      await this.cache.persist?.();
+      if (this.signedOut || this.accountId !== accountId) return;
+      await this.sendMessage({
+        target: {
+          type: message.conversationType,
+          conversationId: message.conversationId,
+          conversationShortId: message.conversationShortId,
+          ...(message.conversationType === 'private' ? { userId: message.senderId } : {})
+        },
+        text: dyCommandReply()
+      });
+    } catch (error) {
+      this.logger.warn({ error, messageId: message.messageId }, 'local #dy reply failed; command consumed without forwarding or retry');
+    }
   }
 
   private rememberSentTarget(messageId: string, target: DouyinSendTarget): void {

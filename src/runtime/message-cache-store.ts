@@ -15,6 +15,7 @@ const scope = z.enum(['private', 'group']);
 const message = z.object({
   messageId: id, conversationId: id, conversationShortId: id.optional(), conversationType: scope,
   senderId: id, senderName: z.string().optional(), messageType: z.number().int().optional(),
+  senderCard: z.string().optional(), senderRole: z.enum(['owner', 'admin', 'member']).optional(),
   clientMessageId: z.string().optional(), content: z.string().optional(), text: z.string().optional(),
   segments: z.array(z.object({ type: id, data: z.record(z.union([z.string(), z.number(), z.boolean()])) })).optional(),
   timestamp: z.number().finite(), raw: z.unknown()
@@ -62,7 +63,7 @@ const manifestSchema = z.object({ version: z.literal(2), accountId: id,
   }
 });
 const recordSchema = z.object({ version: z.literal(1), accountId: id,
-  kind: z.enum(['messages', 'sentClientMessageIds', 'sentTargets', 'recalls']), entry: z.object({
+  kind: z.enum(['messages', 'notifications', 'pendingSends', 'sentClientMessageIds', 'sentTargets', 'recalls']), entry: z.object({
     key: id, expiresAt: z.number().finite(), value: z.unknown()
   }) });
 const MAX_RECORD_BYTES = 4 * 1024 * 1024;

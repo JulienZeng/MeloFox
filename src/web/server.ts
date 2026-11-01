@@ -9,6 +9,8 @@ import type { BrowserRuntime } from '../browser/chromium.js';
 import type { DouyinBridge } from '../douyin/bridge.js';
 import { LoginAssist } from '../douyin/login-assist.js';
 import { ChannelManager } from './channels.js';
+import { registerConsoleAssets } from './assets.js';
+import type { ConsoleStatus } from './contracts.js';
 import {
   DouyinLogin,
   PassportError,
@@ -37,7 +39,7 @@ export class ConsoleControl {
     this.recover = undefined;
     this.checkSession = undefined;
   }
-  status() {
+  status(): ConsoleStatus {
     return {
       startedAt: this.startedAt,
       account: {
@@ -62,7 +64,8 @@ export class ConsoleControl {
 export async function createConsoleServer(
   config: AppConfig,
   logger: AppLogger,
-  control: ConsoleControl
+  control: ConsoleControl,
+  options: { development?: boolean } = {}
 ): Promise<FastifyInstance> {
   control.login ??= new DouyinLogin(
     config,
@@ -100,6 +103,7 @@ export async function createConsoleServer(
   const expected = digest(adminToken);
   const sessions = new Map<string, number>();
   const attempts = new Map<string, { count: number; until: number }>();
+  let developmentNonce: string | undefined;
   const sessionOf = (cookie?: string) =>
     cookie?.match(/(?:^|;\s*)dy_console=([\w-]+)/)?.[1];
   server.addHook('onRequest', async (request, reply) => {
@@ -109,7 +113,7 @@ export async function createConsoleServer(
       .header('Referrer-Policy', 'no-referrer');
     reply.header(
       'Content-Security-Policy',
-      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+      `default-src 'self'; script-src 'self'; style-src 'self'${developmentNonce ? ` 'nonce-${developmentNonce}'` : ''}; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`
     );
     if (!['GET', 'HEAD'].includes(request.method)) {
       const origin = request.headers.origin;
@@ -144,24 +148,11 @@ export async function createConsoleServer(
       message: status >= 500 ? '服务暂时不可用，请稍后重试' : failure.message
     });
   });
-  const assets = [
-    ['/', 'index.html', 'text/html; charset=utf-8'],
-    ['/app.js', 'app.js', 'text/javascript; charset=utf-8'],
-    ['/theme.js', 'theme.js', 'text/javascript; charset=utf-8'],
-    ['/style.css', 'style.css', 'text/css; charset=utf-8'],
-    ['/logo.svg', 'logo.svg', 'image/svg+xml'],
-    ['/logo-dark.svg', 'logo-dark.svg', 'image/svg+xml'],
-    ['/douyin.svg', 'douyin.svg', 'image/svg+xml'],
-    ['/douyin-dark.svg', 'douyin-dark.svg', 'image/svg+xml'],
-    ['/onebot.png', 'onebot.png', 'image/png']
-  ];
-  for (const [route, file, type] of assets) {
-    const content = await readFile(
-      new URL(`./public/${file}`, import.meta.url)
-    );
-    server.get(route, async (_request, reply) =>
-      reply.type(type).send(content)
-    );
+  if (options.development) {
+    const { registerConsoleDevAssets } = await import('./dev-assets.js');
+    developmentNonce = await registerConsoleDevAssets(server);
+  } else {
+    await registerConsoleAssets(server);
   }
   server.post('/api/auth/login', async (request, reply) => {
     const now = Date.now();

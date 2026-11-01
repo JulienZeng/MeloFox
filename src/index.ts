@@ -29,10 +29,12 @@ async function main(): Promise<void> {
     await mediaRegistry.initialize();
     if (control) {
       await control.channels.initialize();
-      web = await createConsoleServer(config, logger, control);
+      const development = process.argv.includes('--web-dev');
+      web = await createConsoleServer(config, logger, control, { development });
       await web.listen({ host: config.web.host, port: config.web.port });
       control.record('管理服务已启动');
       logger.info({ url: `http://${config.web.host}:${config.web.port}` }, 'web console started');
+      if (development) logger.info('web console HMR enabled');
     }
     await superviseSessions({
       signal: shutdown.signal,

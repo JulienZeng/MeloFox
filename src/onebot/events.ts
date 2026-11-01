@@ -42,13 +42,17 @@ export function toOneBotMessageEvent(config: AppConfig, message: DouyinMessage):
     message_id: message.messageId,
     user_id: message.senderId,
     group_id: isGroup ? message.conversationShortId ?? message.conversationId : undefined,
+    anonymous: isGroup ? null : undefined,
     raw_message: serializeCqMessage(segments),
     message: segments,
     font: 0,
-    sender: {
+    sender: removeUndefined({
       user_id: message.senderId,
-      nickname: message.senderName ?? ''
-    },
+      nickname: message.senderName ?? '',
+      sex: 'unknown', age: 0,
+      card: isGroup ? message.senderCard : undefined,
+      role: isGroup ? message.senderRole : undefined
+    }),
     platform: 'douyin',
     douyin_message_type: message.messageType,
     raw_event: message.raw

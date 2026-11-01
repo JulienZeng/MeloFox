@@ -141,6 +141,14 @@ export class DouyinDirectory {
     return this.users.get(userId);
   }
 
+  getCachedGroupMember(groupId: string, userId: string): DouyinGroupMember | undefined {
+    const cached = this.memberCache.get(groupId);
+    const members = cached && Date.now() - cached.time < 30000 ? cached.members
+      : Date.now() - this.refreshedAt < 30000
+        ? [...this.conversations.values()].find(group => group.type === 'group' && group.shortId === groupId)?.participants : undefined;
+    return members?.find(member => member.userId === userId);
+  }
+
   async refresh(): Promise<void> {
     if (!this.refreshPromise) {
       this.refreshPromise = this.loadConversations().finally(() => { this.refreshPromise = undefined; });
@@ -326,10 +334,13 @@ export class DouyinDirectory {
       for (const item of result.participants ?? []) members.set(item.userId, mapParticipant(item, groupId, conversation.ownerId));
       if (!result.hasMore) {
         const list = [...members.values()];
-        await this.loadUsers(list);
+        const profiles = list.map(member => ({ userId: member.userId, secUid: member.secUid ?? this.users.get(member.userId)?.secUid }));
+        const knownProfiles = new Set(profiles.filter(profile => profile.secUid).map(profile => profile.userId));
+        await this.loadUsers(profiles, noCache);
         deadline?.remainingMs();
         if (this.selfId !== accountId) throw new Error('Account changed while reading group members');
-        for (const member of list) member.nickname = this.users.get(member.userId)?.name;
+        for (const member of list) member.nickname = !noCache || knownProfiles.has(member.userId)
+          ? this.users.get(member.userId)?.name : undefined;
         this.memberCache.set(groupId, { time: Date.now(), members: list });
         this.memberSnapshots.set(groupId, list.map(member => ({ ...member })));
         return list;
@@ -435,6 +446,7 @@ export class DouyinDirectory {
   }
 
   private async loadUsers(members: Array<{ userId: string; secUid?: string }>, noCache = false): Promise<void> {
+    const accountId = this.selfId;
     const missing = [...new Map(members.filter(item => item.secUid && (noCache || !this.users.get(item.userId)?.name)).map(item => [item.userId, item])).values()];
     for (let offset = 0; offset < missing.length; offset += 20) {
       const batch = missing.slice(offset, offset + 20);
@@ -449,6 +461,7 @@ export class DouyinDirectory {
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           return await response.json() as { status_code?: number; data?: Array<{ uid: string; sec_uid?: string; nickname?: string; avatar_thumb?: { url_list?: string[] } }> };
         }, { ids: batch.map(item => item.secUid), timeoutMs: this.timeoutMs });
+        if (this.selfId !== accountId) throw new Error('Account changed while reading user profiles');
         if (result.status_code !== 0 || !Array.isArray(result.data)) throw new Error(`User info status ${result.status_code}`);
         if (noCache && batch.some(item => !result.data?.some(user => user.uid === item.userId))) {
           throw new Error('Douyin user info response is missing a requested user');

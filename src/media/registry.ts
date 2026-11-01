@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { createReadStream } from 'node:fs';
-import { chmod, copyFile, lstat, mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { constants, createReadStream } from 'node:fs';
+import { chmod, copyFile, lstat, mkdir, open, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { AppConfig } from '../config/index.js';
 import type { AppLogger } from '../logger/index.js';
@@ -375,12 +376,53 @@ export class MediaRegistry {
     });
   }
 
+  /** Reuse only registered media; ordinary local files still go through the send allowlist. */
+  async resolveOutgoingMedia(file: string, kind: 'image' | 'video', signal: AbortSignal): Promise<string> {
+    signal = AbortSignal.any([signal, this.shutdown.signal]);
+    signal.throwIfAborted();
+    let reference = file, cacheReference = mediaIdPattern.test(file);
+    if (/^https?:\/\//i.test(file)) {
+      const url = new URL(file), base = new URL(this.publicUrl(''));
+      // An upstream URL must retain its normal proxy/cache/timeout download semantics.
+      if (url.origin !== base.origin || !url.pathname.startsWith(base.pathname)) return file;
+      reference = url.pathname.slice(base.pathname.length);
+      if (!mediaIdPattern.test(reference)) return file;
+      cacheReference = true;
+    } else if (file.startsWith('file://')) reference = fileURLToPath(file);
+    else if (/^[a-z][a-z0-9+.-]*:/i.test(file)) return file;
+    await this.initialize();
+    return this.exclusive(async () => {
+      signal.throwIfAborted();
+      const item = [...this.items.values()].find(item => item.id === reference || item.filePath === reference);
+      if (!item) {
+        if (cacheReference) throw new Error(`${kind} cache expired or missing`);
+        return file;
+      }
+      if (!item.contentType.toLowerCase().startsWith(`${kind}/`)) throw new Error(`Cached media is not ${kind}`);
+      if (this.expired(item)) {
+        await this.removeItem(item); await this.persistIndex();
+        throw new Error(`${kind} cache expired`);
+      }
+      const handle = await open(item.filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.size !== item.size) throw new Error('Cached media file is missing or invalid');
+        this.assertFileSize(info.size);
+        const bytes = await handle.readFile({ signal });
+        signal.throwIfAborted();
+        if (bytes.length !== item.size) throw new Error('Cached media changed while reading');
+        return `base64://${bytes.toString('base64')}`;
+      } finally { await handle.close(); }
+    });
+  }
+
   private findItem(file: string): RegisteredMedia | undefined {
     const exact = [...this.items.values()].find(value => value.id === file || value.sourceUrl === file || value.filePath === file);
     if (exact) return exact;
     try {
       const path = new URL(file).pathname;
-      const id = path.startsWith('/media/') ? path.slice('/media/'.length) : '';
+      const prefix = new URL(this.publicUrl('')).pathname;
+      const id = path.startsWith(prefix) ? path.slice(prefix.length) : path.startsWith('/media/') ? path.slice('/media/'.length) : '';
       return mediaIdPattern.test(id) ? this.items.get(id) : undefined;
     } catch { return undefined; }
   }

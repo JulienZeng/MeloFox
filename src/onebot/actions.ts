@@ -12,6 +12,7 @@ import { outgoingEmojiToken, qqFaceNames } from '../douyin/emoji.js';
 import { buildShareContent, nativeSourceId, numericId, type DouyinShareSendInput } from '../douyin/native-message.js';
 import { PartialSendError, UncertainSendError } from '../douyin/types.js';
 import { ActionDeadline } from '../runtime/deadline.js';
+import { getVersionInfo } from '../runtime/version.js';
 import type { DouyinSendTarget, DouyinEmojiReaction, DouyinMessage, DouyinGroupMember } from '../douyin/types.js';
 import type { OneBotActionRequest, OneBotActionResponse, OneBotMessageSegment, OneBotStatus } from './types.js';
 
@@ -39,6 +40,25 @@ interface OutgoingMessage {
   emojiReaction?: DouyinEmojiReaction;
 }
 
+const supportedActions = new Set([
+  '.handle_quick_operation', 'send_msg', 'send_private_msg', 'send_group_msg',
+  'send_group_forward_msg', 'send_private_forward_msg', 'get_forward_msg', 'get_msg',
+  'get_douyin_send_result', 'get_record', 'get_group_msg_history', 'get_friend_msg_history',
+  'get_private_msg_history', 'get_douyin_history', 'search_douyin_messages', 'get_douyin_read_state',
+  'mark_douyin_read', 'get_douyin_sticker_list', 'resolve_douyin_share', 'get_douyin_reactions',
+  'set_msg_emoji_like', 'set_douyin_reaction', 'get_douyin_emoji_list', 'delete_msg',
+  'set_group_add_request', 'set_group_kick', 'set_group_leave', 'set_group_card',
+  'set_group_admin', 'set_group_ban', 'set_group_whole_ban', 'set_group_name',
+  'get_login_info', 'get_friend_list', 'get_stranger_info', 'get_group_list',
+  'get_group_info', 'get_group_member_list', 'get_group_member_info', 'get_status',
+  'can_send_image', 'can_send_record', 'get_image', 'get_group_file_url',
+  'get_private_file_url', 'clean_cache', 'get_version_info', 'set_restart'
+]);
+
+export function supportsOneBotAction(action: string): boolean {
+  return supportedActions.has(action.replace(/_(async|rate_limited)$/, ''));
+}
+
 export class OneBotActionRouter {
   private static readonly deferred = new WeakMap<DouyinBridge, DeferredActions>();
   static stopForBridge(bridge: DouyinBridge): void { this.deferred.get(bridge)?.stop(); }
@@ -50,6 +70,11 @@ export class OneBotActionRouter {
 
   async handle(request: OneBotActionRequest): Promise<OneBotActionResponse> {
     try {
+      if (!request || typeof request.action !== 'string' || !request.action ||
+        (request.params !== undefined && (!request.params || typeof request.params !== 'object' || Array.isArray(request.params) || isLosslessNumber(request.params)))) {
+        throw new Error('Invalid OneBot action request');
+      }
+      if (!supportsOneBotAction(request.action)) throw unsupported(`Unsupported OneBot action: ${request.action}`);
       const suffix = /_(async|rate_limited)$/.exec(request.action);
       if (suffix) {
         const action = request.action.slice(0, -suffix[0].length);
@@ -74,7 +99,7 @@ export class OneBotActionRouter {
       for (let depth = 0; depth < 8 && cause instanceof Error; depth++, cause = cause.cause) {
         if (cause instanceof UncertainSendError) { unknown = cause; break; }
       }
-      return { ...failed(message, request.echo), ...(error instanceof PartialSendError || unknown ? { data: {
+      return { ...failed(message, request?.echo), ...(error instanceof PartialSendError || unknown ? { data: {
         ...(error instanceof PartialSendError ? { message_ids: error.messageIds, partial: true } : {}),
         ...(unknown ? { client_message_id: unknown.clientMessageId, delivery_status: 'unknown' } : {})
       } } : {}) };
@@ -239,7 +264,7 @@ export class OneBotActionRouter {
           remark: item.name ?? ''
         }));
       case 'get_stranger_info': {
-        const user = await this.bridge.getUser(requireString(request.params, 'user_id'), request.params?.no_cache === true);
+        const user = await this.bridge.getUser(requireString(request.params, 'user_id'), booleanParam(request.params, 'no_cache'));
         return {
           user_id: user.id,
           nickname: user.name ?? user.id,
@@ -255,6 +280,7 @@ export class OneBotActionRouter {
           max_member_count: item.maxMemberCount ?? 0
         }));
       case 'get_group_info': {
+        booleanParam(request.params, 'no_cache'); // This endpoint always reads fresh upstream group metadata.
         const group = await this.bridge.getGroupInfo(requireString(request.params, 'group_id'));
         return {
           group_id: group.shortId ?? group.id,
@@ -268,7 +294,7 @@ export class OneBotActionRouter {
       case 'get_group_member_info': {
         const groupId = requireString(request.params, 'group_id');
         const userId = requireString(request.params, 'user_id');
-        const members = await this.bridge.getGroupMembers(groupId, request.params?.no_cache === true);
+        const members = await this.bridge.getGroupMembers(groupId, booleanParam(request.params, 'no_cache'));
         const member = members.find(item => item.userId === userId);
         if (!member) {
           throw new Error(`Group member not found: ${groupId}/${userId}`);
@@ -306,11 +332,7 @@ export class OneBotActionRouter {
         this.bridge.clearOutgoingMediaCache();
         return null;
       case 'get_version_info':
-        return {
-          app_name: 'douyin-onebot',
-          app_version: '0.1.0',
-          protocol_version: '11'
-        };
+        return getVersionInfo();
       case 'set_restart':
         {
           const value = request.params?.delay ?? 0, delay = Number(value);
@@ -462,10 +484,18 @@ export class OneBotActionRouter {
       throw new Error('Unsupported: ordinary file sending is experimental and disabled; native IM delivery has not passed verification');
     }
     const ids: string[] = [];
+    const accountId = this.bridge.accountId;
     const deadline = new ActionDeadline(messages.some(message => message.video) ? this.config.runtime.videoSendTimeoutMs : this.config.runtime.actionTimeoutMs);
     for (const message of messages) {
       try {
-        const result = await this.bridge.sendMessage({ ...message, target, operatorUserId: this.config.app.selfId }, deadline);
+        const media = this.mediaRegistry;
+        const input = media ? await deadline.run(async () => ({ ...message,
+          images: await Promise.all(message.images.map(file => media.resolveOutgoingMedia(file, 'image', deadline.signal))),
+          video: message.video ? { ...message.video, file: await media.resolveOutgoingMedia(message.video.file, 'video', deadline.signal) } : undefined
+        })) : message;
+        deadline.remainingMs();
+        if (this.bridge.accountId !== accountId) throw new Error('Account changed before sending; remaining messages were not sent');
+        const result = await this.bridge.sendMessage({ ...input, target, operatorUserId: this.config.app.selfId }, deadline);
         ids.push(...(result.messageIds ?? [result.messageId]));
       } catch (error) {
         if (error instanceof PartialSendError) ids.push(...error.messageIds);
@@ -564,6 +594,12 @@ function groupMemberInfo(member: DouyinGroupMember): Record<string, unknown> {
 
 function unsupported(message: string): Error {
   return new Error(`Unsupported: ${message}`);
+}
+
+function booleanParam(params: Record<string, unknown> | undefined, key: string, fallback = false): boolean {
+  const value = params?.[key];
+  if (value !== undefined && typeof value !== 'boolean') throw new Error(`${key} must be a boolean`);
+  return value === undefined ? fallback : value;
 }
 
 function requireString(params: unknown, key: string): string {

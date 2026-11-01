@@ -6,7 +6,7 @@ import { decodeNetworkResponseBodies, extractRealtimeMessageCandidates } from '.
 import type { AppLogger } from '../logger/index.js';
 import type { RealtimeMessageProcessor } from '../douyin/realtime.js';
 import type { MediaRegistry } from '../media/registry.js';
-import type { OneBotActionRouter } from './actions.js';
+import { supportsOneBotAction, type OneBotActionRouter } from './actions.js';
 import type { OneBotActionRequest } from './types.js';
 import { parseOneBotJson, stringifyOneBotJson } from './json.js';
 
@@ -24,7 +24,16 @@ export async function startOneBotHttpServer(
   realtime?: RealtimeMessageProcessor,
   bridge?: DouyinBridge
 ): Promise<HttpServerRuntime> {
-  const server = Fastify();
+  const server = Fastify({ routerOptions: { ignoreTrailingSlash: true } });
+  const apiError = (message: string, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+  const object = (value: unknown): value is Record<string, unknown> => Boolean(value) &&
+    typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+  server.setErrorHandler((error, _request, reply) => {
+    const failure = error as Error & { statusCode?: number; code?: string };
+    const status = failure.code === 'FST_ERR_CTP_INVALID_MEDIA_TYPE' ? 406 : failure.statusCode ?? 500;
+    return reply.code(status).send({ status: 'failed', retcode: 10003, data: null,
+      message: status >= 500 ? 'Internal server error' : failure.message });
+  });
   server.removeContentTypeParser('application/json');
   server.addContentTypeParser('application/json', { parseAs: 'string' }, (_request, body, done) => {
     try {
@@ -39,9 +48,10 @@ export async function startOneBotHttpServer(
     catch (error) { done(Object.assign(new Error('Invalid form body', { cause: error }), { statusCode: 400 })); }
   });
 
-  server.addHook('preHandler', async (request, reply) => {
-    if (!request.url.startsWith('/media/') && !isAuthorized(config, request)) {
-      await reply.code(401).send({
+  server.addHook('onRequest', async (request, reply) => {
+    const authStatus = authorizationStatus(config, request);
+    if (!request.url.startsWith('/media/') && authStatus !== 200) {
+      return reply.code(authStatus).send({
         status: 'failed',
         retcode: 10001,
         data: null,
@@ -294,18 +304,30 @@ export async function startOneBotHttpServer(
     };
   });
 
-  server.post('/', async (request: FastifyRequest<{ Body: OneBotActionRequest }>, reply) => {
-    return reply.serializer(stringifyOneBotJson).send(await router.handle(request.body));
+  const apiOptions = { onRequest: async (request: FastifyRequest) => {
+    const type = request.headers['content-type']?.split(';')[0].trim().toLowerCase();
+    if (request.method === 'POST' && type && !['application/json', 'application/x-www-form-urlencoded'].includes(type)) {
+      throw apiError('Unsupported Content-Type', 406);
+    }
+  } };
+  server.post('/', apiOptions, async (request: FastifyRequest<{ Body: OneBotActionRequest }>, reply) => {
+    const body = request.body;
+    if (!object(body) || typeof body.action !== 'string' || !body.action || (body.params !== undefined && !object(body.params))) {
+      throw apiError('Invalid OneBot action request');
+    }
+    const result = await router.handle({ ...body, params: normalizeHttpParams(body.params ?? {}) });
+    return reply.code(supportsOneBotAction(body.action) ? 200 : 404).serializer(stringifyOneBotJson).send(result);
   });
 
-  server.post('/:action', async (request: FastifyRequest<{ Params: { action: string }; Body: Record<string, unknown> }>, reply) => {
-    return reply.serializer(stringifyOneBotJson).send(await router.handle({
+  server.post('/:action', apiOptions, async (request: FastifyRequest<{ Params: { action: string }; Body: Record<string, unknown> }>, reply) => {
+    if (request.body !== undefined && !object(request.body)) throw apiError('API parameters must be an object');
+    return reply.code(supportsOneBotAction(request.params.action) ? 200 : 404).serializer(stringifyOneBotJson).send(await router.handle({
       action: request.params.action,
       params: normalizeHttpParams({ ...(request.query as object), ...request.body })
     }));
   });
   server.get('/:action', async (request: FastifyRequest<{ Params: { action: string }; Querystring: Record<string, unknown> }>, reply) => {
-    return reply.serializer(stringifyOneBotJson).send(await router.handle({ action: request.params.action, params: normalizeHttpParams(request.query) }));
+    return reply.code(supportsOneBotAction(request.params.action) ? 200 : 404).serializer(stringifyOneBotJson).send(await router.handle({ action: request.params.action, params: normalizeHttpParams(request.query) }));
   });
 
   await server.listen({
@@ -336,18 +358,30 @@ export function normalizeHttpParams(params: Record<string, unknown>): Record<str
     if (result[key] === 'true') result[key] = true;
     else if (result[key] === 'false') result[key] = false;
   }
-  if (typeof result.message === 'string' && result.message.trim().startsWith('[')) {
-    try { const message = parseOneBotJson(result.message); if (Array.isArray(message)) result.message = message; } catch { /* Plain text / CQ remains text. */ }
+  if (result.auto_escape !== true && typeof result.message === 'string' && /^[\[{]/.test(result.message.trim())) {
+    try {
+      const message = parseOneBotJson(result.message);
+      if (Array.isArray(message) || (message && typeof message === 'object' && typeof (message as Record<string, unknown>).type === 'string' && (message as Record<string, unknown>).data)) result.message = message;
+    } catch { /* Plain text / CQ remains text. */ }
+  }
+  for (const key of ['messages', 'context', 'operation']) {
+    if (typeof result[key] !== 'string') continue;
+    try {
+      const parsed = parseOneBotJson(result[key]);
+      if (key === 'messages' ? !Array.isArray(parsed) : !parsed || typeof parsed !== 'object' || Object.getPrototypeOf(parsed) !== Object.prototype) throw new Error();
+      result[key] = parsed;
+    } catch { throw Object.assign(new Error(`Invalid JSON parameter: ${key}`), { statusCode: 400 }); }
   }
   return result;
 }
 
-function isAuthorized(config: AppConfig, request: FastifyRequest): boolean {
+function authorizationStatus(config: AppConfig, request: FastifyRequest): 200 | 401 | 403 {
   if (!config.onebot.accessToken) {
-    return true;
+    return 200;
   }
 
   const authorization = request.headers.authorization ?? '';
   const queryToken = typeof request.query === 'object' && request.query !== null ? (request.query as Record<string, unknown>).access_token : undefined;
-  return authorization === `Bearer ${config.onebot.accessToken}` || queryToken === config.onebot.accessToken;
+  if (authorization === `Bearer ${config.onebot.accessToken}` || queryToken === config.onebot.accessToken) return 200;
+  return authorization || queryToken !== undefined ? 403 : 401;
 }

@@ -301,7 +301,8 @@ export class ChannelManager {
     if (new Set(channels.map((c) => c.id)).size !== channels.length)
       throw new Error("通道 ID 重复");
     const destinations = channels.filter(c => c.enabled && c.type.startsWith("reverse-")).map(c => `${c.type}:${new URL(c.url).href}`);
-    if (new Set(destinations).size !== destinations.length) throw new Error("同类型反向通道的地址不能重复");
+    if (new Set(destinations).size !== destinations.length)
+      throw Object.assign(new Error("同类型反向通道的地址不能重复"), { statusCode: 409 });
     const ports = new Set<number>();
     for (const c of channels.filter(
       (c) => c.enabled && ["http", "forward-ws"].includes(c.type),

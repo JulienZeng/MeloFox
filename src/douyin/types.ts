@@ -33,6 +33,8 @@ export interface DouyinMessage {
   conversationType: DouyinConversationType;
   senderId: string;
   senderName?: string;
+  senderCard?: string;
+  senderRole?: 'owner' | 'admin' | 'member';
   messageType?: number;
   clientMessageId?: string;
   forwardMessages?: DouyinMessage[];
