@@ -1,7 +1,13 @@
 node_modules/
 dist/
 douyin-profile/
+data/
 .env
+.env.*
+!.env.example
+.build.env
+.build.env.*
+!.build.env.example
 *.log
 
 # docs files
@@ -12,7 +18,7 @@ docs/
 
 # cache files
 *cache/
+.pnpm-store/
 
 # debug & develop files
 captures/
-

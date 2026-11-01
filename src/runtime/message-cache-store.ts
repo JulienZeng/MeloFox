@@ -26,6 +26,8 @@ const recall = z.object({ messageId: id, conversationId: id, conversationShortId
 }).transform(value => ({ ...value, raw: value.raw }));
 const entries = <T extends z.ZodTypeAny>(value: T) => z.array(z.object({ key: id, value, expiresAt: z.number().finite() }));
 const legacySnapshotSchema = z.object({
+  pendingSends: entries(z.object({ target, createdAt: z.number(), messageId: z.string().optional(), rejected: z.boolean().optional() })).default([]),
+  notifications: entries(z.boolean()).default([]),
   version: z.literal(1), accountId: id, messages: entries(message), sentClientMessageIds: entries(id),
   sentTargets: entries(z.object({ target, senderId: id })), recalls: entries(z.object({ notice: recall, emitted: z.boolean() }))
 }).superRefine((saved, context) => {
@@ -41,13 +43,18 @@ const legacySnapshotSchema = z.object({
   }
 });
 
-const valueSchemas = { messages: message, sentClientMessageIds: id,
+const valueSchemas = { messages: message, notifications: z.boolean(), sentClientMessageIds: id,
+  pendingSends: z.object({ target, createdAt: z.number(), messageId: z.string().optional(), rejected: z.boolean().optional() }),
   sentTargets: z.object({ target, senderId: id }), recalls: z.object({ notice: recall, emitted: z.boolean() }) };
 type Kind = keyof typeof valueSchemas;
 const kinds = Object.keys(valueSchemas) as Kind[];
 const metadata = z.object({ key: id, expiresAt: z.number().finite(), createdAt: z.number().finite() });
 type Metadata = z.infer<typeof metadata>;
 const manifestSchema = z.object({ version: z.literal(2), accountId: id,
+  pendingSends: z.array(metadata).default([]),
+  notifications: z.array(metadata).default([]),
+  syncCursors: z.record(z.object({ version: z.string().regex(/^\d{1,19}$/), cmdIndex: z.string().regex(/^\d{1,19}$/),
+    readVersion: z.string().regex(/^\d{1,19}$/) })).optional(),
   messages: z.array(metadata), sentClientMessageIds: z.array(metadata), sentTargets: z.array(metadata), recalls: z.array(metadata)
 }).superRefine((saved, context) => {
   for (const kind of kinds) if (new Set(saved[kind].map(entry => entry.key)).size !== saved[kind].length) {
@@ -94,6 +101,7 @@ export class MessageCacheStore {
         const saved = legacy ? legacySnapshotSchema.parse(raw) : manifestSchema.parse(raw);
         // Restored entries remain hidden until the browser authenticates this account.
         this.cache.accountId = saved.accountId;
+        this.cache.syncCursors = 'syncCursors' in saved ? saved.syncCursors : {};
         this.cache.restored = true;
         for (const kind of kinds) for (const item of saved[kind]) {
           const value = 'value' in item ? item.value : undefined;
@@ -158,7 +166,7 @@ export class MessageCacheStore {
     this.prune();
     const accountId = this.cache.accountId;
     const changes = [...this.changes.entries()];
-    const manifest = { version: 2, accountId,
+    const manifest = { version: 2, accountId, syncCursors: this.cache.syncCursors,
       ...Object.fromEntries(kinds.map(kind => [kind, [...this.records.get(kind)!.values()]])) };
     const json = JSON.stringify(manifest);
     // Commit bodies first, then the manifest; delete obsolete bodies only after that checkpoint.

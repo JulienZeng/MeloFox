@@ -39,6 +39,9 @@ export interface DecodedNetworkEvent {
 }
 
 export interface RealtimeMessageCandidate {
+  inboxType?: number;
+  previousCursor?: string;
+  nextCursor?: string;
   source: string;
   conversationId?: string;
   conversationType?: number;
@@ -194,7 +197,8 @@ function collectMessageCandidate(type: string, value: unknown, source: string, o
       return;
     }
 
-    out.push(normalizeMessageBody(source, message));
+    out.push({ ...normalizeMessageBody(source, message), inboxType: numberValue(value.inboxType) ?? 0,
+      previousCursor: stringValue(notify.previousCursor), nextCursor: stringValue(notify.nextCursor) });
   }
 
   if ((type === 'GetUserMsgResponse' || type === 'DyStrangerMsgResponse') && isRecord(value)) {
@@ -225,7 +229,7 @@ function collectNestedMessageBodies(source: string, value: unknown, out: Realtim
   }
 }
 
-function normalizeMessageBody(source: string, body: Record<string, unknown>): RealtimeMessageCandidate {
+export function normalizeMessageBody(source: string, body: Record<string, unknown>): RealtimeMessageCandidate {
   const content = stringValue(body.content) ?? stringValue(body.textContent);
   return {
     source,
@@ -239,9 +243,16 @@ function normalizeMessageBody(source: string, body: Record<string, unknown>): Re
     content,
     text: parseTextContent(content),
     createTime: stringValue(body.createTime),
-    reference: normalizeReference(body.__douyinOneBotReference),
+    reference: normalizeReference(body.__douyinOneBotReference) ?? normalizeStructuredReference(body.referenceInfo),
     raw: body
   };
+}
+
+function normalizeStructuredReference(value: unknown): RealtimeMessageReference | undefined {
+  if (!isRecord(value) || !stringValue(value.referencedMessageId) || Number(value.referencedMessageStatus ?? 0) !== 0) return undefined;
+  const hint = parseJsonObject(stringValue(value.hint) ?? '') ?? {};
+  return normalizeReference({ messageId: stringValue(value.referencedMessageId), content: hint.content,
+    refmsgContent: hint.refmsg_content, refmsgType: hint.refmsg_type, refmsgUid: hint.refmsg_uid, nickname: hint.nickname, raw: hint });
 }
 
 function extractEntityValue(value: unknown, key: string): string | undefined {

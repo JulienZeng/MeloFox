@@ -4,6 +4,7 @@ import type { Page } from 'playwright';
 import type { AppLogger } from '../logger/index.js';
 import type { ActionDeadline } from '../runtime/deadline.js';
 import type { DouyinConversation, DouyinGroupMember, DouyinSendTarget, DouyinUser } from './types.js';
+import { groupMutation, verifyGroupMutation, type GroupOperation } from './group-management.js';
 
 interface WireParticipant {
   userId: string;
@@ -18,14 +19,22 @@ interface ParticipantsPage {
   cursor?: string;
 }
 
+export interface GroupApplyInfo {
+  userId: string; convShortId: string; conversationType: number; applyStatus: number; applyId: string;
+  createTime?: string; applyReason?: string;
+}
+
 interface WireConversation {
+  userInfo?: WireParticipant;
+  badgeCount?: number;
+  conversationSettingInfo?: { readIndex?: string; readIndexV2?: string; readBadgeCount?: number };
   conversationId: string;
   conversationShortId: string;
   conversationType: number;
   inboxType?: number;
   participantsCount?: number;
   firstPageParticipants?: ParticipantsPage;
-  conversationCoreInfo?: { name?: string; owner?: string; ext?: Record<string, string> };
+  conversationCoreInfo?: { name?: string; icon?: string; owner?: string; ext?: Record<string, string> };
 }
 
 export interface DirectoryResponse {
@@ -34,7 +43,15 @@ export interface DirectoryResponse {
   errorDesc?: string;
   reqUserId?: string;
   body?: {
-    messageByInit?: { messages?: Array<{ conversations?: WireConversation }>; hasMore?: boolean; version?: string; nextInitVersion?: string };
+    groupAudit?: { applyInfoList?: GroupApplyInfo[]; nextCursor?: string; hasMore?: boolean };
+    ackGroupApply?: { applyInfo?: GroupApplyInfo; status?: number; checkCode?: string; checkMessage?: string };
+    removeParticipants?: { status?: number; checkCode?: string; checkMessage?: string; extraInfo?: string; failedParticipants?: string[] };
+    updateParticipant?: { status?: number; checkCode?: string; checkMessage?: string; extraInfo?: string; participant?: WireParticipant };
+    leave?: Record<string, never>;
+    dissolve?: Record<string, never>;
+    blockMembers?: { failedMembers?: string[] };
+    blockConversation?: Record<string, never>;
+    messageByInit?: { messages?: Array<{ conversations?: WireConversation }>; hasMore?: boolean; version?: string; nextInitVersion?: string; cmdIndex?: string; readconvVersion?: string };
     info?: { conversationInfoList?: WireConversation[] };
     setCoreInfo?: { conversationCoreInfo?: NonNullable<WireConversation['conversationCoreInfo']> & {
       conversationId?: string; conversationShortId?: string; conversationType?: number;
@@ -73,6 +90,8 @@ export function mapConversation(value: WireConversation, selfId: string): Douyin
     maxMemberCount: core?.ext?.['a:s_group_member_limit'] ? Number(core.ext['a:s_group_member_limit']) : undefined,
     inboxType: value.inboxType ?? 0,
     ownerId: core?.owner,
+    icon: core?.icon,
+    selfRole: value.userInfo?.role,
     peerUserId: value.conversationType === 1 ? peer?.userId : undefined,
     participants
   };
@@ -84,16 +103,19 @@ function mapParticipant(value: WireParticipant, groupId: string, ownerId?: strin
     userId: value.userId,
     secUid: value.secUid,
     card: value.alias || undefined,
-    role: value.userId === ownerId || value.role === 1 ? 'owner' : 'member'
+    rawRole: value.role ?? 0,
+    role: value.userId === ownerId || value.role === 1 ? 'owner' : value.role === 2 ? 'admin' : 'member'
   };
 }
 
 type DirectoryRequester = (command: number, type: string, params: Record<string, unknown>, path: string, inboxType: number, deadline?: ActionDeadline) => Promise<DirectoryResponse>;
 
 export class DouyinDirectory {
+  initialSyncState?: { version: string; cmdIndex: string; readVersion: string };
   private readonly conversations = new Map<string, DouyinConversation>();
   private readonly users = new Map<string, DouyinUser>();
   private readonly memberCache = new Map<string, { time: number; members: DouyinGroupMember[] }>();
+  private readonly memberSnapshots = new Map<string, DouyinGroupMember[]>();
   private refreshedAt = 0;
   private refreshPromise?: Promise<void>;
   private selfId?: string;
@@ -137,6 +159,9 @@ export class DouyinDirectory {
       const response = await this.query(2043, 'InitRequest', params, 'v1/message/get_message_by_init', 1);
       const result = response.body?.messageByInit;
       if (!result) throw new Error('Douyin init response has no conversation page');
+      if (page === 0 && result.version !== undefined) this.initialSyncState = {
+        version: result.version, cmdIndex: result.cmdIndex ?? '0', readVersion: result.readconvVersion ?? '0'
+      };
       for (const entry of result.messages ?? []) {
         const value = entry.conversations;
         if (!value || !['1', '2'].includes(String(value.conversationType))) continue;
@@ -171,6 +196,7 @@ export class DouyinDirectory {
         this.conversations.clear();
         this.users.clear();
         this.memberCache.clear();
+        this.memberSnapshots.clear();
         this.refreshedAt = 0;
       }
       this.selfId = response.reqUserId;
@@ -197,6 +223,17 @@ export class DouyinDirectory {
   async getConversations(): Promise<DouyinConversation[]> {
     await this.ensureFresh();
     return [...this.conversations.values()];
+  }
+
+  async getConversationState(target: DouyinSendTarget, deadline?: ActionDeadline): Promise<WireConversation> {
+    const resolved = await this.resolveTarget(target);
+    const response = await this.query(610, 'ConversationInfoRequest', { conversationInfoList: [{
+      conversationId: resolved.conversationId, conversationShortId: resolved.conversationShortId, conversationType: resolved.type === 'group' ? 2 : 1
+    }] }, 'v2/conversation/get_info_list', resolved.inboxType ?? 0, deadline);
+    const info = response.body?.info?.conversationInfoList?.find(item => item.conversationId === resolved.conversationId &&
+      item.conversationShortId === resolved.conversationShortId && item.conversationType === (resolved.type === 'group' ? 2 : 1));
+    if (!info) throw new Error('Conversation read state is unavailable');
+    return info;
   }
 
   async getFriends(): Promise<DouyinUser[]> {
@@ -272,25 +309,29 @@ export class DouyinDirectory {
     this.logger.info({ groupId }, 'updated douyin group name through imapi');
   }
 
-  async getGroupMembers(groupId: string, noCache = false): Promise<DouyinGroupMember[]> {
+  async getGroupMembers(groupId: string, noCache = false, deadline?: ActionDeadline): Promise<DouyinGroupMember[]> {
     const cached = this.memberCache.get(groupId);
     if (!noCache && cached && Date.now() - cached.time < 30000) return cached.members;
-    const conversation = await this.getGroupInfo(groupId);
+    const conversation = await this.getGroupInfo(groupId, deadline), accountId = this.selfId;
     const members = new Map<string, DouyinGroupMember>();
     let cursor = '0';
     const seenCursors = new Set<string>();
     for (let page = 0; page < 1000; page += 1) {
       const response = await this.query(605, 'ParticipantsRequest', {
         conversationId: conversation.id, conversationShortId: conversation.shortId, conversationType: 2, cursor, limit: 50
-      }, 'v1/conversation/participants_list', conversation.inboxType ?? 0);
+      }, 'v1/conversation/participants_list', conversation.inboxType ?? 0, deadline);
+      if (this.selfId !== accountId) throw new Error('Account changed while reading group members');
       const result = response.body?.participants?.participantsPage;
       if (!result) throw new Error('Douyin participants response has no page');
       for (const item of result.participants ?? []) members.set(item.userId, mapParticipant(item, groupId, conversation.ownerId));
       if (!result.hasMore) {
         const list = [...members.values()];
         await this.loadUsers(list);
+        deadline?.remainingMs();
+        if (this.selfId !== accountId) throw new Error('Account changed while reading group members');
         for (const member of list) member.nickname = this.users.get(member.userId)?.name;
         this.memberCache.set(groupId, { time: Date.now(), members: list });
+        this.memberSnapshots.set(groupId, list.map(member => ({ ...member })));
         return list;
       }
       if (!result.cursor || result.cursor === cursor || seenCursors.has(result.cursor)) throw new Error('Douyin member pagination did not advance');
@@ -298,6 +339,68 @@ export class DouyinDirectory {
       cursor = result.cursor;
     }
     throw new Error('Douyin member pagination exceeded limit');
+  }
+
+  invalidateGroup(groupId: string, removed = false): void {
+    this.memberCache.delete(groupId);
+    this.refreshedAt = 0;
+    if (removed) for (const [id, group] of this.conversations) if (group.shortId === groupId) this.conversations.delete(id);
+    if (removed) this.memberSnapshots.delete(groupId);
+  }
+
+  getGroupMemberSnapshot(groupId: string): DouyinGroupMember[] {
+    return (this.memberSnapshots.get(groupId) ?? [...this.conversations.values()].find(group => group.shortId === groupId)?.participants ?? []).map(member => ({ ...member }));
+  }
+
+  rememberGroupAdmin(groupId: string, userId: string): void {
+    const members = this.getGroupMemberSnapshot(groupId).filter(member => member.userId !== userId);
+    members.push({ groupId, userId, role: 'admin', rawRole: 2 }); this.memberSnapshots.set(groupId, members);
+  }
+
+  async manageGroup(groupId: string, operation: GroupOperation, deadline: ActionDeadline): Promise<void> {
+    await this.ensureFresh();
+    const accountId = this.selfId;
+    if (!accountId || !this.authenticated) throw new Error('Douyin account is not authenticated');
+    if (![...this.conversations.values()].some(group => group.type === 'group' && group.shortId === groupId)) throw new Error('Group operation requires an existing group conversation');
+    const group = await this.getGroupInfo(groupId, deadline);
+    const mutation = groupMutation(group, accountId, operation);
+    if (this.selfId !== accountId) throw new Error('Account changed before group operation');
+    const response = await this.query(mutation.command, mutation.type, mutation.params, mutation.path, group.inboxType ?? 0, deadline);
+    if (this.selfId !== accountId) throw new Error('Account changed during group operation; do not retry automatically');
+    verifyGroupMutation(response.body, mutation, operation);
+    this.invalidateGroup(groupId, operation.kind === 'leave');
+  }
+
+  async getGroupRequests(groupId: string, deadline: ActionDeadline): Promise<GroupApplyInfo[]> {
+    const groups = await this.getConversations(), accountId = this.selfId;
+    const group = groups.find(group => group.type === 'group' && group.shortId === groupId);
+    if (!accountId || !group || (group.ownerId !== accountId && group.selfRole !== 2)) throw new Error('Group requests require an existing group managed by this account');
+    const items: GroupApplyInfo[] = [], cursors = new Set<string>(); let cursor = '0';
+    for (let page = 0; page < 1000; page++) {
+      const response = await this.query(2027, 'GroupAuditRequest', { cursor, limit: 50, convShortId: groupId, noClearUnread: true }, 'v1/conversation/get_audit_list', 0, deadline);
+      if (this.selfId !== accountId) throw new Error('Account changed while reading group requests');
+      const result = response.body?.groupAudit;
+      if (!result) throw new Error('Missing group audit page');
+      items.push(...(result.applyInfoList ?? []).filter(item => item.conversationType === 2 && item.convShortId === groupId && item.applyStatus === 1));
+      if (!result.hasMore) return items;
+      if (!result.nextCursor || result.nextCursor === cursor || cursors.has(result.nextCursor)) throw new Error('Group audit cursor did not advance');
+      cursors.add(cursor); cursor = result.nextCursor;
+    }
+    throw new Error('Group audit pagination exceeded limit');
+  }
+
+  async approveGroupRequest(groupId: string, applyId: string, approve: boolean, deadline: ActionDeadline): Promise<void> {
+    const accountId = this.selfId;
+    const request = (await this.getGroupRequests(groupId, deadline)).find(item => item.applyId === applyId);
+    if (!request || accountId !== this.selfId) throw new Error('Group request expired, already handled, or belongs to another account');
+    const status = approve ? 2 : 3;
+    const response = await this.query(2025, 'AckGroupApplyRequest', { applyId, applyStatus: status }, 'v1/conversation/ack_apply', 0, deadline);
+    const result = response.body?.ackGroupApply, applied = result?.applyInfo;
+    if (this.selfId !== accountId || result?.status !== 0 || (result.checkCode !== undefined && result.checkCode !== '0') ||
+      applied?.applyId !== applyId || applied.convShortId !== groupId || applied.userId !== request.userId || applied.applyStatus !== status) {
+      throw new Error(`Group request decision not confirmed: ${result?.checkMessage ?? 'unexpected business response'}; do not retry automatically`);
+    }
+    this.invalidateGroup(groupId);
   }
 
   async resolveTarget(target: DouyinSendTarget): Promise<DouyinSendTarget> {

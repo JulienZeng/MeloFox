@@ -27,6 +27,9 @@ export interface RealtimeProcessorOptions {
   logger: AppLogger;
   emit: (message: DouyinMessage) => Promise<void>;
   emitRecall?: (notice: DouyinRecall) => Promise<void>;
+  emitReaction?: (candidate: RealtimeMessageCandidate) => Promise<void>;
+  emitGroupNotice?: (candidate: RealtimeMessageCandidate) => Promise<boolean>;
+  updateDetail?: (detail: RealtimeMessageCandidate) => Promise<void>;
   enrich: (candidate: RealtimeMessageCandidate, signal: AbortSignal) => Promise<RealtimeMessageCandidate>;
   stickerAsText?: boolean;
   decode?: (event: NetworkEvent) => Promise<DecodedMessages>;
@@ -81,6 +84,7 @@ export class RealtimeMessageProcessor {
   private readonly detailLimit: number;
   private readonly decode: (event: NetworkEvent) => Promise<DecodedMessages>;
   private counters = { acceptedEvents: 0, processedEvents: 0, emittedMessages: 0, emittedNotices: 0, duplicates: 0, parseFailures: 0, deliveryFailures: 0, mediaFailures: 0, overflows: 0 };
+  private recoveredFailures = { overflows: 0, deliveryFailures: 0 };
 
   constructor(private readonly options: RealtimeProcessorOptions) {
     this.queueLimit = options.queueLimit ?? 10000;
@@ -116,6 +120,18 @@ export class RealtimeMessageProcessor {
     this.drain();
   }
 
+  async recover(candidate: RealtimeMessageCandidate): Promise<void> {
+    if (this.stopped) throw new Error('Realtime processor stopped during recovery');
+    await this.accept(candidate);
+    await this.waitForIdle();
+    if (this.stopped) throw new Error('Realtime processor stopped during recovery');
+    const notice = isRecallMessage(candidate) ? toDouyinRecall(candidate) : undefined;
+    if (notice && !this.recalls.get(notice.messageId)?.emitted) throw new Error('Recall recovery was not delivered');
+    if (!notice && toDouyinMessage(candidate, false, true) && !this.seen.has(candidate.serverMessageId!)) {
+      throw new Error('Recovered message was not delivered; cursor retained');
+    }
+  }
+
   getStats() {
     this.pruneCaches();
     return {
@@ -128,8 +144,13 @@ export class RealtimeMessageProcessor {
       recalledMessages: this.recalls.size,
       cachedDetails: this.details.size,
       running: this.started && !this.stopped,
-      good: this.started && !this.stopped && this.counters.overflows === 0 && this.counters.deliveryFailures === 0
+      good: this.started && !this.stopped && this.counters.overflows === this.recoveredFailures.overflows && this.counters.deliveryFailures === this.recoveredFailures.deliveryFailures
     };
+  }
+
+  markRecovered(before: { overflows: number; deliveryFailures: number }): void {
+    // A new failure during catch-up still needs another recovery pass.
+    this.recoveredFailures = { overflows: before.overflows, deliveryFailures: before.deliveryFailures };
   }
 
   waitForIdle(): Promise<void> {
@@ -173,10 +194,11 @@ export class RealtimeMessageProcessor {
           this.details.set(detail.serverMessageId, { candidate: detail, time: Date.now() });
           while (this.details.size > this.detailLimit) this.details.delete(this.details.keys().next().value!);
           const job = this.pending.get(detail.serverMessageId);
-          if (job?.state === 'waiting') {
+          if (job) {
             job.candidate = mergeRealtimeMessageDetail(job.candidate, detail);
-            if (!this.waitForDetail(job.candidate)) await this.ready(job);
+            if (job.state === 'waiting' && !this.waitForDetail(job.candidate)) await this.ready(job);
           }
+          if (!this.recalls.has(detail.serverMessageId)) await this.options.updateDetail?.(detail);
         }
         // HTTP details enrich a WS notification, never generate a fresh message event.
         if (event.type === 'ws_frame_received') {
@@ -196,6 +218,15 @@ export class RealtimeMessageProcessor {
   }
 
   private async accept(candidate: RealtimeMessageCandidate): Promise<void> {
+    if (candidate.messageType === 70002) { await this.options.emitReaction?.(candidate); return; }
+    if ([1001, 50001, 50005, 50011].includes(candidate.messageType ?? 0)) {
+      if (await this.options.emitGroupNotice?.(candidate)) {
+        if (candidate.serverMessageId) this.seen.set(candidate.serverMessageId, Date.now());
+        while (this.seen.size > this.seenLimit) this.seen.delete(this.seen.keys().next().value!);
+        this.counters.emittedNotices++; return;
+      }
+      if (candidate.messageType !== 1001) return;
+    }
     if (isRecallMessage(candidate)) {
       const notice = toDouyinRecall(candidate);
       if (notice) await this.recall(notice);
@@ -228,7 +259,7 @@ export class RealtimeMessageProcessor {
   }
 
   private needsMedia(candidate: RealtimeMessageCandidate): boolean {
-    return [27, 30, 150].includes(candidate.messageType ?? 0) || (candidate.messageType === 5 && this.options.stickerAsText === false);
+    return [17, 27, 30, 150].includes(candidate.messageType ?? 0) || (candidate.messageType === 5 && this.options.stickerAsText === false);
   }
 
   private waitForDetail(candidate: RealtimeMessageCandidate): boolean {
@@ -306,7 +337,7 @@ export class RealtimeMessageProcessor {
     } catch (error) {
       if (this.stopped || job.recalled) return;
       this.counters.mediaFailures += 1;
-      if ([5, 27, 150].includes(candidate.messageType ?? 0)) candidate = { ...candidate, mediaUnavailable: true, mediaUrl: undefined };
+      if ([5, 17, 27, 150].includes(candidate.messageType ?? 0)) candidate = { ...candidate, mediaUnavailable: true, mediaUrl: undefined };
       this.options.logger.warn({ error, messageId: candidate.serverMessageId }, 'media enrichment failed; reporting original message');
     } finally {
       clearTimeout(timer);
@@ -317,10 +348,12 @@ export class RealtimeMessageProcessor {
 
   private async deliver(candidate: RealtimeMessageCandidate): Promise<void> {
     if (this.stopped || (candidate.serverMessageId && this.recalls.has(candidate.serverMessageId))) return;
-    const message = toDouyinMessage(candidate, this.options.stickerAsText !== false);
+    const message = toDouyinMessage(candidate, this.options.stickerAsText !== false, candidate.source === 'imapi');
     if (!message) return;
     try {
       await this.options.emit(message);
+      const detail = this.details.get(message.messageId)?.candidate;
+      if (detail) await this.options.updateDetail?.(detail);
       this.seen.set(message.messageId, Date.now());
       while (this.seen.size > this.seenLimit) this.seen.delete(this.seen.keys().next().value!);
       this.counters.emittedMessages += 1;

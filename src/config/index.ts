@@ -4,13 +4,20 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
 const ConfigSchema = z.object({
+  web: z.object({
+    enabled: z.boolean().default(true),
+    host: z.string().default('127.0.0.1'),
+    port: z.number().int().min(1).max(65535).default(3000),
+    token: z.string().default(''),
+    dataDir: z.string().min(1).default('./data/console')
+  }).default({}),
   app: z.object({
     selfId: z.string().min(1),
     logLevel: z.string().default('info')
   }),
   browser: z.object({
     userDataDir: z.string().min(1),
-    headless: z.boolean().default(false),
+    headless: z.boolean().default(true),
     douyinUrl: z.string().url()
   }),
   douyin: z.object({
@@ -18,6 +25,7 @@ const ConfigSchema = z.object({
     hookMode: z.enum(['network', 'injection', 'dom']).default('network')
   }),
   onebot: z.object({
+    rateLimitIntervalMs: z.number().int().min(0).max(60000).default(500),
     accessToken: z.string().default(''),
     http: z.object({
       enabled: z.boolean().default(true),
@@ -29,6 +37,15 @@ const ConfigSchema = z.object({
       enabled: z.boolean().default(false),
       url: z.string().url()
     }),
+    reverseHttp: z.object({
+      enabled: z.boolean().default(false),
+      url: z.string().url().refine(value => {
+        const url = new URL(value);
+        return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.hash;
+      }).default('http://127.0.0.1:5701'),
+      secret: z.string().max(512).default(''),
+      timeoutMs: z.number().int().min(100).max(60000).default(10000)
+    }).default({}),
     forwardWs: z.object({
       enabled: z.boolean().default(true),
       host: z.string().default('127.0.0.1'),
@@ -85,6 +102,14 @@ export function loadConfig(configPath = process.env.DOUYIN_ONEBOT_CONFIG ?? 'con
 function applyEnvOverrides(config: AppConfig): AppConfig {
   return {
     ...config,
+    web: {
+      ...config.web,
+      enabled: envBoolean('WEB_ENABLED') ?? config.web.enabled,
+      host: envString('WEB_HOST') ?? config.web.host,
+      port: envNumber('WEB_PORT') ?? config.web.port,
+      token: envString('WEB_TOKEN') ?? config.web.token,
+      dataDir: envString('WEB_DATA_DIR') ?? config.web.dataDir
+    },
     app: {
       ...config.app,
       selfId: envString('APP_SELF_ID') ?? config.app.selfId,
@@ -115,6 +140,13 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
         ...config.onebot.reverseWs,
         enabled: envBoolean('ONEBOT_REVERSE_WS_ENABLED') ?? config.onebot.reverseWs.enabled,
         url: envString('ONEBOT_REVERSE_WS_URL') ?? config.onebot.reverseWs.url
+      },
+      reverseHttp: {
+        ...config.onebot.reverseHttp,
+        enabled: envBoolean('ONEBOT_REVERSE_HTTP_ENABLED') ?? config.onebot.reverseHttp.enabled,
+        url: envString('ONEBOT_REVERSE_HTTP_URL') ?? config.onebot.reverseHttp.url,
+        secret: envString('ONEBOT_REVERSE_HTTP_SECRET', true) ?? config.onebot.reverseHttp.secret,
+        timeoutMs: envNumber('ONEBOT_REVERSE_HTTP_TIMEOUT_MS') ?? config.onebot.reverseHttp.timeoutMs
       },
       forwardWs: {
         ...config.onebot.forwardWs,

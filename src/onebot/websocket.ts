@@ -1,4 +1,7 @@
 import { WebSocket, WebSocketServer } from 'ws';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { EventOutbox } from './outbox.js';
 import type { IncomingMessage } from 'node:http';
 import type { AppConfig } from '../config/index.js';
 import type { AppLogger } from '../logger/index.js';
@@ -8,7 +11,7 @@ import { lifecycleEvent } from './events.js';
 import { parseOneBotJson, stringifyOneBotJson } from './json.js';
 
 export interface OneBotWebSocketRuntime {
-  emit(event: OneBotEvent): void;
+  emit(event: OneBotEvent): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -19,6 +22,8 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   private reverseReconnectTimer?: NodeJS.Timeout;
   private stopped = true;
   private stopPromise?: Promise<void>;
+  private readonly outboxes = new Map<'forward' | 'reverse', EventOutbox>();
+  private readonly kinds = new Map<WebSocket, 'forward' | 'reverse'>();
 
   constructor(
     private readonly config: AppConfig,
@@ -29,6 +34,13 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   async start(): Promise<void> {
     this.stopped = false;
     this.stopPromise = undefined;
+    for (const kind of ['forward', 'reverse'] as const) {
+      if (!(kind === 'forward' ? this.config.onebot.forwardWs.enabled : this.config.onebot.reverseWs.enabled)) continue;
+      const destination = kind === 'forward' ? `${this.config.onebot.forwardWs.host}:${this.config.onebot.forwardWs.port}` : this.config.onebot.reverseWs.url;
+      const key = createHash('sha256').update(`${kind}:${destination}:${this.config.app.selfId}`).digest('hex');
+      const outbox = new EventOutbox(join(this.config.runtime.messageCacheDir, 'events', `${key}.json`), this.config.app.selfId);
+      await outbox.initialize(); this.outboxes.set(kind, outbox);
+    }
     if (this.config.onebot.forwardWs.enabled) {
       await this.startForwardServer();
     }
@@ -38,8 +50,24 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     }
   }
 
-  emit(event: OneBotEvent): void {
-    this.broadcast(event);
+  async emit(event: OneBotEvent): Promise<void> {
+    if (this.stopped) return;
+    if (event.post_type === 'meta_event') { this.broadcast(event); return; }
+    await Promise.all([...this.outboxes].map(async ([kind, outbox]) => {
+      await outbox.enqueue(event);
+      // Await durability, but let reconnection/backpressure control delivery.
+      this.flush(kind);
+    }));
+  }
+
+  status(): { state: string; clients: number; pendingEvents: number } {
+    return {
+      state: this.stopped ? 'waiting' : this.config.onebot.reverseWs.enabled
+        ? this.reverseSocket?.readyState === WebSocket.OPEN ? 'connected' : 'connecting'
+        : 'listening',
+      clients: this.clients.size,
+      pendingEvents: [...this.outboxes.values()].reduce((sum, outbox) => sum + outbox.size, 0)
+    };
   }
 
   stop(): Promise<void> {
@@ -57,8 +85,9 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     this.reverseSocket = undefined;
     this.stopPromise = Promise.all([
       ...Array.from(sockets, socket => this.closeSocket(socket)),
-      ...this.servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve())))
-    ]).then(() => { this.clients.clear(); });
+      ...this.servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))),
+      ...[...this.outboxes.values()].map(outbox => outbox.settled())
+    ]).then(() => { this.clients.clear(); this.kinds.clear(); });
     return this.stopPromise;
   }
 
@@ -76,7 +105,7 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
         return;
       }
 
-      this.addClient(socket, 'forward websocket client connected');
+      this.addClient(socket, 'forward websocket client connected', 'forward');
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -110,7 +139,7 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
 
     socket.on('open', () => {
       if (this.stopped) { socket.close(); return; }
-      this.addClient(socket, 'onebot reverse websocket connected');
+      this.addClient(socket, 'onebot reverse websocket connected', 'reverse');
     });
 
     socket.on('close', () => {
@@ -129,8 +158,9 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     });
   }
 
-  private addClient(socket: WebSocket, message: string): void {
+  private addClient(socket: WebSocket, message: string, kind: 'forward' | 'reverse'): void {
     this.clients.add(socket);
+    this.kinds.set(socket, kind);
     this.logger.info(message);
 
     socket.on('message', payload => {
@@ -139,8 +169,25 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
 
     socket.on('close', () => {
       this.clients.delete(socket);
+      this.kinds.delete(socket);
     });
     this.send(socket, lifecycleEvent(this.config, 'connect'));
+    this.flush(kind);
+  }
+
+  private flush(kind: 'forward' | 'reverse'): void {
+    void this.outboxes.get(kind)?.drain(async event => {
+      if (this.stopped) return false;
+      const sockets = [...this.clients].filter(socket => this.kinds.get(socket) === kind && socket.readyState === WebSocket.OPEN);
+      if (!sockets.length) return false;
+      const results = await Promise.all(sockets.map(socket => new Promise<boolean>(resolve => {
+        if (socket.bufferedAmount > 8 * 1024 * 1024) { socket.terminate(); resolve(false); return; }
+        const timer = setTimeout(() => { socket.terminate(); resolve(false); }, 10000);
+        try { socket.send(stringifyOneBotJson(event), error => { clearTimeout(timer); resolve(!error); }); }
+        catch { clearTimeout(timer); resolve(false); }
+      })));
+      return results.every(Boolean);
+    }).catch(error => this.logger.error({ error }, 'OneBot event replay failed; pending events retained'));
   }
 
   private async handleMessage(socket: WebSocket, payload: string): Promise<void> {

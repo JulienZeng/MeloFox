@@ -1,4 +1,4 @@
-export type OneBotPostType = 'message' | 'notice' | 'meta_event';
+export type OneBotPostType = 'message' | 'notice' | 'request' | 'meta_event';
 export type OneBotMessageType = 'private' | 'group';
 
 export interface OneBotMessageSegment {
@@ -20,7 +20,7 @@ export interface OneBotActionRequest<TParams = Record<string, unknown>> {
 }
 
 export interface OneBotActionResponse<TData = unknown> {
-  status: 'ok' | 'failed';
+  status: 'ok' | 'failed' | 'async';
   retcode: number;
   data: TData | null;
   message?: string;

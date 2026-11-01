@@ -73,6 +73,14 @@ message MessageBody {
   string secSender = 14;
   map<string, ReactionPropertyItemList> propertyList = 15;
   int64 indexInConversationV2 = 17;
+  ReferenceInfo referenceInfo = 18;
+}
+
+message ReferenceInfo {
+  int64 referencedMessageId = 1;
+  string hint = 2;
+  int64 refMessageType = 3;
+  int32 referencedMessageStatus = 4;
 }
 
 message ReactionPropertyItemList {

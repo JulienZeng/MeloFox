@@ -1,21 +1,36 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { signVodRequest, crc32Hex, type UploadCredentials } from './upload-signing.js';
+import { buildInteractiveEmoji } from './interactive-emoji.js';
+import { buildGroupCard } from './group-card.js';
+import { OutgoingMediaCache } from '../media/outgoing.js';
+import { groupNotices, modifiedGroupMembers, removedAdminNotices, type DouyinGroupNotice } from './group-notice.js';
+import { prepareForward, readForwardRecords } from './forward.js';
+import { buildLocationContent } from './card-compat.js';
+import { randomUUID } from 'node:crypto';
+import { loadImageData, uploadOutgoingImage, validateOutgoingImage, type LoadedImageData } from './image-upload.js';
+export { loadImageData } from './image-upload.js';
+import { PartialSendError, UncertainSendError } from './types.js';
 import { loadOutgoingFile, uploadOutgoingFile } from './file-upload.js';
 import { prepareOutgoingVideo, uploadOutgoingVideo } from './video-upload.js';
-import { readFile } from 'node:fs/promises';
-import { basename, extname } from 'node:path';
 import type { Page } from 'playwright';
 import type { AppLogger } from '../logger/index.js';
+import { BoundedCache } from '../runtime/bounded-cache.js';
+import { fetchDouyinResource, parseStickerCatalog, resolveDouyinUrl, awemeShareFromDetail } from './resources.js';
+import { parseDouyinSticker } from './sticker.js';
+import type { StructuredShareInput, NativeMessageContent } from './native-message.js';
 import { RetainedCache } from '../runtime/retained-cache.js';
 import { ActionDeadline } from '../runtime/deadline.js';
+import { IdentitySecurityProvider } from './identity-security.js';
+import { buildShareContent, cachedNativeContent, nativeSourceId } from './native-message.js';
 import { DouyinDirectory, decodeDirectoryResponse, encodeDirectoryPayload } from './directory.js';
 import { postImApi } from './im-client.js';
 import { enrichRealtimeFile } from './file.js';
 import { fetchSmallEmojiCatalog } from './emoji.js';
-import { decodeReactionQuery, encodeReactionQuery, type ReactionState } from './reaction.js';
+import { decodeQueriedMessage, decodeReactionQuery, encodeReactionQuery, type ReactionState } from './reaction.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { resolveDouyinFileUrl, type DouyinFileResource } from './file-url.js';
-import { enrichRealtimeMedia, toDouyinMessage } from './message-adapter.js';
+import { enrichRealtimeMedia, mergeRealtimeMessageDetail, toDouyinMessage } from './message-adapter.js';
+import type { RealtimeMessageCandidate } from './protobuf.js';
+import { cursorId, nextSyncCursor, decodeHistoryResponse, encodeHistoryRequest, historyCandidates } from './history.js';
+import { reactionNotices, type DouyinReactionNotice } from './reaction-notice.js';
 import type { MediaRegistry } from '../media/registry.js';
 import {
   buildEmojiReactionRequest,
@@ -23,6 +38,7 @@ import {
   buildImageSendRequest,
   buildFileSendRequest,
   buildVideoSendRequest,
+  buildNativeSendRequest,
   buildRecallRequest,
   buildTextSendRequest,
   decodeSendResponse,
@@ -44,6 +60,9 @@ import type {
 export type DouyinMessageHandler = (message: DouyinMessage) => void | Promise<void>;
 
 export interface DouyinBridgeCache {
+  pendingSends: RetainedCache<{ target: DouyinSendTarget; createdAt: number; messageId?: string; rejected?: boolean }>;
+  notifications: RetainedCache<boolean>;
+  syncCursors?: Record<string, { version: string; cmdIndex: string; readVersion: string }>;
   messages: RetainedCache<DouyinMessage>;
   sentClientMessageIds: RetainedCache<string>;
   sentTargets: RetainedCache<{ target: DouyinSendTarget; senderId: string }>;
@@ -55,12 +74,15 @@ export interface DouyinBridgeCache {
 
 export function createDouyinBridgeCache(limit = 10000, ttlMs = 7 * 86400000): DouyinBridgeCache {
   return {
+    pendingSends: new RetainedCache(limit, ttlMs),
+    notifications: new RetainedCache(limit, ttlMs),
     messages: new RetainedCache(limit, ttlMs, message => message.timestamp), sentClientMessageIds: new RetainedCache(limit, ttlMs),
     sentTargets: new RetainedCache(limit, ttlMs), recalls: new RetainedCache(limit, ttlMs, state => state.notice.timestamp)
   };
 }
 
 export interface DouyinBridgeOptions {
+  requestRestart?: (delayMs: number) => void;
   enableDomMessageCapture?: boolean;
   actionTimeoutMs?: number;
   maxFileBytes?: number;
@@ -77,19 +99,41 @@ export interface DouyinBridgeOptions {
 }
 
 export class DouyinBridge {
+  requestRestart(delayMs: number): void {
+    if (!this.options.requestRestart) throw new Error('Unsupported: gateway restart controller is unavailable');
+    this.options.requestRestart(delayMs);
+  }
+  reportDeferredActionFailure(action: string, retcode: number): void {
+    this.logger.warn({ action, retcode }, 'asynchronous OneBot action failed; no automatic retry');
+  }
+  private readonly outgoingMedia = new OutgoingMediaCache();
+  clearOutgoingMediaCache(): void { this.outgoingMedia.clear(); }
+
+  private readonly stickerCatalog = new BoundedCache<{ accountId: string; message: NativeMessageContent }>(1000, 3600000, Date.now, false);
   private messageHandlers = new Set<DouyinMessageHandler>();
   private readonly recallHandlers = new Set<(notice: DouyinRecall) => void | Promise<void>>();
+  private readonly groupNoticeHandlers = new Set<(notice: DouyinGroupNotice) => void | Promise<void>>();
+  private readonly groupRequestHandlers = new Set<(request: import('./directory.js').GroupApplyInfo, flag: string) => void | Promise<void>>();
+  private readonly reactionHandlers = new Set<(notice: DouyinReactionNotice) => void | Promise<void>>();
+  private readonly reactionDeliveries = new Map<string, Promise<void>>();
+  private readonly groupNoticeDeliveries = new Map<string, Promise<void>>();
+  private readonly pendingGroupRoleNotices = new Map<string, DouyinGroupNotice[]>();
+  private readonly uncertainSends = new WeakMap<ActionDeadline, string>();
   private readonly recalling = new Map<string, Promise<void>>();
   private readonly ingestingRecalls = new Map<string, Promise<void>>();
   private readonly receivingFiles = new Map<string, Promise<DouyinMessage>>();
   private readonly receivingStickers = new Map<string, Promise<DouyinMessage>>();
   private readonly receivingVideos = new Map<string, Promise<DouyinMessage>>();
+  private readonly receivingVoices = new Map<string, Promise<DouyinMessage>>();
+  private readonly receivingImages = new Map<string, Promise<DouyinMessage>>();
   private emojiCatalog?: { accountId: string; tokens: string[]; expiresAt: number };
   private loadingEmojiCatalog?: { accountId: string; promise: Promise<string[]> };
   private readonly messageCache: RetainedCache<DouyinMessage>;
   private readonly sentClientMessageIds: RetainedCache<string>;
   private currentUserId: string | undefined;
+  private signedOut = false;
   private readonly directory: DouyinDirectory;
+  private readonly identitySecurity: IdentitySecurityProvider;
   private readonly cache: DouyinBridgeCache;
 
   constructor(
@@ -97,6 +141,7 @@ export class DouyinBridge {
     private readonly logger: AppLogger,
     private readonly options: DouyinBridgeOptions = {}
   ) {
+    this.identitySecurity = new IdentitySecurityProvider(page, () => this.accountId);
     this.cache = options.cache ?? createDouyinBridgeCache(options.messageCacheLimit, options.messageCacheTtlMs);
     this.messageCache = this.cache.messages;
     this.sentClientMessageIds = this.cache.sentClientMessageIds;
@@ -116,6 +161,10 @@ export class DouyinBridge {
       this.logger.warn({ error }, 'douyin account and conversation initialization failed');
     });
     this.synchronizeCacheAccount();
+    if (this.accountId && this.directory.initialSyncState && !this.cache.syncCursors?.['1']) {
+      this.cache.syncCursors = { ...this.cache.syncCursors, '1': { ...this.directory.initialSyncState } };
+      await this.cache.persist?.();
+    }
     if (!this.options.enableDomMessageCapture) {
       this.logger.info('douyin bridge started with realtime network capture');
       return;
@@ -140,7 +189,110 @@ export class DouyinBridge {
     this.messageHandlers.add(handler);
   }
 
+  onReaction(handler: (notice: DouyinReactionNotice) => void | Promise<void>): void { this.reactionHandlers.add(handler); }
+
+  onGroupNotice(handler: (notice: DouyinGroupNotice) => void | Promise<void>): void { this.groupNoticeHandlers.add(handler); }
+
+  onGroupRequest(handler: (request: import('./directory.js').GroupApplyInfo, flag: string) => void | Promise<void>): void { this.groupRequestHandlers.add(handler); }
+
+  async pollGroupRequests(): Promise<void> {
+    const accountId = this.accountId;
+    if (!accountId || !this.groupRequestHandlers.size) return;
+    this.synchronizeCacheAccount();
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    await deadline.run(async () => {
+      const groups = await this.directory.getConversations();
+      for (const group of groups) {
+        if (group.type !== 'group' || !group.shortId || (group.ownerId !== accountId && group.selfRole !== 2)) continue;
+        try {
+          for (const request of await this.directory.getGroupRequests(group.shortId, deadline)) {
+            const flag = `dygroup:${accountId}:${group.shortId}:${request.applyId}`;
+            if (!/^[1-9]\d{0,18}$/.test(request.applyId) || !/^[1-9]\d{0,18}$/.test(request.userId) || this.cache.notifications.get(flag)) continue;
+            if (this.accountId !== accountId) throw new Error('Account changed while delivering group requests');
+            for (const handler of this.groupRequestHandlers) await handler(request, flag);
+            if (this.accountId !== accountId) throw new Error('Account changed while delivering group requests');
+            this.cache.notifications.set(flag, true); await this.cache.persist?.();
+          }
+        } catch (error) {
+          deadline.remainingMs();
+          if (this.accountId !== accountId) throw error;
+          this.logger.warn({ error, groupId: group.shortId }, 'could not read group join requests');
+        }
+      }
+    });
+  }
+
+  async approveGroupRequest(flag: string, approve: boolean): Promise<void> {
+    const parts = /^dygroup:([1-9]\d{0,18}):([1-9]\d{0,18}):([1-9]\d{0,18})$/.exec(flag);
+    if (!parts || parts[1] !== this.accountId || this.signedOut) throw new Error('Invalid or foreign-account group request flag');
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    await deadline.run(() => this.directory.approveGroupRequest(parts[2], parts[3], approve, deadline));
+  }
+
+  async ingestGroupNotice(candidate: RealtimeMessageCandidate): Promise<boolean> {
+    if (!this.accountId || this.signedOut) return false;
+    this.synchronizeCacheAccount();
+    const accountId = this.accountId;
+    const previous = candidate.conversationShortId ? this.directory.getGroupMemberSnapshot(candidate.conversationShortId) : [];
+    if (candidate.conversationType === 2 && candidate.conversationShortId) this.directory.invalidateGroup(candidate.conversationShortId, candidate.messageType === 50005);
+    const notices = groupNotices(candidate, accountId);
+    const roleKey = `${accountId}:${candidate.serverMessageId}`, pendingRoles = this.pendingGroupRoleNotices.get(roleKey);
+    const modified = new Set(modifiedGroupMembers(candidate));
+    if (pendingRoles) notices.push(...pendingRoles);
+    else if (previous.some(member => member.role === 'admin' && modified.has(member.userId))) {
+      if (this.pendingGroupRoleNotices.size >= 1000) throw new Error('Pending group role notice queue is full');
+      const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+      const current = await deadline.run(() => this.directory.getGroupMembers(candidate.conversationShortId!, true, deadline));
+      if (this.accountId !== accountId) throw new Error('Account changed while reconciling group roles');
+      const removed = removedAdminNotices(candidate, previous, current);
+      if (removed.length) this.pendingGroupRoleNotices.set(roleKey, removed);
+      notices.push(...removed);
+    }
+    if (!notices.length) return false;
+    for (const notice of notices) {
+      const key = `group:${notice.eventId}:${notice.type}:${notice.userId}`;
+      if (this.cache.notifications.get(key)) continue;
+      const deliveryKey = `${accountId}:${key}`, running = this.groupNoticeDeliveries.get(deliveryKey);
+      if (running) { await running; continue; }
+      const task = (async () => {
+        if (this.accountId !== accountId) throw new Error('Account changed during group notice delivery');
+        for (const handler of this.groupNoticeHandlers) await handler(notice);
+        if (this.accountId !== accountId) throw new Error('Account changed during group notice delivery');
+        if (notice.type === 'group_admin' && notice.subType === 'set') this.directory.rememberGroupAdmin(notice.groupId, notice.userId);
+        this.cache.notifications.set(key, true);
+        try { await this.cache.persist?.(); }
+        catch (error) { this.cache.notifications.delete(key); throw error; }
+      })().finally(() => this.groupNoticeDeliveries.delete(deliveryKey));
+      this.groupNoticeDeliveries.set(deliveryKey, task);
+      await task;
+    }
+    this.pendingGroupRoleNotices.delete(roleKey);
+    return true;
+  }
+
+  async ingestReaction(candidate: RealtimeMessageCandidate): Promise<void> {
+    const id = candidate.serverMessageId;
+    if (!id || !this.accountId || this.signedOut) return;
+    this.synchronizeCacheAccount();
+    if (this.cache.notifications.get(id)) return;
+    const running = this.reactionDeliveries.get(id);
+    if (running) return running;
+    const notices = reactionNotices(candidate);
+    if (!notices.length) return;
+    const task = (async () => {
+      for (const notice of notices) {
+        if (this.cache.recalls.get(notice.messageId)) continue;
+        for (const handler of this.reactionHandlers) await handler(notice);
+      }
+      this.cache.notifications.set(id, true);
+      await this.cache.persist?.();
+    })().finally(() => this.reactionDeliveries.delete(id));
+    this.reactionDeliveries.set(id, task);
+    return task;
+  }
+
   getCachedMessage(messageId: string): DouyinMessage | undefined {
+    if (this.signedOut) return undefined;
     this.synchronizeCacheAccount();
     if (this.cache.restored) return undefined;
     if (this.cache.recalls.get(messageId)) return undefined;
@@ -152,6 +304,211 @@ export class DouyinBridge {
 
   resolveFileUrl(resource: DouyinFileResource): Promise<string> {
     return resolveDouyinFileUrl(this.page, resource);
+  }
+
+  async queryMessage(messageId: string, target: DouyinSendTarget,
+    deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000)): Promise<RealtimeMessageCandidate> {
+    return deadline.run(async () => {
+      const accountId = this.accountId;
+      if (!accountId) throw new Error('Douyin account is not authenticated');
+      const resolved = await this.directory.resolveTarget(target);
+      const context = await this.readSendProtocolContext();
+      if (this.accountId !== accountId) throw new Error('Douyin account changed during message query');
+      const payload = await encodeReactionQuery({ messageId, conversationId: resolved.conversationId!,
+        conversationShortId: resolved.conversationShortId!, conversationType: resolved.type === 'group' ? 2 : 1 });
+      const raw = await postImApi(this.page, 'v1/message/get_message_by_server_id',
+        buildImApiRequest(211, payload, context, resolved.inboxType), deadline.remainingMs());
+      const detail = await decodeQueriedMessage(raw);
+      deadline.remainingMs();
+      if (this.accountId !== accountId || detail.serverMessageId !== messageId || detail.conversationId !== resolved.conversationId ||
+          detail.conversationShortId !== resolved.conversationShortId || detail.conversationType !== (resolved.type === 'group' ? 2 : 1)) {
+        throw new Error('Message query returned a different account or conversation');
+      }
+      return detail;
+    });
+  }
+
+  async fetchMessage(messageId: string, target: DouyinSendTarget): Promise<DouyinMessage> {
+    const detail = await this.queryMessage(messageId, target);
+    this.synchronizeCacheAccount();
+    if (this.cache.recalls.get(messageId)) throw new Error('Message has been recalled');
+    const message = toDouyinMessage(detail, false, true);
+    if (!message) throw new Error('Message is unavailable');
+    this.messageCache.set(messageId, message);
+    await this.cache.persist?.();
+    return message;
+  }
+
+  async getHistory(target: DouyinSendTarget, cursor = '0', limit = 50, direction = 3, parentDeadline?: ActionDeadline): Promise<{
+    messages: DouyinMessage[]; next_cursor: string; has_more: boolean;
+  }> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || ![1, 2, 3].includes(direction)) throw new Error('Invalid history limit or direction');
+    const deadline = parentDeadline ?? new ActionDeadline(this.options.actionTimeoutMs ?? 15000), accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    return deadline.run(async () => {
+      const resolved = await this.directory.resolveTarget(target);
+      const body = await this.historyRequest(301, 'HistoryRequest', { conversationId: resolved.conversationId,
+        conversationShortId: resolved.conversationShortId, conversationType: resolved.type === 'group' ? 2 : 1,
+        anchorIndex: cursorId(cursor), direction, limit }, 'v1/message/get_by_conversation', resolved.inboxType ?? 0, deadline);
+      if (this.accountId !== accountId || !body.history) throw new Error('History account changed or response missing');
+      const messages: DouyinMessage[] = [];
+      for (const candidate of historyCandidates(body.history)) {
+        if (candidate.conversationId !== resolved.conversationId || candidate.conversationShortId !== resolved.conversationShortId ||
+            candidate.conversationType !== (resolved.type === 'group' ? 2 : 1)) throw new Error('History response conversation mismatch');
+        const message = toDouyinMessage({ ...candidate, mediaUnavailable: true }, false, true);
+        if (!message || this.cache.recalls.get(message.messageId) || (messageCallbackStatus(message) ?? 0) !== 0) continue;
+        const existing = this.getCachedMessage(message.messageId);
+        if (!existing) this.messageCache.set(message.messageId, message);
+        messages.push(existing ?? message);
+      }
+      await this.cache.persist?.();
+      return { messages, next_cursor: cursorId(body.history.nextCursor ?? '0'), has_more: body.history.hasMore === true };
+    });
+  }
+
+  async getHistoryFromMessage(target: DouyinSendTarget, messageId: string | undefined, limit: number, newer = false,
+    deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000)) {
+    return deadline.run(async () => {
+      if (!messageId) return this.getHistory(target, '0', limit, 3, deadline);
+      // Plugin message_seq is a public message ID, never the native conversation index.
+      const detail = await this.queryMessage(messageId, target, deadline);
+      const index = cursorId((detail.raw as Record<string, unknown>).indexInConversation);
+      const result = await this.getHistory(target, index, limit, newer ? 2 : 1, deadline);
+      return { ...result, messages: result.messages.filter(message => message.messageId !== messageId) };
+    });
+  }
+
+  async getReadState(target: DouyinSendTarget): Promise<Record<string, unknown>> {
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000), accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    return deadline.run(async () => {
+      const info = await this.directory.getConversationState(target, deadline);
+      const body = await this.historyRequest(2000, 'ReadIndexRequest', { conversationId: info.conversationId,
+        conversationShortId: info.conversationShortId, conversationType: info.conversationType },
+      'v3/conversation/get_read_index', info.inboxType ?? 0, deadline);
+      if (this.accountId !== accountId || !body.read) throw new Error('Read state unavailable or account changed');
+      const count = info.badgeCount, read = info.conversationSettingInfo?.readBadgeCount;
+      return { conversation_id: info.conversationId, conversation_short_id: info.conversationShortId,
+        unread_count: count === undefined || read === undefined ? null : Math.max(0, count - read),
+        read_index: info.conversationSettingInfo?.readIndex, read_index_v2: info.conversationSettingInfo?.readIndexV2,
+        participants: body.read.indexes ?? [] };
+    });
+  }
+
+  async markConversationRead(target: DouyinSendTarget): Promise<void> {
+    const accountId = this.accountId, deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    return deadline.run(async () => {
+      const info = await this.directory.getConversationState(target, deadline);
+      const latest = await this.getHistory(target, '0', 1, 3, deadline);
+      const message = latest.messages[0];
+      if (!message) return;
+      const detail = await this.queryMessage(message.messageId, target, deadline);
+      const raw = detail.raw as Record<string, unknown>;
+      const index = cursorId(raw.indexInConversation), indexV2 = cursorId(raw.indexInConversationV2 ?? '1');
+      if (this.accountId !== accountId) throw new Error('Douyin account changed before marking read');
+      await this.historyRequest(2002, 'MarkReadRequest', { conversationId: info.conversationId,
+        conversationShortId: info.conversationShortId, conversationType: info.conversationType,
+        readMessageIndex: index, readMessageIndexV2: indexV2, readBadgeCount: info.badgeCount }, 'v3/conversation/mark_read', info.inboxType ?? 1, deadline);
+    });
+  }
+
+  async recoverMessages(deliver: (candidate: RealtimeMessageCandidate) => Promise<void>): Promise<boolean> {
+    const accountId = this.accountId;
+    if (!accountId || this.cache.restored || !Object.keys(this.cache.syncCursors ?? {}).length) return false;
+    for (const [inbox, start] of Object.entries(this.cache.syncCursors ?? {})) {
+      let cursor = { ...start };
+      for (let page = 0; page < 100; page++) {
+        const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+        const body = await this.historyRequest(2048, 'SyncMessagesRequest', { ...cursor, source: 'reconnect' },
+          'v1/message/get_user_message', Number(inbox), deadline);
+        if (this.accountId !== accountId || !body.sync) throw new Error('Recovery account changed or response missing');
+        const sync = body.sync;
+        const next = { version: nextSyncCursor(cursor.version, sync.messages?.nextVersion, sync.messages?.hasMore, sync.messages?.conversations?.length ?? 0),
+          cmdIndex: nextSyncCursor(cursor.cmdIndex, sync.commands?.nextIndex, sync.commands?.hasMore, sync.commands?.messages?.length ?? 0),
+          readVersion: nextSyncCursor(cursor.readVersion, sync.readInfo?.nextVersion, sync.readInfo?.hasMore, sync.readInfo?.entries?.length ?? 0) };
+        const hasMore = Boolean(sync.messages?.hasMore || sync.commands?.hasMore || sync.readInfo?.hasMore);
+        if (Object.keys(cursor).some(key => BigInt(next[key as keyof typeof next]) < BigInt(cursor[key as keyof typeof cursor])) ||
+            (hasMore && JSON.stringify(next) === JSON.stringify(cursor))) throw new Error('Recovery cursor did not advance');
+        const candidates = [...historyCandidates(sync.commands ?? {}),
+          ...(sync.messages?.conversations ?? []).flatMap((entry: any) => historyCandidates({ messages: [...(entry.messages ?? []), ...(entry.extMessages ?? [])] }))];
+        for (const candidate of candidates) {
+          if (candidate.serverMessageId && this.cache.notifications.get(`message:${candidate.serverMessageId}`)) continue;
+          await deliver(candidate);
+          if (this.accountId !== accountId) throw new Error('Account changed during recovery');
+        }
+        // Save only after every message/command in the page reached durable downstream queues.
+        this.cache.syncCursors![inbox] = next;
+        await this.cache.persist?.();
+        cursor = next;
+        if (!hasMore) break;
+        if (page === 99) throw new Error('Recovery page limit reached; remaining messages will resume on the next pass');
+      }
+    }
+    return true;
+  }
+
+  private async historyRequest(command: number, type: string, params: Record<string, unknown>, path: string,
+    inbox: number, deadline: ActionDeadline): Promise<Record<string, any>> {
+    const accountId = this.accountId;
+    const context = await this.readSendProtocolContext();
+    const payload = await encodeHistoryRequest(type, params);
+    if (!accountId || this.accountId !== accountId) throw new Error('Douyin account changed during query');
+    const raw = await postImApi(this.page, path, buildImApiRequest(command, payload, context, inbox, command === 2002 ? 604 : command), deadline.remainingMs());
+    deadline.remainingMs();
+    if (this.accountId !== accountId) throw new Error('Douyin account changed during query');
+    return decodeHistoryResponse(raw, command);
+  }
+
+  async updateCachedMessageDetail(detail: RealtimeMessageCandidate): Promise<void> {
+    if (!detail.serverMessageId) return;
+    const cached = this.getCachedMessage(detail.serverMessageId);
+    if (!cached || (detail.conversationId && detail.conversationId !== cached.conversationId) ||
+        (detail.sender && detail.sender !== cached.senderId) || (detail.messageType && detail.messageType !== cached.messageType)) return;
+    const merged = mergeRealtimeMessageDetail(this.cachedCandidate(cached), detail);
+    const updated = toDouyinMessage(merged, false, true);
+    if (!updated) return;
+    const oldMedia = cached.segments?.filter(segment => ['image', 'video', 'record', 'file'].includes(segment.type));
+    const segments = oldMedia?.length ? [...(updated.segments?.filter(segment => segment.type === 'reply') ?? []), ...oldMedia] : updated.segments;
+    this.messageCache.set(cached.messageId, { ...cached, content: merged.content, text: updated.text, segments, raw: merged.raw });
+    await this.cache.persist?.();
+  }
+
+  private cachedCandidate(cached: DouyinMessage): RealtimeMessageCandidate {
+    return { source: 'imapi', serverMessageId: cached.messageId, clientMessageId: cached.clientMessageId,
+      conversationId: cached.conversationId, conversationShortId: cached.conversationShortId,
+      conversationType: cached.conversationType === 'group' ? 2 : 1, sender: cached.senderId,
+      messageType: cached.messageType, content: cached.content, createTime: String(cached.timestamp), raw: cached.raw };
+  }
+
+  receiveCachedImage(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const existing = this.receivingImages.get(messageId);
+    if (existing) return existing;
+    const promise = this.downloadCachedImage(messageId, registry).finally(() => this.receivingImages.delete(messageId));
+    this.receivingImages.set(messageId, promise);
+    return promise;
+  }
+
+  private async downloadCachedImage(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const cached = this.getCachedMessage(messageId), accountId = this.accountId;
+    if (!cached || cached.messageType !== 27) throw new Error('Image message not found in cache');
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    return deadline.run(async () => {
+      let candidate = this.cachedCandidate(cached);
+      try { candidate = await enrichRealtimeMedia(this.page, registry, this.logger, candidate, deadline.signal); }
+      catch {
+        deadline.remainingMs();
+        const detail = await this.queryMessage(messageId, { type: cached.conversationType, conversationId: cached.conversationId }, deadline);
+        candidate = await enrichRealtimeMedia(this.page, registry, this.logger, mergeRealtimeMessageDetail(candidate, detail), deadline.signal);
+      }
+      deadline.remainingMs();
+      if (this.accountId !== accountId || this.getCachedMessage(messageId) !== cached) throw new Error('Image message expired, recalled or changed during download');
+      const replies = cached.segments?.filter(segment => segment.type === 'reply') ?? [];
+      const message = { ...cached, content: candidate.content, segments: [...replies, { type: 'image', data: { file: candidate.mediaUrl! } }] };
+      this.messageCache.set(messageId, message);
+      await this.cache.persist?.();
+      return message;
+    });
   }
 
   receiveCachedFile(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
@@ -232,6 +589,41 @@ export class DouyinBridge {
     if (!candidate.mediaUrl) throw new Error('Video resource is unavailable');
     const replies = cached.segments?.filter(segment => segment.type === 'reply') ?? [];
     const message = { ...cached, segments: [...replies, { type: 'video', data: { file: candidate.mediaUrl } }] };
+    this.messageCache.set(messageId, message);
+    await this.cache.persist?.();
+    return message;
+  }
+
+  receiveCachedVoice(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const existing = this.receivingVoices.get(messageId);
+    if (existing) return existing;
+    const promise = this.downloadCachedVoice(messageId, registry).finally(() => this.receivingVoices.delete(messageId));
+    this.receivingVoices.set(messageId, promise);
+    return promise;
+  }
+
+  private async downloadCachedVoice(messageId: string, registry: MediaRegistry): Promise<DouyinMessage> {
+    const cached = this.getCachedMessage(messageId);
+    if (!cached || cached.messageType !== 17) throw new Error('Voice message not found in cache');
+    const accountId = this.accountId;
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    const candidate = await deadline.run(async () => {
+      const initial = this.cachedCandidate(cached);
+      try { return await enrichRealtimeMedia(this.page, registry, this.logger, initial, deadline.signal); }
+      catch {
+        deadline.remainingMs();
+        const detail = await this.queryMessage(messageId, { type: cached.conversationType, conversationId: cached.conversationId }, deadline);
+        return enrichRealtimeMedia(this.page, registry, this.logger, mergeRealtimeMessageDetail(initial, detail), deadline.signal);
+      }
+    });
+    deadline.remainingMs();
+    if (this.accountId !== accountId || this.getCachedMessage(messageId) !== cached) throw new Error('Voice message expired, recalled or changed during download');
+    const replies = cached.segments?.filter(segment => segment.type === 'reply') ?? [];
+    const segments = toDouyinMessage(candidate, false, true)!.segments!;
+    const message = { ...cached, content: candidate.content, segments: [
+      ...(replies.length ? replies : segments.filter(segment => segment.type === 'reply')),
+      ...segments.filter(segment => segment.type !== 'reply')
+    ] };
     this.messageCache.set(messageId, message);
     await this.cache.persist?.();
     return message;
@@ -333,6 +725,50 @@ export class DouyinBridge {
     await this.handleMessage(message);
   }
 
+  async getStickerList(input: { keyword?: string; cursor?: string; target?: DouyinSendTarget } = {}): Promise<Record<string, unknown>> {
+    const accountId = this.accountId, deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    const cursor = cursorId(input.cursor ?? '0');
+    if (input.keyword !== undefined && (!input.keyword.trim() || input.keyword.length >= 20)) throw new Error('Sticker search keyword must contain 1–19 characters');
+    return deadline.run(async () => {
+      const search = input.keyword !== undefined;
+      const target = search ? await this.directory.resolveTarget(input.target ?? { type: 'private' }) : undefined;
+      if (search && !target?.conversationId) throw new Error('Sticker search requires an existing conversation');
+      const params: Record<string, string> = search ? { keyword: input.keyword!, cursor, keyword_id: '', source: 'im', query_index: '0',
+        target_uid: '0', conv_id: target!.conversationId! } : { cursor, count: '50', groupId: '1' };
+      const value = await fetchDouyinResource(this.page, search ? '/aweme/v1/web/im/resource/emoticon/search/' :
+        '/aweme/v1/web/im/resources/emoticon/trending', params, deadline);
+      if (this.accountId !== accountId) throw new Error('Account changed during sticker lookup');
+      const result = parseStickerCatalog(value, search);
+      const stickers = result.items.map(message => {
+        const catalogId = randomUUID(), sticker = parseDouyinSticker(message.content, 5)!;
+        this.stickerCatalog.set(catalogId, { accountId, message });
+        return { name: sticker.name ?? '', url: sticker.url, image_id: sticker.imageId,
+          segment: { type: 'sticker', data: { douyin_catalog_id: catalogId } } };
+      });
+      return { stickers, next_cursor: result.cursor, has_more: result.hasMore, unsupported_items: result.rejected };
+    });
+  }
+
+  async resolveShare(url: string, target: DouyinSendTarget, deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000)): Promise<StructuredShareInput> {
+    const accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    return deadline.run(async () => {
+      const resolved = await this.directory.resolveTarget(target);
+      if (!resolved.conversationShortId) throw new Error('Share lookup requires an existing conversation');
+      const canonical = await resolveDouyinUrl(url, deadline);
+      const match = /^https:\/\/www\.douyin\.com\/(?:video|note)\/([1-9]\d{0,19})$/.exec(canonical);
+      if (!match) throw new Error('Automatic share details currently require a video or photo post; user cards require explicit user metadata');
+      const data = await fetchDouyinResource(this.page, '/aweme/v1/web/multi/aweme/detail/', {
+        aweme_ids: `[${match[1]}]`, origin_type: 'chat', request_source: '3', conversation_short_id: resolved.conversationShortId
+      }, deadline, 'POST');
+      if (this.accountId !== accountId) throw new Error('Account changed during share lookup');
+      const detail = Array.isArray(data.aweme_details) ? data.aweme_details.find((item: any) => String(item.aweme_id) === match[1]) : undefined;
+      if (!detail) throw new Error('Share detail unavailable, private, or removed');
+      return awemeShareFromDetail(detail, match[1]);
+    });
+  }
+
   getEmojiList(noCache = false, deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000)): Promise<string[]> {
     const accountId = this.accountId;
     if (!accountId) return Promise.reject(new Error('Douyin account is not authenticated'));
@@ -351,24 +787,39 @@ export class DouyinBridge {
     return promise;
   }
 
-  async sendMessage(input: DouyinSendMessageInput): Promise<DouyinSendMessageResult> {
-    const deadline = new ActionDeadline(input.video ? this.options.videoSendTimeoutMs ?? 120000 : this.options.actionTimeoutMs ?? 15000);
+  async sendMessage(input: DouyinSendMessageInput, parentDeadline?: ActionDeadline): Promise<DouyinSendMessageResult> {
+    if (this.signedOut) throw new Error('Douyin account is signed out');
+    const timeout = input.video ? this.options.videoSendTimeoutMs ?? 120000 : this.options.actionTimeoutMs ?? 15000;
+    const deadline = new ActionDeadline(Math.min(timeout, parentDeadline?.remainingMs() ?? timeout));
+    const messageIds: string[] = [];
     return deadline.run(async () => {
+      if (input.share || input.sticker || input.location || input.contact || input.music || input.forward || input.interactive) {
+        if (([input.share, input.sticker, input.location, input.contact, input.music, input.forward, input.interactive].filter(Boolean).length > 1) || input.text || input.images?.length || input.file || input.video ||
+            input.mentions?.length || input.emojiTokens?.length || input.emojiReaction) {
+          throw new Error('Native card or sticker must be sent as a single segment');
+        }
+        if (input.share && 'kind' in input.share) buildShareContent(input.share);
+      }
       if (input.emojiTokens?.length) {
         const catalog = new Set(await this.getEmojiList(false, deadline));
         for (const token of input.emojiTokens) {
           if (!catalog.has(token)) throw new Error(`Unsupported or hidden Douyin emoji: ${token}`);
         }
       }
-      if (input.video && (input.text || input.file || input.images?.length || input.mentions?.length || input.replyToMessageId || input.emojiReaction)) {
+      if (input.video && (input.text || input.file || input.images?.length || input.mentions?.length || input.emojiReaction)) {
         throw new Error('Video must be sent without text, image, at, reply, file, or emoji');
       }
-      if (input.file && (input.text || input.video || input.images?.length || input.mentions?.length || input.replyToMessageId || input.emojiReaction)) {
+      if (input.file && (input.text || input.video || input.images?.length || input.mentions?.length || input.emojiReaction)) {
         throw new Error('File must be sent without text, image, at, reply, or emoji');
       }
+      const startingAccount = this.accountId;
       input = { ...input, target: await this.directory.resolveTarget(input.target) };
       this.synchronizeCacheAccount();
       deadline.remainingMs();
+      if (startingAccount && this.accountId !== startingAccount) throw new Error('Douyin account changed while resolving message target; message was not sent');
+      if (input.share || input.sticker || input.location || input.contact || input.music || input.forward || input.interactive) {
+        return this.sendNativeViaImApi(input, deadline);
+      }
       if (input.video) return this.sendVideoViaImApi(input, deadline);
       if (input.file) return this.sendFileViaImApi(input, deadline);
       if (input.emojiReaction) {
@@ -376,14 +827,122 @@ export class DouyinBridge {
       }
 
       if (input.images?.length) {
-        return this.sendImagesViaImApi(input, deadline);
+        return this.sendImagesViaImApi(input, deadline, messageIds);
       }
 
       return this.sendViaImApi(input, deadline);
+    }).catch(error => {
+      const clientId = this.uncertainSends.get(deadline);
+      if (clientId) error = new UncertainSendError(clientId, error);
+      if (messageIds.length) throw new PartialSendError([...messageIds], error);
+      throw error;
     });
   }
 
-  private async sendImagesViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
+  async getForwardMessages(messageId: string, parentDeadline?: ActionDeadline, registry?: MediaRegistry): Promise<DouyinMessage[]> {
+    const deadline = parentDeadline ?? new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    return deadline.run(async () => {
+      const accountId = this.accountId, card = this.getCachedMessage(nativeSourceId(messageId));
+      if (!accountId || card?.messageType !== 136) throw new Error('Forward card is not available in this account cache; fetch its message first');
+      const budget = { bytes: 4 * 1024 * 1024, records: 100, chunks: 10 };
+      const visited = new Set<string>();
+      const read = async (current: DouyinMessage, depth: number): Promise<DouyinMessage[]> => {
+        deadline.remainingMs();
+        if (this.accountId !== accountId || this.getCachedMessage(messageId) !== card) throw new Error('Forward card expired, recalled or account changed');
+        if (visited.has(current.messageId)) throw new Error('Forward cycle detected');
+        visited.add(current.messageId);
+        const messages = await readForwardRecords(this.page, current, deadline, accountId, budget);
+        for (let i = 0; i < messages.length; i++) {
+          deadline.remainingMs();
+          if (this.accountId !== accountId || this.getCachedMessage(messageId) !== card) throw new Error('Forward card expired, recalled or account changed');
+          const message = messages[i];
+          if (message.messageType === 136) {
+            try {
+              if (depth >= 1) throw new Error('Forward nesting limit reached');
+              message.forwardMessages = await read(message, depth + 1);
+            } catch { deadline.remainingMs(); message.forwardUnavailable = true; }
+          } else if (registry && [5, 17, 27, 30, 150].includes(message.messageType ?? 0)) {
+            try {
+              const candidate = await enrichRealtimeMedia(this.page, registry, this.logger, this.cachedCandidate(message), deadline.signal,
+                resource => this.resolveFileUrl(resource));
+              const hydrated = toDouyinMessage(candidate, false, true);
+              if (hydrated) messages[i] = { ...hydrated, senderName: message.senderName };
+            } catch { deadline.remainingMs(); /* Keep the explicit unavailable media placeholder. */ }
+          }
+        }
+        return messages;
+      };
+      const messages = await read(card, 0);
+      if (this.accountId !== accountId || this.getCachedMessage(messageId) !== card) throw new Error('Forward card expired, recalled or account changed');
+      return messages;
+    });
+  }
+
+  private async sendNativeViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
+    const conversationShortId = pickNumericConversationId(input);
+    if (!conversationShortId) throw new Error('Native message send requires an existing conversation');
+    const accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    const sourceId = input.sticker?.sourceMessageId ??
+      (input.share && 'sourceMessageId' in input.share ? input.share.sourceMessageId : undefined);
+    const source = sourceId === undefined ? undefined : this.getCachedMessage(nativeSourceId(sourceId));
+    if (sourceId !== undefined && !source) throw new Error('Native source message expired, recalled, or not found in this account cache');
+    const catalog = input.sticker?.catalogId ? this.stickerCatalog.get(input.sticker.catalogId) : undefined;
+    if (input.sticker?.catalogId && (!catalog || catalog.accountId !== accountId)) throw new Error('Sticker catalog entry expired or belongs to another account; query the catalog again');
+    const share = input.share && 'resolveUrl' in input.share ? await this.resolveShare(input.share.resolveUrl, input.target, deadline) : input.share;
+    let message = source ? cachedNativeContent(source, input.sticker ? 'sticker' : 'share') : catalog?.message ??
+      (share && 'kind' in share ? buildShareContent(share) : undefined);
+    if (input.location) message = buildLocationContent(input.location);
+    if (input.interactive) {
+      const catalog = await fetchDouyinResource(this.page, '/aweme/v1/web/im/strategy/config', { aid: '1128', app_id: '1128', scenes: '["interactive_resources"]' }, deadline);
+      message = buildInteractiveEmoji(catalog, input.interactive);
+    }
+    if (input.contact && 'groupId' in input.contact) {
+      const groupId = input.contact.groupId;
+      if (!(await this.directory.getConversations()).some(group => group.type === 'group' && group.shortId === groupId)) throw new Error('Group contact requires an existing group');
+      const group = await this.directory.getGroupInfo(groupId, deadline);
+      if (!group.ownerId) throw new Error('Group owner is unavailable');
+      await this.directory.getGroupMembers(groupId);
+      message = buildGroupCard(group, await this.getUser(group.ownerId), await this.getUser(accountId));
+    }
+    if (input.contact && 'userId' in input.contact) {
+      const user = await this.getUser(input.contact.userId);
+      if (!user.secUid || !user.name) throw new Error('Contact requires a known user with name and secUID; fetch profile details first');
+      message = buildShareContent({ kind: 'user', url: `https://www.douyin.com/user/${user.secUid}`, userId: user.id, title: user.name, image: user.avatar });
+    }
+    const sources: DouyinMessage[] = [];
+    if (input.music || input.forward) {
+      const ids = input.music ? [input.music.sourceMessageId] : 'messageIds' in input.forward! ? input.forward.messageIds : [input.forward!.sourceMessageId];
+      for (const id of ids) { const item = this.getCachedMessage(nativeSourceId(id)); if (!item) throw new Error('Source message expired, recalled, or not found in this account cache'); sources.push(item); }
+      if (input.music) {
+        const music = sources[0];
+        if (music.messageType !== 22 || !music.content) throw new Error('Source is not a native Douyin music card');
+        message = { messageType: 22, content: music.content, text: '[音乐]' };
+      } else message = await prepareForward(this.page, 'sourceMessageId' in input.forward! ? sources[0] : sources, deadline);
+    }
+    if (!message) throw new Error('Native message content is unavailable');
+    const context = await this.readSendProtocolContext(deadline);
+    deadline.remainingMs();
+    if (this.accountId !== accountId) throw new Error('Douyin account changed before native message send; message was not sent');
+    if (sources.some(m => this.getCachedMessage(m.messageId) !== m)) throw new Error('Forward or music source expired, recalled or changed before send');
+    if (source && this.getCachedMessage(source.messageId) !== source) throw new Error('Native source expired, recalled or changed before send');
+    const request = buildNativeSendRequest({ conversationShortId, conversationId: input.target.conversationId,
+      conversationType: input.target.type === 'group' ? 2 : 1, inboxType: input.target.inboxType, message, context, replyReference: this.buildReplyReference(input.replyToMessageId) });
+    const decoded = await this.postImProtobuf('message/send', request.body, deadline, request.clientMessageId, input.target);
+    if (!decoded.ok || !decoded.serverMessageId || !/^[1-9]\d{0,18}$/.test(decoded.serverMessageId) ||
+        BigInt(decoded.serverMessageId) > 9223372036854775807n) {
+      throw new Error(`Douyin native message/send failed: ${decoded.failureReason ?? 'no valid server message receipt; do not retry automatically'}`);
+    }
+    if (this.accountId !== accountId) throw new Error('Douyin account changed after native message send; delivery may have succeeded, do not retry automatically');
+    const messageId = decoded.serverMessageId;
+    this.sentClientMessageIds.set(messageId, request.clientMessageId);
+    this.rememberSentTarget(messageId, input.target);
+    await this.cacheOutgoingMessage(input, messageId, request, message.messageType, accountId);
+    this.logger.info({ messageId, conversationShortId, messageType: message.messageType }, 'sent douyin native message through imapi');
+    return { messageId, raw: { source: 'imapi', response: decoded } };
+  }
+
+  private async sendImagesViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline, messageIds: string[]): Promise<DouyinSendMessageResult> {
     const conversationShortId = pickNumericConversationId(input);
     if (!conversationShortId) {
       throw new Error('Direct Douyin image send requires a numeric conversation id from realtime messages or group list');
@@ -391,33 +950,41 @@ export class DouyinBridge {
     if (!input.images?.length) {
       throw new Error('Direct Douyin image send requires at least one image');
     }
-    if (input.text || input.mentions?.length || input.replyToMessageId) {
+    if (input.text || input.mentions?.length) {
       throw new Error('Direct Douyin image send currently supports image-only messages');
     }
 
-    const context = await this.readSendProtocolContext();
+    const accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
     let lastResult: DouyinSendMessageResult | undefined;
-    for (const image of input.images) {
+    for (const [index, image] of input.images.entries()) {
       deadline.remainingMs();
-      const imageData = await loadImageData(image, deadline.signal);
+      const imageData = await loadImageData(image, deadline.signal, this.options.maxFileBytes, this.options.fileSendAllowedDirs, input.imageOptions?.[index], this.outgoingMedia);
       const uploaded = await this.uploadImageViaVod(imageData, deadline);
+      const context = await this.readSendProtocolContext(deadline);
+      deadline.remainingMs();
+      if (this.accountId !== accountId) throw new Error('Douyin account changed before image send; message was not sent');
       const request = buildImageSendRequest({
         conversationShortId,
         conversationId: input.target.conversationId,
         inboxType: input.target.inboxType,
         conversationType: input.target.type === 'group' ? 2 : 1,
         image: uploaded,
+        replyReference: this.buildReplyReference(input.replyToMessageId),
         context
       });
 
-      const decoded = await this.postImProtobuf('message/send', request.body, deadline);
-      if (!decoded.ok) {
+      const decoded = await this.postImProtobuf('message/send', request.body, deadline, request.clientMessageId, input.target);
+      if (!decoded.ok || !decoded.serverMessageId || !/^[1-9]\d{0,18}$/.test(decoded.serverMessageId) || BigInt(decoded.serverMessageId) > 9223372036854775807n) {
         throw new Error(`Douyin image message/send failed: ${decoded.failureReason ?? decoded.status ?? decoded.statusCode ?? 'unknown'}`);
       }
 
-      const messageId = decoded.serverMessageId ?? decoded.clientMessageId ?? request.clientMessageId;
+      if (this.accountId !== accountId) throw new Error('Douyin account changed after image send; delivery may have succeeded, do not retry automatically');
+      const messageId = decoded.serverMessageId;
       this.sentClientMessageIds.set(messageId, request.clientMessageId);
       this.rememberSentTarget(messageId, input.target);
+      messageIds.push(messageId);
+      await this.cacheOutgoingMessage(input, messageId, request, 27, accountId);
       this.logger.info(
         {
           conversationShortId,
@@ -443,7 +1010,7 @@ export class DouyinBridge {
     if (!lastResult) {
       throw new Error('No image was sent');
     }
-    return lastResult;
+    return { ...lastResult, messageIds: [...messageIds] };
   }
 
   private async sendVideoViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
@@ -451,18 +1018,18 @@ export class DouyinBridge {
     if (!conversationShortId || !input.video) throw new Error('Video send requires an existing conversation and one video');
     const accountId = this.accountId;
     if (!accountId) throw new Error('Douyin account is not authenticated');
-    const video = await prepareOutgoingVideo(input.video, { maxBytes: this.options.maxFileBytes ?? 128 * 1024 * 1024,
+    const video = await prepareOutgoingVideo(input.video, { downloadCache: this.outgoingMedia, maxBytes: this.options.maxFileBytes ?? 128 * 1024 * 1024,
       allowedDirs: this.options.fileSendAllowedDirs ?? [], ffmpegPath: this.options.ffmpegPath ?? 'ffmpeg',
       ffprobePath: this.options.ffprobePath ?? 'ffprobe' }, deadline);
     const config = await this.readImageUploadConfig(deadline.remainingMs());
     const uploaded = await uploadOutgoingVideo(video, config, deadline);
     if (this.accountId !== accountId) throw new Error('Douyin account changed during video upload; message was not sent');
-    const context = await this.readSendProtocolContext();
+    const context = await this.readSendProtocolContext(deadline);
     deadline.remainingMs();
     if (this.accountId !== accountId) throw new Error('Douyin account changed before video send; message was not sent');
     const request = buildVideoSendRequest({ conversationShortId, conversationId: input.target.conversationId,
-      conversationType: input.target.type === 'group' ? 2 : 1, inboxType: input.target.inboxType, video: uploaded, context });
-    const decoded = await this.postImProtobuf('message/send', request.body, deadline);
+      conversationType: input.target.type === 'group' ? 2 : 1, inboxType: input.target.inboxType, video: uploaded, context, replyReference: this.buildReplyReference(input.replyToMessageId) });
+    const decoded = await this.postImProtobuf('message/send', request.body, deadline, request.clientMessageId, input.target);
     if (!decoded.ok || !decoded.serverMessageId || !/^[1-9]\d*$/.test(decoded.serverMessageId)) {
       throw new Error(`Douyin video message/send failed: ${decoded.failureReason ?? 'no valid server message receipt; do not retry automatically'}`);
     }
@@ -470,13 +1037,7 @@ export class DouyinBridge {
     const messageId = decoded.serverMessageId;
     this.sentClientMessageIds.set(messageId, request.clientMessageId);
     this.rememberSentTarget(messageId, input.target);
-    if (!this.messageCache.get(messageId) && !this.cache.recalls.get(messageId)) {
-      this.messageCache.set(messageId, { messageId, clientMessageId: request.clientMessageId, messageType: 30,
-        conversationId: input.target.conversationId ?? conversationShortId, conversationShortId, conversationType: input.target.type,
-        senderId: accountId, timestamp: Date.now(), content: request.content, text: '[视频]',
-        raw: { source: 'imapi', payload: { content: request.content, messageType: 30 } } });
-    }
-    await this.cache.persist?.().catch(error => this.logger.warn({ messageId, error: error instanceof Error ? error.message : String(error) }, 'video delivered but send cache persistence failed'));
+    await this.cacheOutgoingMessage(input, messageId, request, 30, accountId);
     this.logger.info({ messageId, conversationShortId, videoSize: video.bytes.length, width: uploaded.width, height: uploaded.height }, 'sent douyin video through imapi');
     return { messageId, raw: { source: 'imapi', response: decoded } };
   }
@@ -487,13 +1048,15 @@ export class DouyinBridge {
     const accountId = this.accountId;
     if (!accountId) throw new Error('Douyin account is not authenticated');
     const file = await loadOutgoingFile(input.file, this.options.maxFileBytes ?? 128 * 1024 * 1024, deadline.signal, this.options.fileSendAllowedDirs);
-    const context = await this.readSendProtocolContext();
     const config = await this.readImageUploadConfig(deadline.remainingMs());
     const uploaded = await uploadOutgoingFile(file, config, deadline);
     if (this.accountId !== accountId) throw new Error('Douyin account changed during file upload; message was not sent');
+    const context = await this.readSendProtocolContext(deadline);
+    deadline.remainingMs();
+    if (this.accountId !== accountId) throw new Error('Douyin account changed before file send; message was not sent');
     const request = buildFileSendRequest({ conversationShortId, conversationId: input.target.conversationId,
-      conversationType: input.target.type === 'group' ? 2 : 1, inboxType: input.target.inboxType, file: uploaded, context });
-    const decoded = await this.postImProtobuf('message/send', request.body, deadline);
+      conversationType: input.target.type === 'group' ? 2 : 1, inboxType: input.target.inboxType, file: uploaded, context, replyReference: this.buildReplyReference(input.replyToMessageId) });
+    const decoded = await this.postImProtobuf('message/send', request.body, deadline, request.clientMessageId, input.target);
     if (!decoded.ok || !decoded.serverMessageId || !/^[1-9]\d*$/.test(decoded.serverMessageId)) {
       throw new Error(`Douyin file message/send failed: ${decoded.failureReason ?? 'no valid server message receipt; do not retry automatically'}`);
     }
@@ -501,13 +1064,7 @@ export class DouyinBridge {
     const messageId = decoded.serverMessageId;
     this.sentClientMessageIds.set(messageId, request.clientMessageId);
     this.rememberSentTarget(messageId, input.target);
-    if (!this.messageCache.get(messageId) && !this.cache.recalls.get(messageId)) {
-      this.messageCache.set(messageId, { messageId, clientMessageId: request.clientMessageId, messageType: 150,
-        conversationId: input.target.conversationId ?? conversationShortId, conversationShortId, conversationType: input.target.type,
-        senderId: accountId, timestamp: Date.now(), content: request.content, text: `[文件: ${uploaded.name}]`,
-        raw: { source: 'imapi', payload: { content: request.content, messageType: 150 } } });
-    }
-    await this.cache.persist?.().catch(error => this.logger.warn({ messageId, error: error instanceof Error ? error.message : String(error) }, 'file delivered but send cache persistence failed'));
+    await this.cacheOutgoingMessage(input, messageId, request, 150, accountId);
     this.logger.info({ messageId, conversationShortId, fileName: uploaded.name, fileSize: uploaded.size }, 'sent douyin file message through imapi');
     return { messageId, raw: { source: 'imapi', response: decoded } };
   }
@@ -522,7 +1079,11 @@ export class DouyinBridge {
       throw new Error('Direct Douyin send requires text content');
     }
 
-    const context = await this.readSendProtocolContext();
+    const accountId = this.accountId;
+    if (!accountId) throw new Error('Douyin account is not authenticated');
+    const context = await this.readSendProtocolContext(deadline);
+    deadline.remainingMs();
+    if (this.accountId !== accountId) throw new Error('Douyin account changed before text send; message was not sent');
     const request = buildTextSendRequest({
       conversationShortId,
       conversationId: input.target.conversationId,
@@ -534,14 +1095,16 @@ export class DouyinBridge {
       context
     });
 
-    const decoded = await this.postImProtobuf('message/send', request.body, deadline);
-    if (!decoded.ok) {
+    const decoded = await this.postImProtobuf('message/send', request.body, deadline, request.clientMessageId, input.target);
+    if (!decoded.ok || !decoded.serverMessageId || !/^[1-9]\d{0,18}$/.test(decoded.serverMessageId) || BigInt(decoded.serverMessageId) > 9223372036854775807n) {
       throw new Error(`Douyin message/send failed: ${decoded.failureReason ?? decoded.status ?? decoded.statusCode ?? 'unknown'}`);
     }
 
-    const messageId = decoded.serverMessageId ?? decoded.clientMessageId ?? request.clientMessageId;
+    if (this.accountId !== accountId) throw new Error('Douyin account changed after text send; delivery may have succeeded, do not retry automatically');
+    const messageId = decoded.serverMessageId;
     this.sentClientMessageIds.set(messageId, request.clientMessageId);
     this.rememberSentTarget(messageId, input.target);
+    await this.cacheOutgoingMessage(input, messageId, request, 7, accountId);
     this.logger.info(
       {
         conversationShortId,
@@ -561,12 +1124,73 @@ export class DouyinBridge {
     };
   }
 
-  private async postImProtobuf(endpoint: 'message/send' | 'message/set_property', body: Buffer, deadline: ActionDeadline) {
+  private async cacheOutgoingMessage(input: DouyinSendMessageInput, messageId: string,
+    request: { clientMessageId: string; content: string }, messageType: number, accountId: string): Promise<void> {
+    if (!this.messageCache.get(messageId) && !this.cache.recalls.get(messageId)) {
+      const reply = input.replyToMessageId ? [{ type: 'reply', data: { id: input.replyToMessageId } }] : [];
+      const message = toDouyinMessage({ source: 'imapi', serverMessageId: messageId, clientMessageId: request.clientMessageId,
+        conversationId: input.target.conversationId, conversationShortId: input.target.conversationShortId,
+        conversationType: input.target.type === 'group' ? 2 : 1, sender: accountId, messageType,
+        content: request.content, createTime: String(Date.now()), raw: { content: request.content, messageType } }, false, true);
+      if (message) this.messageCache.set(messageId, { ...message, segments: [...reply, ...(message.segments ?? [])] });
+    }
+    await this.cache.persist?.().catch(error => this.logger.warn({ messageId, error: error instanceof Error ? error.message : String(error) }, 'message delivered but send cache persistence failed'));
+  }
+
+  private async postImProtobuf(endpoint: 'message/send' | 'message/set_property', body: Buffer, deadline: ActionDeadline,
+    clientId?: string, target?: DouyinSendTarget) {
+    const accountId = this.accountId;
+    if (endpoint === 'message/send' && clientId && target) {
+      this.cache.pendingSends.set(clientId, { target, createdAt: Date.now() });
+      await this.cache.persist?.();
+      deadline.remainingMs();
+      if (this.accountId !== accountId) throw new Error('Account changed before sending');
+      this.uncertainSends.set(deadline, clientId);
+    }
     const response = await postImApi(this.page, `v1/${endpoint}`, body, deadline.remainingMs());
     const decoded = decodeSendResponse(response);
     const expectedCommand = endpoint === 'message/send' ? 100 : 705;
+    const rejected = (decoded.statusCode !== undefined && decoded.statusCode !== 0) ||
+      (decoded.messageStatus !== undefined && decoded.messageStatus !== 0) ||
+      (decoded.checkCode !== undefined && decoded.checkCode !== '0') ||
+      (decoded.callbackStatusCode !== undefined && decoded.callbackStatusCode !== 0);
+    if (clientId && decoded.cmd === expectedCommand && (decoded.ok || rejected)) {
+      this.uncertainSends.delete(deadline);
+      const pending = this.cache.pendingSends.get(clientId);
+      if (pending) this.cache.pendingSends.set(clientId, { ...pending, ...(decoded.ok ? { messageId: decoded.serverMessageId } : { rejected: true }) });
+      await this.cache.persist?.().catch(() => undefined);
+    }
     if (decoded.cmd !== expectedCommand) return { ...decoded, ok: false, failureReason: `Unexpected response command: ${decoded.cmd}` };
     return decoded;
+  }
+
+  async getSendResult(clientId: string): Promise<Record<string, unknown>> {
+    this.synchronizeCacheAccount();
+    const pending = this.cache.pendingSends.get(clientId);
+    if (!pending || this.cache.restored || !this.accountId) throw new Error('Pending send not found in this account');
+    if (pending.messageId) return { delivery_status: 'sent', message_id: pending.messageId, client_message_id: clientId };
+    if (pending.rejected) return { delivery_status: 'rejected', client_message_id: clientId };
+    const accountId = this.accountId;
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    return deadline.run(async () => {
+      let cursor = '0';
+      for (let page = 0; page < 10; page++) {
+        deadline.remainingMs();
+        const result = await this.getHistory(pending.target, cursor, 100, page === 0 ? 3 : 1, deadline);
+        if (this.accountId !== accountId) throw new Error('Account changed during send reconciliation');
+        const found = result.messages.find(message => message.clientMessageId === clientId && message.senderId === accountId);
+        if (found) {
+          this.sentClientMessageIds.set(found.messageId, clientId);
+          this.rememberSentTarget(found.messageId, pending.target);
+          this.cache.pendingSends.set(clientId, { ...pending, messageId: found.messageId });
+          await this.cache.persist?.();
+          return { delivery_status: 'sent', message_id: found.messageId, client_message_id: clientId };
+        }
+        if (!result.has_more || result.next_cursor === cursor) break;
+        cursor = result.next_cursor;
+      }
+      return { delivery_status: 'unknown', client_message_id: clientId };
+    });
   }
 
   private async sendReactionViaImApi(input: DouyinSendMessageInput, deadline: ActionDeadline): Promise<DouyinSendMessageResult> {
@@ -661,104 +1285,9 @@ export class DouyinBridge {
   }
 
   private async uploadImageViaVod(imageData: LoadedImageData, deadline: ActionDeadline): Promise<DouyinUploadedImage> {
-    const bytes = Buffer.from(imageData.base64, 'base64');
-    const uploadConfig = await this.readImageUploadConfig(deadline.remainingMs());
-    deadline.remainingMs();
-    const credentials = normalizeUploadCredentials(uploadConfig);
-    const applyUrl = new URL('https://vod.bytedanceapi.com/');
-    applyUrl.searchParams.set('Action', 'ApplyUploadInner');
-    applyUrl.searchParams.set('Version', '2020-11-19');
-    applyUrl.searchParams.set('SpaceName', credentials.spaceName);
-    applyUrl.searchParams.set('FileType', 'image');
-    applyUrl.searchParams.set('IsInner', '1');
-    applyUrl.searchParams.set('NeedFallback', 'true');
-    applyUrl.searchParams.set('FileSize', String(bytes.byteLength));
-    applyUrl.searchParams.set('s', randomId(10));
-
-    deadline.remainingMs();
-    const applyResponse = await fetch(applyUrl, {
-      signal: deadline.signal,
-      method: 'GET',
-      headers: signVodRequest('GET', applyUrl, Buffer.alloc(0), credentials)
-    });
-    const applyBody = await readJsonResponse(applyResponse, 'ApplyUploadInner');
-    const applyResult = recordValue(applyBody.Result ?? applyBody.result, 'ApplyUploadInner.Result');
-    const uploadAddress = recordValue(applyResult.UploadAddress ?? applyResult.uploadAddress, 'UploadAddress');
-    const storeInfos = arrayValue(uploadAddress.StoreInfos);
-    const storeInfo = recordValue(storeInfos[0], 'StoreInfos[0]');
-    const uploadHosts = arrayValue(uploadAddress.UploadHosts);
-    const uploadHost = stringValue(uploadHosts[0]);
-    const storeUri = requireStringValue(storeInfo.StoreUri, 'StoreUri');
-    const auth = requireStringValue(storeInfo.Auth, 'Auth');
-    const sessionKey = requireStringValue(uploadAddress.SessionKey, 'SessionKey');
-
-    const uploadUrl = `https://${uploadHost}/upload/v1/${storeUri}`;
-    const crc32 = crc32Hex(bytes);
-    deadline.remainingMs();
-    const uploadResponse = await fetch(uploadUrl, {
-      signal: deadline.signal,
-      method: 'POST',
-      headers: {
-        authorization: auth,
-        'content-crc32': crc32,
-        'content-type': 'application/octet-stream'
-      },
-      body: bytes
-    });
-    await readJsonResponse(uploadResponse, 'TOS image upload');
-
-    const commitUrl = new URL('https://vod.bytedanceapi.com/');
-    commitUrl.searchParams.set('Action', 'CommitUploadInner');
-    commitUrl.searchParams.set('Version', '2020-11-19');
-    commitUrl.searchParams.set('SpaceName', credentials.spaceName);
-    const commitPayload = Buffer.from(
-      JSON.stringify({
-        SessionKey: sessionKey,
-        Functions: [
-          {
-            name: 'Encryption',
-            input: {
-              Config: {
-                copies: 'cipher_v2'
-              },
-              PolicyParams: {
-                'policy-set': 'check,thumb,medium,large'
-              }
-            }
-          }
-        ]
-      }),
-      'utf8'
-    );
-    deadline.remainingMs();
-    const commitResponse = await fetch(commitUrl, {
-      signal: deadline.signal,
-      method: 'POST',
-      headers: {
-        ...signVodRequest('POST', commitUrl, commitPayload, credentials),
-        'content-type': 'text/plain;charset=UTF-8'
-      },
-      body: commitPayload
-    });
-    const commitBody = await readJsonResponse(commitResponse, 'CommitUploadInner');
-    const commitResult = recordValue(commitBody.Result ?? commitBody.result, 'CommitUploadInner.Result');
-    const firstResult = recordValue(arrayValue(commitResult.Results ?? commitResult.results)[0], 'Results[0]');
-    const encryption = recordValue(firstResult.Encryption ?? firstResult.encryption, 'Encryption');
-    const extra = recordValue(encryption.Extra ?? encryption.extra, 'Encryption.Extra');
-    const oid = requireStringValue(encryption.Uri ?? encryption.uri, 'Encryption.Uri');
-    await this.buildImagePrivacyUrl(oid, deadline.remainingMs()).catch(error => {
-      this.logger.warn({ error: error instanceof Error ? error.message : String(error), oid }, 'douyin image privacy url build failed');
-    });
-    deadline.remainingMs();
-
-    return {
-      oid,
-      skey: requireStringValue(encryption.SecretKey ?? encryption.secretKey, 'Encryption.SecretKey'),
-      size: numberFromUnknown(extra.img_size) ?? bytes.byteLength,
-      md5: requireStringValue(encryption.SourceMd5 ?? encryption.sourceMd5, 'Encryption.SourceMd5'),
-      width: numberFromUnknown(extra.img_width) ?? 0,
-      height: numberFromUnknown(extra.img_height) ?? 0
-    };
+    await validateOutgoingImage(this.page, imageData, deadline.signal);
+    const config = await this.readImageUploadConfig(deadline.remainingMs());
+    return uploadOutgoingImage(imageData, config, deadline);
   }
 
   private async readImageUploadConfig(timeoutMs: number): Promise<unknown> {
@@ -1021,8 +1550,8 @@ export class DouyinBridge {
     return result;
   }
 
-  private async readSendProtocolContext(): Promise<DouyinSendProtocolContext> {
-    return this.page.evaluate(() => {
+  private async readSendProtocolContext(deadline?: ActionDeadline): Promise<DouyinSendProtocolContext> {
+    const context = await this.page.evaluate(() => {
       function allStorageValues(): string[] {
         const values: string[] = [];
         for (const storage of [window.localStorage, window.sessionStorage]) {
@@ -1031,43 +1560,6 @@ export class DouyinBridge {
           }
         }
         return values;
-      }
-
-      function storageValues(): string[] {
-        const values: string[] = [];
-        for (const storage of [window.localStorage, window.sessionStorage]) {
-          for (let index = 0; index < storage.length; index += 1) {
-            const key = storage.key(index) ?? '';
-            const value = storage.getItem(key) ?? '';
-            if (/identity|security|token|device|webid|fp/i.test(`${key}\n${value}`)) {
-              values.push(value);
-            }
-          }
-        }
-        return values;
-      }
-
-      function pickToken(): string | undefined {
-        for (const value of storageValues()) {
-          try {
-            const parsed = JSON.parse(value) as unknown;
-            if (
-              typeof parsed === 'object' &&
-              parsed !== null &&
-              typeof (parsed as { token?: unknown }).token === 'string'
-            ) {
-              return JSON.stringify({ token: (parsed as { token: string }).token });
-            }
-          } catch {
-            // Some storage entries are plain strings; skip JSON parsing failures.
-          }
-
-          const token = value.match(/"token"\s*:\s*"([^"]+)"/)?.[1];
-          if (token) {
-            return JSON.stringify({ token });
-          }
-        }
-        return undefined;
       }
 
       function cookieValue(name: string): string | undefined {
@@ -1106,10 +1598,10 @@ export class DouyinBridge {
         screenHeight: window.screen.height,
         timezoneName: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai',
         deviceId: cookieValue('webid') ?? cookieValue('ttwid') ?? '0',
-        userId: pickUserId(),
-        identitySecurityToken: pickToken()
+        userId: pickUserId()
       };
     });
+    return deadline ? { ...context, ...await this.identitySecurity.get(deadline) } : context;
   }
 
   private buildReplyReference(messageId: string | undefined): DouyinReplyReference | undefined {
@@ -1210,6 +1702,12 @@ export class DouyinBridge {
     await deadline.run(() => this.directory.setGroupName(groupId, name, deadline));
   }
 
+  async manageGroup(groupId: string, operation: import('./group-management.js').GroupOperation): Promise<void> {
+    if (!this.accountId || this.signedOut) throw new Error('Douyin account is not authenticated');
+    const deadline = new ActionDeadline(this.options.actionTimeoutMs ?? 15000);
+    await deadline.run(() => this.directory.manageGroup(groupId, operation, deadline));
+  }
+
   async getFriends(): Promise<DouyinUser[]> {
     return this.directory.getFriends();
   }
@@ -1223,7 +1721,22 @@ export class DouyinBridge {
   }
 
   get accountId(): string | undefined {
-    return this.directory.accountId;
+    return this.signedOut ? undefined : this.directory.accountId;
+  }
+
+  get loggedIn(): boolean {
+    return !this.signedOut && this.directory.loggedIn;
+  }
+
+  async invalidateLogin(): Promise<void> {
+    this.signedOut = true;
+    this.outgoingMedia.clear();
+    this.pendingGroupRoleNotices.clear();
+    this.cache.notifications.clear();
+    this.cache.pendingSends.clear();
+    this.cache.syncCursors = {};
+    this.cache.messages.clear(); this.cache.sentClientMessageIds.clear(); this.cache.sentTargets.clear(); this.cache.recalls.clear();
+    await this.cache.persist?.();
   }
 
   async refreshSession(): Promise<{ loggedIn: boolean; accountId?: string }> {
@@ -1233,11 +1746,12 @@ export class DouyinBridge {
   }
 
   getStatus(): { online: boolean; good: boolean } {
-    const online = !this.page.isClosed() && this.directory.loggedIn && Boolean(this.options.isImConnected?.()) && (this.options.isSessionHealthy?.() ?? true);
+    const online = !this.signedOut && !this.page.isClosed() && this.directory.loggedIn && Boolean(this.options.isImConnected?.()) && (this.options.isSessionHealthy?.() ?? true);
     return { online, good: online && (this.options.isRealtimeHealthy?.() ?? true) };
   }
 
   private async handleMessage(message: DouyinMessage): Promise<void> {
+    if (this.signedOut) return;
     this.synchronizeCacheAccount();
     if (this.cache.restored) return;
     if (this.cache.recalls.get(message.messageId)) return;
@@ -1257,6 +1771,7 @@ export class DouyinBridge {
       this.logger.warn({ messageId: message.messageId, callbackStatus }, 'received rejected message echo; not publishing as a chat message');
       return;
     }
+    if (this.cache.notifications.get(`message:${message.messageId}`)) return;
     this.logger.info(
       {
         messageId: message.messageId,
@@ -1270,6 +1785,7 @@ export class DouyinBridge {
     for (const handler of this.messageHandlers) {
       await handler(message);
     }
+    if (this.messageHandlers.size) this.cache.notifications.set(`message:${message.messageId}`, true);
   }
 
   private rememberSentTarget(messageId: string, target: DouyinSendTarget): void {
@@ -1281,7 +1797,12 @@ export class DouyinBridge {
     if (!accountId) return;
     this.cache.restored = false;
     if (this.cache.accountId === accountId) return;
+    this.outgoingMedia.clear();
+    this.pendingGroupRoleNotices.clear();
     if (this.cache.accountId !== undefined) {
+      this.cache.notifications.clear();
+      this.cache.pendingSends.clear();
+      this.cache.syncCursors = {};
       this.messageCache.clear();
       this.sentClientMessageIds.clear();
       this.cache.sentTargets.clear();
@@ -1351,145 +1872,6 @@ function pickNumericConversationId(input: DouyinSendMessageInput): string | unde
     input.target.userId
   ];
   return candidates.find((value): value is string => typeof value === 'string' && /^\d+$/.test(value));
-}
-
-interface LoadedImageData {
-  base64: string;
-  mimeType: string;
-  name: string;
-}
-
-export async function loadImageData(file: string, signal?: AbortSignal): Promise<LoadedImageData> {
-  signal?.throwIfAborted();
-  if (/^base64:\/\//i.test(file)) {
-    const base64 = file.replace(/^base64:\/\//i, '');
-    const buffer = Buffer.from(base64, 'base64');
-    return {
-      base64,
-      mimeType: detectImageMime(buffer) ?? 'image/png',
-      name: `onebot-image${extensionFromMime(detectImageMime(buffer) ?? 'image/png')}`
-    };
-  }
-
-  const dataUriMatch = file.match(/^data:([^;,]+);base64,(.+)$/i);
-  if (dataUriMatch) {
-    return {
-      base64: dataUriMatch[2],
-      mimeType: dataUriMatch[1] || 'image/png',
-      name: `onebot-image${extensionFromMime(dataUriMatch[1] || 'image/png')}`
-    };
-  }
-
-  if (/^https?:\/\//i.test(file)) {
-    const response = await fetch(file, { signal });
-    if (!response.ok) {
-      throw new Error(`Failed to fetch outgoing image: ${response.status}`);
-    }
-    const contentType = response.headers.get('content-type') ?? 'image/png';
-    return {
-      base64: Buffer.from(await response.arrayBuffer()).toString('base64'),
-      mimeType: contentType.split(';')[0] || 'image/png',
-      name: `onebot-image${extensionFromMime(contentType)}`
-    };
-  }
-
-  const path = file.startsWith('file://') ? new URL(file) : file;
-  const buffer = await readFile(path, { signal });
-  return {
-    base64: buffer.toString('base64'),
-    mimeType: mimeFromPath(typeof path === 'string' ? path : path.pathname),
-    name: basename(typeof path === 'string' ? path : path.pathname) || 'onebot-image.png'
-  };
-}
-
-function normalizeUploadCredentials(value: unknown): UploadCredentials {
-  const root = recordValue(value, 'upload config');
-  const config =
-    optionalRecord(root.public_image_config) ??
-    optionalRecord(root.public_image_config_v2) ??
-    optionalRecord(root.inner_image_config);
-  if (!config) {
-    throw new Error('Douyin image upload config did not contain public_image_config_v2');
-  }
-
-  return {
-    accessKeyId: requireStringValue(config.access_key_id, 'access_key_id'),
-    secretAccessKey: requireStringValue(config.secret_access_key, 'secret_access_key'),
-    sessionToken: requireStringValue(config.session_token, 'session_token').split('|')[0] ?? '',
-    spaceName: requireStringValue(config.space_name, 'space_name')
-  };
-}
-
-async function readJsonResponse(response: Response, label: string): Promise<Record<string, unknown>> {
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`${label} failed: ${response.status} ${text.slice(0, 200)}`);
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text) as unknown;
-  } catch {
-    throw new Error(`${label} returned non-JSON response: ${text.slice(0, 200)}`);
-  }
-  const record = recordValue(parsed, label);
-  const responseMetadata = optionalRecord(record.ResponseMetadata ?? record.responseMetadata);
-  const error = optionalRecord(responseMetadata?.Error ?? responseMetadata?.error);
-  if (error) {
-    throw new Error(`${label} returned error: ${JSON.stringify(error).slice(0, 400)}`);
-  }
-  return record;
-}
-
-function randomId(length: number): string {
-  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let value = '';
-  for (let index = 0; index < length; index += 1) {
-    value += alphabet[Math.floor(Math.random() * alphabet.length)];
-  }
-  return value;
-}
-
-function detectImageMime(buffer: Buffer): string | undefined {
-  if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-    return 'image/png';
-  }
-  if (buffer[0] === 0xff && buffer[1] === 0xd8) {
-    return 'image/jpeg';
-  }
-  if (buffer.subarray(0, 3).toString('ascii') === 'GIF') {
-    return 'image/gif';
-  }
-  if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
-    return 'image/webp';
-  }
-  return undefined;
-}
-
-function mimeFromPath(path: string): string {
-  const extension = extname(path).toLowerCase();
-  if (extension === '.jpg' || extension === '.jpeg') {
-    return 'image/jpeg';
-  }
-  if (extension === '.webp') {
-    return 'image/webp';
-  }
-  if (extension === '.gif') {
-    return 'image/gif';
-  }
-  return 'image/png';
-}
-
-function extensionFromMime(mimeType: string): string {
-  if (/jpeg/i.test(mimeType)) {
-    return '.jpg';
-  }
-  if (/webp/i.test(mimeType)) {
-    return '.webp';
-  }
-  if (/gif/i.test(mimeType)) {
-    return '.gif';
-  }
-  return '.png';
 }
 
 function recordValue(value: unknown, label: string): Record<string, unknown> {

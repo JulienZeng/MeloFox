@@ -1,5 +1,6 @@
 import { resolve } from 'node:path';
 import protobuf from 'protobufjs';
+import type { RealtimeMessageCandidate } from './protobuf.js';
 
 const root = protobuf.load(resolve(process.cwd(), 'proto/douyin/Reaction.proto'));
 
@@ -39,4 +40,13 @@ export async function decodeReactionQuery(buffer: Buffer): Promise<ReactionState
   return { messageId: message.serverMessageId, conversationId: message.conversationId,
     conversationShortId: message.conversationShortId, conversationType: message.conversationType,
     version: message.version, properties: message.propertyList ?? {} };
+}
+
+export async function decodeQueriedMessage(buffer: Buffer): Promise<RealtimeMessageCandidate> {
+  // Reuse the same visibility/status checks as the reaction query.
+  await decodeReactionQuery(buffer);
+  const type = (await root).lookupType('ReactionQueryResponse');
+  const response = type.toObject(type.decode(buffer), { longs: String, defaults: false }) as any;
+  const body = response.body.result.msgInfo.body;
+  return { source: 'imapi', ...body, clientMessageId: body.ext?.find((entry: { key: string }) => entry.key === 's:client_message_id')?.value, raw: body };
 }

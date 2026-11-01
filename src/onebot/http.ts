@@ -34,6 +34,10 @@ export async function startOneBotHttpServer(
       done(Object.assign(failure, { statusCode: 400 }), undefined);
     }
   });
+  server.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_request, body, done) => {
+    try { done(null, Object.fromEntries(new URLSearchParams(String(body)))); }
+    catch (error) { done(Object.assign(new Error('Invalid form body', { cause: error }), { statusCode: 400 })); }
+  });
 
   server.addHook('preHandler', async (request, reply) => {
     if (!request.url.startsWith('/media/') && !isAuthorized(config, request)) {
@@ -297,8 +301,11 @@ export async function startOneBotHttpServer(
   server.post('/:action', async (request: FastifyRequest<{ Params: { action: string }; Body: Record<string, unknown> }>, reply) => {
     return reply.serializer(stringifyOneBotJson).send(await router.handle({
       action: request.params.action,
-      params: request.body
+      params: normalizeHttpParams({ ...(request.query as object), ...request.body })
     }));
+  });
+  server.get('/:action', async (request: FastifyRequest<{ Params: { action: string }; Querystring: Record<string, unknown> }>, reply) => {
+    return reply.serializer(stringifyOneBotJson).send(await router.handle({ action: request.params.action, params: normalizeHttpParams(request.query) }));
   });
 
   await server.listen({
@@ -320,6 +327,19 @@ export async function startOneBotHttpServer(
       await server.close();
     }
   };
+}
+
+export function normalizeHttpParams(params: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...params };
+  delete result.access_token;
+  for (const key of ['auto_escape', 'no_cache', 'is_add', 'set', 'reverse_order', 'reverseOrder', 'disable_get_url', 'parse_mult_msg', 'quick_reply', 'reject_add_request', 'is_dismiss', 'enable', 'approve']) {
+    if (result[key] === 'true') result[key] = true;
+    else if (result[key] === 'false') result[key] = false;
+  }
+  if (typeof result.message === 'string' && result.message.trim().startsWith('[')) {
+    try { const message = parseOneBotJson(result.message); if (Array.isArray(message)) result.message = message; } catch { /* Plain text / CQ remains text. */ }
+  }
+  return result;
 }
 
 function isAuthorized(config: AppConfig, request: FastifyRequest): boolean {

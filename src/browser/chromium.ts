@@ -6,6 +6,7 @@ import type { AppLogger } from '../logger/index.js';
 import { SessionCleanupError } from '../runtime/supervisor.js';
 import { installDouyinInjection } from './injection.js';
 import { attachNetworkDiagnostics, type NetworkEvent } from './network.js';
+import { restoreLoginState } from '../douyin/login.js';
 
 export interface BrowserRuntime {
   context: BrowserContext;
@@ -102,6 +103,7 @@ async function attachBrowserRuntime(
   options: { onNetworkEvent?: (event: NetworkEvent) => void }
 ): Promise<BrowserRuntime> {
   await installDouyinInjection(context, logger);
+  await restoreLoginState(context, config);
 
   const page = await context.newPage();
   if (!config.browser.headless) {

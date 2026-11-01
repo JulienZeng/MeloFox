@@ -10,8 +10,10 @@ import { z } from 'zod';
 import { readCacheJson, writeCacheJson } from '../runtime/cache-file.js';
 import { decodeDouyinImage, imageFormat, type ImageFormat } from './image.js';
 import { decodeDouyinFile, type FilePayload } from './file.js';
+import { audioFormat } from './audio.js';
 
 interface CacheOptions {
+  validateAudio?: boolean;
   filePayload?: FilePayload;
   douyinDecryptKeyHex?: string;
   normalizeImage?: boolean;
@@ -21,6 +23,7 @@ interface CacheOptions {
 }
 
 export interface RegisteredMedia {
+  audioValidated?: boolean;
   fileName?: string;
   fileMd5?: string;
   id: string;
@@ -34,6 +37,7 @@ export interface RegisteredMedia {
 const mediaIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-zA-Z0-9]{1,10}$/;
 const ownedFilePattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-zA-Z0-9]{1,10}(?:\.download|\.transcoded\.mp4|\.normalize\.failed)?$/;
 const mediaIndexSchema = z.object({ version: z.literal(1), items: z.array(z.object({
+  audioValidated: z.boolean().optional(),
   id: z.string().regex(mediaIdPattern), sourceUrl: z.string().url(),
   contentType: z.string().regex(/^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+(?:;[^\r\n]*)?$/),
   createdAt: z.number().finite().nonnegative(), size: z.number().int().nonnegative().safe(),
@@ -185,7 +189,7 @@ export class MediaRegistry {
       const existing = existingId ? this.items.get(existingId) : undefined;
       if (!existing) return undefined;
       const info = await lstat(existing.filePath).catch(() => undefined);
-      if (!this.expired(existing) && info?.isFile() && info.size === existing.size) return this.publicUrl(existing.id);
+      if (!this.expired(existing) && info?.isFile() && info.size === existing.size && (!options.validateAudio || existing.audioValidated)) return this.publicUrl(existing.id);
       await this.removeItem(existing);
       await this.persistIndex();
       return undefined;
@@ -195,7 +199,9 @@ export class MediaRegistry {
 
     const downloading = this.downloads.get(sourceUrl);
     if (downloading) {
-      return this.validateFileCache(await downloading, options.filePayload);
+      const url = await downloading;
+      if (options.validateAudio && !this.findItem(url)?.audioValidated) throw new Error('Voice cache has no verified audio resource');
+      return this.validateFileCache(url, options.filePayload);
     }
 
     const promise = this.downloadRemote(sourceUrl, contentType, extension, { ...options, signal }).finally(() => {
@@ -311,6 +317,49 @@ export class MediaRegistry {
     });
   }
 
+  async getRecord(file: string, format: string): Promise<{ file: string; url: string }> {
+    const codecs: Record<string, [string, string]> = { wav: ['pcm_s16le', 'audio/wav'], mp3: ['libmp3lame', 'audio/mpeg'],
+      ogg: ['libvorbis', 'audio/ogg'], flac: ['flac', 'audio/flac'], spx: ['libspeex', 'audio/ogg'],
+      amr: ['libopencore_amrnb', 'audio/amr'], wma: ['wmav2', 'audio/x-ms-wma'], m4a: ['aac', 'audio/mp4'] };
+    if (!Object.hasOwn(codecs, format)) throw new Error('Unsupported audio output format');
+    await this.initialize();
+    const signal = AbortSignal.any([AbortSignal.timeout(this.config.runtime.actionTimeoutMs), this.shutdown.signal]);
+    return this.exclusive(async () => {
+      signal.throwIfAborted();
+      const original = this.findItem(file);
+      if (!original?.audioValidated || this.expired(original)) throw new Error('Record not found in verified audio cache');
+      const info = await lstat(original.filePath).catch(() => undefined);
+      if (!info?.isFile() || info.size !== original.size) throw new Error('Record cache file is missing or invalid');
+      if (extname(original.filePath) === `.${format}`) return { file: original.filePath, url: this.publicUrl(original.id) };
+      const sourceUrl = `record-convert:${original.id}:${format}`;
+      const existing = this.findItem(sourceUrl);
+      if (existing && !this.expired(existing)) {
+        const info = await lstat(existing.filePath).catch(() => undefined);
+        if (info?.isFile() && info.size === existing.size) return { file: existing.filePath, url: this.publicUrl(existing.id) };
+      }
+      const id = `${randomUUID()}.${format}`, output = resolve(this.cacheDir, id);
+      try {
+        const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+          '-protocol_whitelist', 'file,pipe', '-i', original.filePath, '-map', '0:a:0', '-vn', '-c:a', codecs[format][0],
+          ...(format === 'amr' ? ['-ar', '8000', '-ac', '1'] : []), '-fs', String(this.config.onebot.mediaCache.maxFileBytes + 1), output], signal);
+        signal.throwIfAborted();
+        if (result.exitCode !== 0) throw new Error(`Audio conversion to ${format} failed; check the configured ffmpeg encoder`);
+        const info = await stat(output); this.assertFileSize(info.size);
+        if (info.size >= this.config.onebot.mediaCache.maxFileBytes) throw new Error('Converted audio exceeds cache size limit');
+        await chmod(output, 0o600);
+        await this.pruneCompleted(info.size, 1);
+        this.items.set(id, { id, sourceUrl, filePath: output, contentType: codecs[format][1], size: info.size,
+          createdAt: original.createdAt, audioValidated: true });
+        this.sourceToId.set(sourceUrl, id);
+        await this.persistIndex();
+        return { file: output, url: this.publicUrl(id) };
+      } catch (error) {
+        this.items.delete(id); this.sourceToId.delete(sourceUrl);
+        await rm(output, { force: true }); throw error;
+      }
+    });
+  }
+
   async resolveCachedUrl(file: string): Promise<string | undefined> {
     await this.initialize();
     return this.exclusive(async () => {
@@ -402,6 +451,12 @@ export class MediaRegistry {
         transcodeImage = Boolean(format.transcode);
         if (transcodeImage && options.validateImage) throw new Error('Sticker format requires conversion that could discard animation');
       }
+      if (options.validateAudio) {
+        const format = audioFormat(buffer);
+        resolvedContentType = format.contentType;
+        id = `${cacheId}${format.extension}`;
+        filePath = resolve(this.cacheDir, id);
+      }
       await writeFile(downloadPath, buffer, { mode: 0o600 });
       this.logger?.debug(
         { id, bytes: buffer.length, contentType: resolvedContentType, sourceHost: safeUrlHost(sourceUrl) },
@@ -422,6 +477,12 @@ export class MediaRegistry {
           if (result.exitCode !== 0) throw new Error('Image payload cannot be decoded');
         }
         options.signal?.throwIfAborted();
+      }
+      if (options.validateAudio) {
+        const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath,
+          ['-hide_banner', '-loglevel', 'error', '-xerror', '-i', downloadPath, '-map', '0:a:0', '-f', 'null', '-'], options.signal);
+        options.signal?.throwIfAborted();
+        if (result.exitCode !== 0) throw new Error('Voice audio payload cannot be decoded');
       }
       const isVideo = /video\//i.test(resolvedContentType);
       const shouldProcessVideo = isVideo && (this.config.onebot.mediaCache.transcodeVideoToH264 || Boolean(options.douyinDecryptKeyHex));
@@ -449,6 +510,7 @@ export class MediaRegistry {
         options.signal?.throwIfAborted();
         await this.pruneCompleted(fileStat.size, 1);
         this.items.set(id, { id, sourceUrl, filePath, contentType: resolvedContentType, createdAt: Date.now(), size: fileStat.size,
+          audioValidated: options.validateAudio || undefined,
           fileName: options.filePayload?.name, fileMd5: options.filePayload?.md5.toLowerCase() });
         this.sourceToId.set(sourceUrl, id);
         try { await this.persistIndex(); }

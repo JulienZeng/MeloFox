@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" fill="none">
+  <title>Douyin OneBot</title>
+  <rect width="96" height="96" rx="26" fill="#20272C" />
+  <path
+    fill="#FFFFFF"
+    fill-rule="evenodd"
+    d="M44 19h10c0 10 8 16 19 16v10c-8 0-14-3-19-7v23c0 11-8 19-19 19S16 73 16 62s8-19 19-19c3 0 6 1 9 2V19ZM35 53a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z"
+    clip-rule="evenodd"
+  />
+  <circle cx="69" cy="69" r="10" fill="#78BFA7" />
+</svg>

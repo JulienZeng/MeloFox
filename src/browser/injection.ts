@@ -8,6 +8,16 @@ declare global {
 }
 
 export async function installDouyinInjection(context: BrowserContext, logger: AppLogger, enableDomCapture = false): Promise<void> {
+  // tsx preserves function names with an esbuild helper. Playwright serializes
+  // callbacks without their module scope, so nested functions need it in-page.
+  await context.addInitScript({ content: `
+    if (typeof globalThis.__name !== 'function') {
+      Object.defineProperty(globalThis, '__name', {
+        configurable: true,
+        value: (target, name) => Object.defineProperty(target, 'name', { value: name, configurable: true })
+      });
+    }
+  ` });
   if (!enableDomCapture) {
     logger.info('DOM capture disabled; using Playwright network events');
     return;

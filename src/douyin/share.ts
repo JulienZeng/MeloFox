@@ -2,7 +2,7 @@ import { parse, parseNumberAndBigInt } from 'lossless-json';
 import type { OneBotMessageSegment } from '../onebot/types.js';
 
 export interface DouyinShare {
-  kind: 'web' | 'aweme' | 'user';
+  kind: 'web' | 'aweme' | 'photos' | 'user';
   title: string;
   url?: string;
   content?: string;
@@ -12,17 +12,18 @@ export interface DouyinShare {
 }
 
 export function parseDouyinShare(content: string | undefined, messageType: number | undefined): DouyinShare | undefined {
-  if ([7, 27, 30, 150].includes(messageType ?? -1)) return undefined;
+  if ([7, 17, 27, 30, 109, 150].includes(messageType ?? -1)) return undefined;
   let value: unknown;
   try { value = parse(content ?? '', undefined, parseNumberAndBigInt); } catch { return undefined; }
   if (!isRecord(value)) return undefined;
   const aweType = numericId(value.aweType);
-  if (messageType === 8 || aweType === '800' || aweType === '803') {
+  const photos = messageType === 77 || numericId(value.awemeType) === '68';
+  if (photos || messageType === 8 || aweType === '800' || aweType === '803') {
     const awemeId = numericId(value.itemId);
-    return { kind: 'aweme', awemeId,
+    return { kind: photos ? 'photos' : 'aweme', awemeId,
       title: text(value.content_title) ?? text(value.title) ?? text(value.content_name) ?? '[抖音作品]',
-      content: text(value.desc), image: coverUrl(value.cover_url) ?? coverUrl(value.content_thumb),
-      url: awemeId ? `https://www.douyin.com/video/${awemeId}` : undefined };
+      content: text(value.desc), image: coverUrl(value.cover_url) ?? coverUrl(value.cover_url_v2) ?? coverUrl(value.content_thumb),
+      url: awemeId ? `https://www.douyin.com/${photos ? 'note' : 'video'}/${awemeId}` : undefined };
   }
   if (messageType === 25 && text(value.name) && Object.hasOwn(value, 'avatar') && Object.hasOwn(value, 'uid')) {
     const secUid = text(value.secUID);

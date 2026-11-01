@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { open, realpath } from 'node:fs/promises';
 import { basename, extname, isAbsolute, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { downloadMedia, type MediaDownloadOptions, type OutgoingMediaCache } from '../media/outgoing.js';
 import { ActionDeadline } from '../runtime/deadline.js';
 import { crc32Hex, signVodRequest, type UploadCredentials } from './upload-signing.js';
 
@@ -17,7 +18,7 @@ function fileName(name: string): string {
   return name;
 }
 
-export async function loadOutgoingFile(input: OutgoingFile, maxBytes: number, signal: AbortSignal, allowedDirs: string[] = []): Promise<LoadedFile> {
+export async function loadOutgoingFile(input: OutgoingFile, maxBytes: number, signal: AbortSignal, allowedDirs: string[] = [], options: MediaDownloadOptions = {}, cache?: OutgoingMediaCache): Promise<LoadedFile> {
   signal.throwIfAborted();
   const checkSize = (size: number) => {
     if (size > maxBytes) throw new Error(`File exceeds maximum size of ${maxBytes} bytes`);
@@ -41,21 +42,9 @@ export async function loadOutgoingFile(input: OutgoingFile, maxBytes: number, si
       if (url.username || url.password) throw new Error('File URL must not contain credentials');
       name ??= decodeURIComponent(basename(url.pathname));
       fileName(name);
-      const response = await fetch(url, { signal });
-      if (!response.ok || !response.body) {
-        await response.body?.cancel();
-        throw new Error(`File download failed: HTTP ${response.status}`);
-      }
-      const length = response.headers.get('content-length');
-      if (length !== null && Number(length) > maxBytes) {
-        await response.body.cancel();
-        checkSize(Number(length));
-      }
-      const reader = response.body.getReader();
-      stream = { async *[Symbol.asyncIterator]() {
-        while (true) { const part = await reader.read(); if (part.done) return; yield part.value; }
-      } };
-      close = () => { void reader.cancel().catch(() => undefined); };
+      const downloaded = await (cache ? cache.download(url, options, maxBytes, signal) : downloadMedia(url, options, maxBytes, signal));
+      stream = { async *[Symbol.asyncIterator]() { yield downloaded; } };
+      close = () => {};
     } else {
       if (/^[a-z][a-z0-9+.-]*:/i.test(input.file) && !input.file.startsWith('file://')) throw new Error('Unsupported file source scheme');
       const path = input.file.startsWith('file://') ? fileURLToPath(input.file) : input.file;
@@ -112,9 +101,9 @@ export function fileUploadCredentials(value: unknown): UploadCredentials {
   if (root.status_code !== undefined && root.status_code !== 0) throw new Error('File upload config was rejected');
   const config = object(root.public_file_config, 'public_file_config');
   const expires = Number(config.expire_at);
-  if (!Number.isFinite(expires) || expires * 1000 <= Date.now()) throw new Error('File upload credentials expired');
+  if (!Number.isFinite(expires) || expires * (expires > 1e11 ? 1 : 1000) <= Date.now()) throw new Error('File upload credentials expired');
   return { accessKeyId: string(config.access_key_id, 'access_key_id'), secretAccessKey: string(config.secret_access_key, 'secret_access_key'),
-    sessionToken: string(config.session_token, 'session_token').split('|')[0], spaceName: string(config.space_name, 'space_name') };
+    sessionToken: string(config.session_token, 'session_token'), spaceName: string(config.space_name, 'space_name') };
 }
 
 async function jsonResponse(response: Response, stage: string): Promise<Record<string, unknown>> {
@@ -153,7 +142,7 @@ export async function uploadOutgoingFile(file: LoadedFile, config: unknown, dead
   if (!Array.isArray(stores) || stores.length !== 1 || !Array.isArray(hosts)) throw new Error('File upload did not return a single upload target');
   const store = object(stores[0], 'StoreInfos');
   const host = string(hosts[0], 'UploadHost');
-  if (!/^[a-z0-9.-]+\.(bytedancevod\.com|snssdk\.com)$/i.test(host)) throw new Error(`Untrusted file upload host: ${new URL(`https://${host}`).hostname}`);
+  if (!/^(?:[a-z0-9.-]+\.(?:bytedancevod\.com|snssdk\.com)|tos-[a-z0-9-]+\.douyin\.com)$/i.test(host)) throw new Error('Untrusted file upload host');
   const uri = string(store.StoreUri, 'StoreUri');
   if (!/^[a-z0-9_-]+\/[a-z0-9/_-]+$/i.test(uri) || uri.includes('..')) throw new Error('Invalid file upload URI');
   const mode = object(apply.SDKParam, 'SDKParam').server_gcm_encryption_mode;

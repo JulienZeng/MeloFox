@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { DouyinOutgoingMention } from './types.js';
 import type { UploadedFile } from './file-upload.js';
 import { uploadedVideoSchema, type UploadedVideo } from './video-upload.js';
+import { validateNativeContent, type NativeMessageContent } from './native-message.js';
 
 export interface DouyinSendProtocolContext {
   userAgent: string;
@@ -54,6 +55,7 @@ export interface BuildEmojiReactionRequestInput {
 }
 
 export interface BuildImageSendRequestInput {
+  replyReference?: DouyinReplyReference;
   conversationId?: string;
   inboxType?: number;
   conversationShortId: string;
@@ -71,6 +73,7 @@ export interface DouyinUploadedImage {
   md5: string;
   width: number;
   height: number;
+  animated?: boolean;
 }
 
 export interface DouyinReplyReference {
@@ -102,7 +105,7 @@ export interface DecodedSendResponse {
   propertyVersion?: string;
 }
 
-export function buildImApiRequest(command: number, payload: Buffer, context: DouyinSendProtocolContext, inboxType = 0): Buffer {
+export function buildImApiRequest(command: number, payload: Buffer, context: DouyinSendProtocolContext, inboxType = 0, bodyField = command): Buffer {
   const envelope = new ProtoWriter()
     .uint32(1, command)
     .uint32(2, nextSequenceId())
@@ -111,7 +114,7 @@ export function buildImApiRequest(command: number, payload: Buffer, context: Dou
     .uint32(5, 3)
     .uint32(6, inboxType)
     .string(7, '0d50935:feat/pc-im-group')
-    .bytes(8, new ProtoWriter().bytes(command, payload).finish())
+    .bytes(8, new ProtoWriter().bytes(bodyField, payload).finish())
     .string(9, '0')
     .string(11, 'douyin_pc')
     .string(14, '360000');
@@ -142,6 +145,7 @@ export function buildRecallRequest(input: {
 }
 
 export function buildFileSendRequest(input: {
+  replyReference?: DouyinReplyReference;
   conversationId?: string;
   conversationShortId: string;
   conversationType: 1 | 2;
@@ -164,11 +168,13 @@ export function buildFileSendRequest(input: {
     .bytes(5, encodeKeyValue('s:mentioned_users', ''))
     .bytes(5, encodeKeyValue('s:client_message_id', clientMessageId))
     .bytes(5, encodeKeyValue('s:stime', `${Date.now()}.${Math.floor(Math.random() * 10000)}`))
-    .uint32(6, 150).string(8, clientMessageId).finish();
-  return { body: buildImApiRequest(100, payload, input.context, input.inboxType), clientMessageId, content };
+    .uint32(6, 150).string(8, clientMessageId);
+  if (input.replyReference) payload.bytes(11, encodeReplyReference(input.replyReference));
+  return { body: buildImApiRequest(100, payload.finish(), input.context, input.inboxType), clientMessageId, content };
 }
 
 export function buildVideoSendRequest(input: {
+  replyReference?: DouyinReplyReference;
   conversationId?: string; conversationShortId: string; conversationType: 1 | 2; inboxType?: number;
   video: UploadedVideo; context: DouyinSendProtocolContext; clientMessageId?: string
 }): { body: Buffer; clientMessageId: string; content: string } {
@@ -180,14 +186,38 @@ export function buildVideoSendRequest(input: {
     .bytes(5, encodeKeyValue('s:mentioned_users', ''))
     .bytes(5, encodeKeyValue('s:client_message_id', clientMessageId))
     .bytes(5, encodeKeyValue('s:stime', `${Date.now()}.${Math.floor(Math.random() * 10000)}`))
-    .uint32(6, 30).string(8, clientMessageId).finish();
-  return { body: buildImApiRequest(100, payload, input.context, input.inboxType), clientMessageId, content };
+    .uint32(6, 30).string(8, clientMessageId);
+  if (input.replyReference) payload.bytes(11, encodeReplyReference(input.replyReference));
+  return { body: buildImApiRequest(100, payload.finish(), input.context, input.inboxType), clientMessageId, content };
 }
 
-export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: Buffer; clientMessageId: string } {
+export function buildNativeSendRequest(input: {
+  replyReference?: DouyinReplyReference;
+  conversationId?: string; conversationShortId: string; conversationType: 1 | 2; inboxType?: number;
+  message: NativeMessageContent; context: DouyinSendProtocolContext; clientMessageId?: string;
+}): { body: Buffer; clientMessageId: string; content: string } {
+  if (!/^[1-9]\d{0,18}$/.test(input.conversationShortId) || BigInt(input.conversationShortId) > 9223372036854775807n) {
+    throw new Error('Native message send requires a valid existing conversation ID');
+  }
+  validateNativeContent(input.message);
+  const clientMessageId = input.clientMessageId ?? randomUUID();
+  const content = input.message.content;
+  const payload = new ProtoWriter().string(1, input.conversationId ?? input.conversationShortId)
+    .uint32(2, input.conversationType).uint64(3, input.conversationShortId).string(4, content)
+    .bytes(5, encodeKeyValue('s:mentioned_users', ''))
+    .bytes(5, encodeKeyValue('s:client_message_id', clientMessageId))
+    .bytes(5, encodeKeyValue('s:stime', `${Date.now()}.${Math.floor(Math.random() * 10000)}`))
+    .uint32(6, input.message.messageType).string(8, clientMessageId);
+  if (input.message.forwardSendId) payload.bytes(5, encodeKeyValue('a:mr_share_send_id', input.message.forwardSendId));
+  if (input.replyReference) payload.bytes(11, encodeReplyReference(input.replyReference));
+  return { body: buildImApiRequest(100, payload.finish(), input.context, input.inboxType), clientMessageId, content };
+}
+
+export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: Buffer; clientMessageId: string; content: string } {
   const clientMessageId = input.clientMessageId ?? randomUUID();
   const content = buildTextContent(input.text, input.mentions ?? [], input.conversationShortId, Boolean(input.replyReference));
-  const mentionedUsers = (input.mentions ?? []).map(mention => mention.userId).filter(Boolean).join(',');
+  if (input.conversationType !== 2 && input.mentions?.some(mention => mention.userId === 'all')) throw new Error('@all requires a group conversation');
+  const mentionedUsers = [...new Set((input.mentions ?? []).map(mention => mention.userId === 'all' ? '0' : mention.userId).filter(Boolean))].join(',');
   const stime = `${Date.now()}.${Math.floor(Math.random() * 10_000)}`;
 
   const sendBody = new ProtoWriter()
@@ -229,7 +259,8 @@ export function buildTextSendRequest(input: BuildTextSendRequestInput): { body: 
   envelope.uint32(18, 1).string(21, 'douyin_web').string(22, 'web_sdk');
   return {
     body: envelope.finish(),
-    clientMessageId
+    clientMessageId,
+    content: JSON.stringify(content)
   };
 }
 
@@ -292,7 +323,7 @@ export function buildEmojiReactionRequest(input: BuildEmojiReactionRequestInput)
   };
 }
 
-export function buildImageSendRequest(input: BuildImageSendRequestInput): { body: Buffer; clientMessageId: string } {
+export function buildImageSendRequest(input: BuildImageSendRequestInput): { body: Buffer; clientMessageId: string; content: string } {
   const clientMessageId = input.clientMessageId ?? randomUUID();
   const content = {
     resource_url: {
@@ -306,7 +337,7 @@ export function buildImageSendRequest(input: BuildImageSendRequestInput): { body
     check_pics: [],
     md5: input.image.md5,
     from_gallery: 1,
-    aweType: 2702
+    aweType: input.image.animated ? 2703 : 2702
   };
   const stime = `${Date.now()}.${Math.floor(Math.random() * 10_000)}`;
 
@@ -319,10 +350,10 @@ export function buildImageSendRequest(input: BuildImageSendRequestInput): { body
     .bytes(5, encodeKeyValue('s:client_message_id', clientMessageId))
     .bytes(5, encodeKeyValue('s:stime', stime))
     .uint32(6, 27)
-    .string(8, clientMessageId)
-    .finish();
+    .string(8, clientMessageId);
+  if (input.replyReference) sendPayload.bytes(11, encodeReplyReference(input.replyReference));
 
-  const bodyWrapper = new ProtoWriter().bytes(100, sendPayload).finish();
+  const bodyWrapper = new ProtoWriter().bytes(100, sendPayload.finish()).finish();
 
   const envelope = new ProtoWriter()
     .uint32(1, 100)
@@ -344,7 +375,8 @@ export function buildImageSendRequest(input: BuildImageSendRequestInput): { body
   envelope.uint32(18, 1).string(21, 'douyin_web').string(22, 'web_sdk');
   return {
     body: envelope.finish(),
-    clientMessageId
+    clientMessageId,
+    content: JSON.stringify(content)
   };
 }
 
@@ -415,11 +447,11 @@ function buildTextContent(text: string, mentions: DouyinOutgoingMention[], conve
     type: 0,
     richTextInfos: mentions.flatMap(mention => [
       {
-        info: {
+        info: mention.userId === 'all' ? { mention_label: '1' } : {
           uid: mention.userId,
           con_id: conversationShortId
         },
-        infoType: 1,
+        infoType: mention.userId === 'all' ? 4 : 1,
         length: mention.length,
         location: mention.location
       },
@@ -443,8 +475,6 @@ function buildCommonHeaders(context: DouyinSendProtocolContext): Array<[string, 
   }
   if (context.identitySecurityDeviceId) {
     headers.push(['identity_security_device_id', context.identitySecurityDeviceId]);
-  } else if (context.deviceId) {
-    headers.push(['identity_security_device_id', context.deviceId]);
   }
 
   headers.push(

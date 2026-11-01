@@ -1,0 +1,42 @@
+syntax = "proto3";
+import "ChatMessage.proto";
+// Field numbers verified against the official PC IM SDK (2026-10-28).
+message HistoryRequest {
+  string conversationId = 1;
+  int32 conversationType = 2;
+  int64 conversationShortId = 3;
+  int32 direction = 4;
+  int64 anchorIndex = 5;
+  int32 limit = 6;
+}
+message SyncMessagesRequest { int64 version = 1; int64 cmdIndex = 2; int64 readVersion = 4; string source = 5; }
+message SyncMessagesResponse { RecentMessages messages = 1; CommandMessages commands = 2; ReadInfo readInfo = 4; }
+message RecentMessages { int64 nextVersion = 1; repeated ConversationMessages conversations = 2; bool hasMore = 3; }
+message ConversationMessages { int64 shortId = 1; repeated MessageBody messages = 2; int64 version = 3; int32 badgeCount = 4; string conversationId = 5; repeated MessageBody extMessages = 6; }
+message CommandMessages { repeated MessageBody messages = 1; bool hasMore = 2; int64 nextIndex = 3; }
+message ReadInfo { repeated bytes entries = 1; bool hasMore = 2; int64 nextVersion = 3; }
+message HistoryPage { repeated MessageBody messages = 1; int64 nextCursor = 2; bool hasMore = 3; }
+message ReadIndexRequest { int64 conversationShortId = 1; int32 conversationType = 2; string conversationId = 3; }
+message ReadIndex { int64 userId = 1; string secUid = 2; int64 index = 3; int64 indexV2 = 4; int64 indexMin = 5; }
+message ReadIndexResponse { repeated ReadIndex indexes = 1; }
+message MarkReadRequest {
+  string conversationId = 1;
+  int64 conversationShortId = 2;
+  int32 conversationType = 3;
+  int64 readMessageIndex = 4;
+  int64 convUnreadCount = 5;
+  int64 totalUnreadCount = 6;
+  int64 readMessageIndexV2 = 7;
+  int32 readBadgeCount = 8;
+}
+message HistoryResponse {
+  int32 cmd = 1;
+  int32 statusCode = 3;
+  string errorDesc = 4;
+  HistoryResponseBody body = 6;
+}
+message HistoryResponseBody {
+  SyncMessagesResponse sync = 2048;
+  HistoryPage history = 301;
+  ReadIndexResponse read = 2000;
+}

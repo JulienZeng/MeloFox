@@ -1,3 +1,6 @@
+import type { MediaDownloadOptions } from '../media/outgoing.js';
+import type { DouyinShareSendInput } from './native-message.js';
+
 export type DouyinConversationType = 'private' | 'group';
 
 export interface DouyinUser {
@@ -17,6 +20,8 @@ export interface DouyinConversation {
   peerUserId?: string;
   inboxType?: number;
   ownerId?: string;
+  icon?: string;
+  selfRole?: number;
   participants?: DouyinGroupMember[];
   raw?: unknown;
 }
@@ -30,6 +35,8 @@ export interface DouyinMessage {
   senderName?: string;
   messageType?: number;
   clientMessageId?: string;
+  forwardMessages?: DouyinMessage[];
+  forwardUnavailable?: boolean;
   content?: string;
   text?: string;
   segments?: Array<{
@@ -65,8 +72,16 @@ export interface DouyinSendMessageInput {
   text: string;
   emojiTokens?: string[];
   images?: string[];
+  imageOptions?: MediaDownloadOptions[];
   file?: { file: string; name?: string };
-  video?: { file: string };
+  video?: { file: string; download?: MediaDownloadOptions };
+  share?: DouyinShareSendInput;
+  location?: import('./card-compat.js').LocationInput;
+  contact?: { userId: string } | { groupId: string };
+  music?: { sourceMessageId: string };
+  interactive?: 'dice' | 'rps';
+  forward?: { messageIds: string[] } | { sourceMessageId: string };
+  sticker?: { sourceMessageId?: string; catalogId?: string };
   mentions?: DouyinOutgoingMention[];
   replyToMessageId?: string;
   emojiReaction?: DouyinEmojiReaction;
@@ -75,7 +90,23 @@ export interface DouyinSendMessageInput {
 
 export interface DouyinSendMessageResult {
   messageId: string;
+  messageIds?: string[];
   raw?: unknown;
+}
+
+/** A batch is not atomic. Receipted messages must never be resent on retry. */
+export class PartialSendError extends Error {
+  constructor(readonly messageIds: string[], cause: unknown) {
+    super(`Partial send: ${messageIds.length} message(s) acknowledged; ${cause instanceof Error ? cause.message : String(cause)}. Do not retry the entire batch`, { cause });
+    this.name = 'PartialSendError';
+  }
+}
+
+export class UncertainSendError extends Error {
+  constructor(readonly clientMessageId: string, cause: unknown) {
+    super(`Send outcome is unknown; query get_douyin_send_result with client_message_id=${clientMessageId} before retrying`, { cause });
+    this.name = 'UncertainSendError';
+  }
 }
 
 export interface DouyinOutgoingMention {
@@ -100,6 +131,7 @@ export interface DouyinGroupMember {
   nickname?: string;
   card?: string;
   secUid?: string;
-  role?: 'owner' | 'member';
+  role?: 'owner' | 'admin' | 'member';
+  rawRole?: number;
   raw?: unknown;
 }

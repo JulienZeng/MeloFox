@@ -1,3 +1,4 @@
+import { locationSegment } from './card-compat.js';
 import type { Page } from 'playwright';
 import { parse, parseNumberAndBigInt, stringify } from 'lossless-json';
 import type { AppLogger } from '../logger/index.js';
@@ -11,11 +12,17 @@ import { enrichRealtimeFile, parseDouyinFile } from './file.js';
 import type { DouyinFileResource } from './file-url.js';
 import { parseDouyinShare, shareDisplayText, shareMessageSegment } from './share.js';
 import { parseDouyinSticker, stickerSegment, stickerText, validateStickerImage } from './sticker.js';
+import { isVoiceMessageType, voiceSegment, voiceUrl } from './voice.js';
 
 export function shouldWaitForMessageDetail(candidate: RealtimeMessageCandidate): boolean {
   // Mobile quoted text may have an empty WS body; HTTP supplies text and mentions.
   if (candidate.messageType === 7) return !candidate.content?.trim();
   if (candidate.messageType === 5) return !parseDouyinSticker(candidate.content, 5)?.url;
+  if (candidate.messageType === 17) return !voiceUrl(candidate.content);
+  if (candidate.messageType === 150) {
+    try { parseDouyinFile(candidate.content); return false; } catch { return true; }
+  }
+  if ([8, 22, 25, 26, 58, 77, 136, 502].includes(candidate.messageType ?? 0)) return !candidate.content?.trim();
 
   if (candidate.messageType !== 27 && candidate.messageType !== 30) {
     return false;
@@ -101,6 +108,12 @@ export async function enrichRealtimeMedia(
   candidate: RealtimeMessageCandidate, signal: AbortSignal,
   resolveFileUrl?: (resource: DouyinFileResource) => Promise<string>
 ): Promise<RealtimeMessageCandidate> {
+  if (candidate.messageType === 17) {
+    const url = voiceUrl(candidate.content);
+    if (!url) throw new Error('Voice message has no downloadable audio resource');
+    const mediaUrl = await mediaRegistry.cacheRemote(url, 'audio/mpeg', undefined, { validateAudio: true, signal });
+    return { ...candidate, mediaUrl };
+  }
   if (candidate.messageType === 5) {
     const sticker = parseDouyinSticker(candidate.content, 5);
     if (!sticker?.url) throw new Error('Sticker message has no downloadable resource');
@@ -146,9 +159,9 @@ function mergeContentObjects(original: Record<string, unknown>, additional: Reco
   return result;
 }
 
-export function toDouyinMessage(candidate: RealtimeMessageCandidate, stickerAsText = false): DouyinMessage | undefined {
-  if ([50001, 50002, 70001, 70002].includes(candidate.messageType ?? 0)) return undefined;
-  if (!candidate.source.includes('frontier-im.douyin.com')) {
+export function toDouyinMessage(candidate: RealtimeMessageCandidate, stickerAsText = false, allowQueriedMessage = false): DouyinMessage | undefined {
+  if ([50001, 50002, 50005, 50011, 70001, 70002].includes(candidate.messageType ?? 0)) return undefined;
+  if (!allowQueriedMessage && !candidate.source.includes('frontier-im.douyin.com')) {
     return undefined;
   }
 
@@ -192,8 +205,16 @@ function buildMessageSegments(
     segments.push(replySegment(candidate.reference.messageId));
   }
 
+  if (candidate.messageType === 136) { segments.push({ type: 'forward', data: { id: candidate.serverMessageId } }); return segments; }
+  if (candidate.messageType === 22) { segments.push({ type: 'music', data: { type: 'douyin', douyin_source_message_id: candidate.serverMessageId } }); return segments; }
+  if (candidate.messageType === 502) { segments.push(locationSegment(candidate.content) ?? textSegment('[位置不可用]')); return segments; }
   if (candidate.messageType === 7) {
     segments.push(...buildTextSegments(parsedContent, fallbackText));
+    return segments;
+  }
+
+  if (isVoiceMessageType(candidate.messageType)) {
+    segments.push(voiceSegment(candidate.messageType!, candidate.mediaUnavailable ? undefined : candidate.mediaUrl));
     return segments;
   }
 
@@ -289,11 +310,12 @@ function buildTextSegments(parsedContent: unknown, fallbackText: string): OneBot
 
   const atInfos = parsedContent.richTextInfos
     .filter(isRecord)
-    .filter(info => numberValue(info.infoType) === 1 && isRecord(info.info) && stringValue(info.info.uid))
+    .filter(info => isRecord(info.info) && ((numberValue(info.infoType) === 1 && stringValue(info.info.uid)) ||
+      (numberValue(info.infoType) === 4 && String(info.info.mention_label) === '1')))
     .map(info => ({
       location: numberValue(info.location) ?? 0,
       length: numberValue(info.length) ?? 0,
-      uid: stringValue((info.info as Record<string, unknown>).uid) ?? ''
+      uid: numberValue(info.infoType) === 4 ? 'all' : stringValue((info.info as Record<string, unknown>).uid) ?? ''
     }))
     .sort((left, right) => left.location - right.location);
 
@@ -304,6 +326,8 @@ function buildTextSegments(parsedContent: unknown, fallbackText: string): OneBot
   const segments: OneBotMessageSegment[] = [];
   let cursor = 0;
   for (const at of atInfos) {
+    if (!Number.isSafeInteger(at.location) || !Number.isSafeInteger(at.length) || at.location < cursor || at.length < 1 ||
+        at.location + at.length > parsedContent.text.length) continue;
     if (at.location > cursor) {
       segments.push(textSegment(parsedContent.text.slice(cursor, at.location)));
     }
@@ -378,6 +402,10 @@ function inferMediaKind(messageType: number | undefined, parsedContent: unknown,
 }
 
 function messageTypeFallbackText(messageType: number | undefined): string {
+  if (messageType === 136) return '[聊天记录]';
+  if (messageType === 502) return '[位置]';
+  if (messageType === 22) return '[音乐]';
+  if (isVoiceMessageType(messageType)) return '[语音]';
   if (messageType === 25) {
     return '[分享]';
   }

@@ -1,10 +1,16 @@
+web:
+  enabled: true
+  host: "127.0.0.1"
+  port: 3000
+  dataDir: "./data/console"
+
 app:
   selfId: "douyin_bot_001"
   logLevel: "info"
 
 browser:
   userDataDir: "./douyin-profile"
-  headless: false
+  headless: true
   douyinUrl: "https://www.douyin.com/"
 
 douyin:
@@ -12,6 +18,8 @@ douyin:
   hookMode: "network"
 
 onebot:
+  # *_rate_limited 接口共用当前账号队列；单位毫秒。
+  rateLimitIntervalMs: 500
   accessToken: ""
   http:
     enabled: true
@@ -21,6 +29,11 @@ onebot:
   reverseWs:
     enabled: false
     url: "ws://127.0.0.1:6700/onebot/v11/ws"
+  reverseHttp:
+    enabled: false
+    url: "http://127.0.0.1:5701"
+    secret: ""
+    timeoutMs: 10000
   forwardWs:
     enabled: true
     host: "127.0.0.1"

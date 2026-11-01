@@ -6,7 +6,60 @@ const catalogSchema = z.object({ status_code: z.literal(0), emoji_list: z.array(
   display_name: z.string().max(128), hide: z.number().int()
 })).max(2000) });
 
-export const qqFaceNames: Readonly<Record<string, string>> = { '66': '爱心' };
+// QQ IDs/names checked against NapCatQQ/packages/napcat-core/external/face_config.json.
+// Sending still requires the same name in the authenticated Douyin catalog.
+export const qqFaceNames: Readonly<Record<string, string>> = {
+  "1": "撇嘴",
+  "2": "色",
+  "3": "发呆",
+  "4": "得意",
+  "6": "害羞",
+  "7": "闭嘴",
+  "8": "睡",
+  "9": "大哭",
+  "5": "流泪",
+  "10": "尴尬",
+  "11": "发怒",
+  "12": "调皮",
+  "13": "呲牙",
+  "15": "难过",
+  "16": "酷",
+  "18": "抓狂",
+  "19": "吐",
+  "20": "偷笑",
+  "21": "可爱",
+  "22": "白眼",
+  "23": "傲慢",
+  "24": "饥饿",
+  "25": "困",
+  "26": "惊恐",
+  "27": "流汗",
+  "28": "憨笑",
+  "29": "悠闲",
+  "30": "奋斗",
+  "31": "咒骂",
+  "32": "疑问",
+  "33": "嘘",
+  "34": "晕",
+  "35": "折磨",
+  "36": "衰",
+  "37": "骷髅",
+  "38": "敲打",
+  "39": "再见",
+  "99": "鼓掌",
+  "74": "太阳",
+  "75": "月亮",
+  "53": "蛋糕",
+  "49": "拥抱",
+  "66": "爱心",
+  "63": "玫瑰",
+  "64": "凋谢",
+  "67": "心碎",
+  "60": "咖啡",
+  "78": "握手",
+  "79": "胜利",
+  "89": "西瓜"
+};
 
 export function parseSmallEmojiCatalog(value: unknown): string[] {
   const catalog = catalogSchema.parse(value);

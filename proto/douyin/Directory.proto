@@ -14,7 +14,13 @@ message DirectoryResponseBody {
   LegacyInitResponse init = 203;
   ParticipantsResponse participants = 605;
   ConversationInfoResponse info = 610;
+  RemoveParticipantsResponse remove_participants = 651;
+  UpdateParticipantResponse update_participant = 655;
   SetConversationCoreInfoResponse set_core_info = 902;
+  BlockMembersResponse block_members = 2019;
+  EmptyGroupResponse block_conversation = 2020;
+  AckGroupApplyResponse ack_group_apply = 2025;
+  GroupAuditResponse group_audit = 2027;
   InitResponse message_by_init = 2043;
 }
 
@@ -30,6 +36,9 @@ message InitResponse {
   bool has_more = 2;
   int64 next_init_version = 3;
   int64 version = 4;
+  int64 user_cursor = 5;
+  int64 cmd_index = 6;
+  int64 readconv_version = 7;
 }
 
 message ConversationMessage {
@@ -65,8 +74,16 @@ message ConversationInfo {
   int32 participants_count = 7;
   bool is_participant = 8;
   int32 inbox_type = 9;
+  int32 badge_count = 10;
   Participant user_info = 20;
   ConversationCoreInfo conversation_core_info = 50;
+  ConversationSettingInfo conversation_setting_info = 51;
+}
+
+message ConversationSettingInfo {
+  int64 read_index = 5;
+  int64 read_index_v2 = 14;
+  int32 read_badge_count = 16;
 }
 
 message ConversationCoreInfo {
@@ -123,4 +140,90 @@ message Participant {
   string sec_uid = 5;
   map<string, string> ext = 8;
   string avatar_url = 40;
+}
+
+// Field numbers and paths follow the official PC IM SDK; operations are never retried.
+message GroupIdentifier {
+  string conversation_id = 1;
+  int64 conversation_short_id = 2;
+  int32 conversation_type = 3;
+}
+message EmptyGroupResponse {}
+message RemoveParticipantsRequest {
+  string conversation_id = 1;
+  int64 conversation_short_id = 2;
+  int32 conversation_type = 3;
+  repeated int64 participants = 4;
+}
+message RemoveParticipantsResponse {
+  repeated int64 failed_participants = 1;
+  int32 status = 2;
+  string extra_info = 3;
+  int64 check_code = 4;
+  string check_message = 5;
+}
+message UpdateParticipantRequest {
+  string conversation_id = 1;
+  int64 conversation_short_id = 2;
+  int32 conversation_type = 3;
+  int64 user_id = 4;
+  int32 role = 5;
+  string alias = 6;
+  bool is_alias_set = 7;
+}
+message UpdateParticipantResponse {
+  Participant participant = 1;
+  int32 status = 2;
+  string extra_info = 3;
+  int64 check_code = 4;
+  string check_message = 5;
+}
+message BlockMembersRequest {
+  int32 block_status = 1;
+  map<int64, int64> block_time = 2;
+  int64 conv_short_id = 3;
+  int32 conversation_type = 4;
+  string conversation_id = 5;
+}
+message BlockMembersResponse { repeated int64 failed_members = 1; }
+message BlockConversationRequest {
+  string conversation_id = 1;
+  int64 conv_short_id = 2;
+  int32 conversation_type = 3;
+  int32 block_status = 4;
+  bool block_normal_only = 5;
+}
+
+message GroupAuditRequest {
+  int64 cursor = 1;
+  int32 limit = 2;
+  int64 conv_short_id = 3;
+  bool no_clear_unread = 4;
+}
+message GroupApplyInfo {
+  int64 user_id = 1;
+  int64 conv_short_id = 2;
+  int32 conversation_type = 3;
+  int32 apply_status = 4;
+  int64 apply_id = 5;
+  int64 create_time = 6;
+  int64 modify_time = 7;
+  int64 modify_user = 8;
+  string sec_uid = 9;
+  int64 invite_user_id = 10;
+  string sec_invite_uid = 11;
+  map<string, string> ext = 12;
+  string apply_reason = 13;
+}
+message GroupAuditResponse {
+  repeated GroupApplyInfo apply_info_list = 1;
+  int64 next_cursor = 2;
+  bool has_more = 3;
+}
+message AckGroupApplyRequest { int64 apply_id = 1; int32 apply_status = 2; }
+message AckGroupApplyResponse {
+  GroupApplyInfo apply_info = 1;
+  int32 status = 2;
+  int64 check_code = 3;
+  string check_message = 4;
 }

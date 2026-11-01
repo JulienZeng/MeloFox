@@ -1,3 +1,4 @@
+import type { MediaDownloadOptions, OutgoingMediaCache } from '../media/outgoing.js';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -54,22 +55,34 @@ function runTool(binary: string, args: string[], signal: AbortSignal): Promise<B
   });
 }
 
-export async function prepareOutgoingVideo(input: { file: string }, options: {
-  maxBytes: number; allowedDirs: string[]; ffmpegPath: string; ffprobePath: string
+export async function prepareOutgoingVideo(input: { file: string; download?: MediaDownloadOptions }, options: {
+  maxBytes: number; allowedDirs: string[]; ffmpegPath: string; ffprobePath: string; downloadCache?: OutgoingMediaCache
 }, deadline: ActionDeadline): Promise<LoadedVideo> {
-  const file = await loadOutgoingFile({ file: input.file, name: 'onebot-video.mp4' }, options.maxBytes, deadline.signal, options.allowedDirs);
-  if (file.bytes.length < 16 || file.bytes.subarray(4, 8).toString('ascii') !== 'ftyp') throw new Error('Video source must be an MP4 file');
+  const file = await loadOutgoingFile({ file: input.file, name: 'onebot-video.mp4' }, options.maxBytes, deadline.signal, options.allowedDirs, input.download, options.downloadCache);
+  const isMp4 = file.bytes.length >= 16 && file.bytes.subarray(4, 8).toString('ascii') === 'ftyp';
   const dir = await mkdtemp(join(tmpdir(), 'douyin-send-video-'));
   try {
-    const path = join(dir, 'input.mp4'), thumbnail = join(dir, 'cover.jpg');
+    let path = join(dir, 'input');
+    const thumbnail = join(dir, 'cover.jpg');
     await writeFile(path, file.bytes, { mode: 0o600 });
     deadline.remainingMs();
     const metadata = JSON.parse((await runTool(options.ffprobePath, ['-v', 'error', '-protocol_whitelist', 'file,pipe',
-      '-show_entries', 'stream=codec_type,width,height:format=duration', '-of', 'json', path], deadline.signal)).toString());
+      '-show_entries', 'stream=codec_type,codec_name,width,height:format=duration', '-of', 'json', path], deadline.signal)).toString());
     const stream = metadata.streams?.find((item: { codec_type?: string }) => item.codec_type === 'video');
     if (!Number.isSafeInteger(stream?.width) || !Number.isSafeInteger(stream?.height) || stream.width < 1 || stream.height < 1 ||
         stream.width > 16384 || stream.height > 16384 || !Number.isFinite(Number(metadata.format?.duration)) || Number(metadata.format?.duration) <= 0) {
       throw new Error('Video source has no valid video stream or duration');
+    }
+    let bytes = file.bytes;
+    if (!isMp4 || stream.codec_name !== 'h264') {
+      const output = join(dir, 'normalized.mp4');
+      await runTool(options.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-protocol_whitelist', 'file,pipe',
+        '-i', path, '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'libx264', '-preset', 'veryfast',
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart',
+        '-fs', String(options.maxBytes + 1), output], deadline.signal);
+      bytes = await readFile(output);
+      if (bytes.length >= options.maxBytes) throw new Error('Converted video exceeds maximum size');
+      path = output;
     }
     deadline.remainingMs();
     await runTool(options.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-protocol_whitelist', 'file,pipe',
@@ -78,7 +91,7 @@ export async function prepareOutgoingVideo(input: { file: string }, options: {
     const cover = await readFile(thumbnail);
     if (cover.length > 1024 * 1024 || cover[0] !== 0xff || cover[1] !== 0xd8) throw new Error('Video thumbnail could not be generated');
     deadline.remainingMs();
-    return { bytes: file.bytes, thumbnail: cover };
+    return { bytes, thumbnail: cover };
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
@@ -92,7 +105,7 @@ const configSchema = z.object({
 export function videoUploadCredentials(value: unknown): { credentials: UploadCredentials; reviewSpace: string } {
   const config = configSchema.parse(value);
   const c = config.public_image_config;
-  if (c.expire_at * 1000 <= Date.now()) throw new Error('Video upload credentials expired');
+  if (c.expire_at * (c.expire_at > 1e11 ? 1 : 1000) <= Date.now()) throw new Error('Video upload credentials expired');
   return { credentials: { accessKeyId: c.access_key_id, secretAccessKey: c.secret_access_key,
     sessionToken: c.session_token, spaceName: c.space_name }, reviewSpace: config.inner_image_config.space_name };
 }
@@ -131,8 +144,8 @@ const applySchema = z.object({ Result: z.object({
   })).min(1) }).nullish()
 }) });
 
-async function uploadResource(bytes: Buffer, type: 'image' | 'video', credentials: UploadCredentials,
-  functions: unknown[], deadline: ActionDeadline): Promise<Record<string, any>> {
+export async function uploadResource(bytes: Buffer, type: 'image' | 'video', credentials: UploadCredentials,
+  functions: unknown[], deadline: ActionDeadline, encryptedImage = false): Promise<Record<string, any>> {
   deadline.remainingMs();
   const applyUrl = new URL('https://vod.bytedanceapi.com/');
   for (const [key, value] of Object.entries({ Action: 'ApplyUploadInner', Version: '2020-11-19', SpaceName: credentials.spaceName,
@@ -164,7 +177,7 @@ async function uploadResource(bytes: Buffer, type: 'image' | 'video', credential
     headers: { ...signVodRequest('POST', commitUrl, body, credentials), 'content-type': 'text/plain;charset=UTF-8' }, body: new Uint8Array(body)
   }), `${type} commit`);
   const result = committed.Result?.Results?.[0];
-  if (!result || (type === 'image' ? result.UriStatus !== 2000 : result.UriStatus !== undefined && result.UriStatus !== 2000)) {
+  if (!result || (type === 'image' && !encryptedImage ? result.UriStatus !== 2000 : result.UriStatus !== undefined && result.UriStatus !== 2000)) {
     throw new Error(`Video ${type} commit did not succeed`);
   }
   return result;
