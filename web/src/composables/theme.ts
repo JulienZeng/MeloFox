@@ -22,7 +22,7 @@ export function createTheme() {
       document.documentElement.dataset.theme = value ? "dark" : "light";
       document.querySelector<HTMLMetaElement>(
         'meta[name="theme-color"]',
-      )!.content = value ? "#121a21" : "#f6f7f9";
+      )!.content = value ? "#171c26" : "#fbf7f2";
       document.querySelector<HTMLLinkElement>('link[rel="icon"]')!.href =
         asset("logo");
     },

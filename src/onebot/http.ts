@@ -9,6 +9,7 @@ import type { MediaRegistry } from '../media/registry.js';
 import { supportsOneBotAction, type OneBotActionRouter } from './actions.js';
 import type { OneBotActionRequest } from './types.js';
 import { parseOneBotJson, stringifyOneBotJson } from './json.js';
+import { getVersionInfo } from '../runtime/version.js';
 
 export interface HttpServerRuntime {
   server: FastifyInstance;
@@ -62,7 +63,7 @@ export async function startOneBotHttpServer(
 
   server.get('/health', async () => ({
     ok: true,
-    app: 'douyin-onebot'
+    app: getVersionInfo().app_name
   }));
 
   server.get('/_debug/realtime', async () => ({

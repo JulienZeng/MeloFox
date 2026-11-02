@@ -1720,8 +1720,8 @@ export class DouyinBridge {
     return this.directory.getFriends();
   }
 
-  async getLoginInfo(): Promise<DouyinUser> {
-    return this.directory.getLoginInfo();
+  async getLoginInfo(noCache = false): Promise<DouyinUser> {
+    return this.directory.getLoginInfo(noCache);
   }
 
   async getUser(userId: string, noCache = false): Promise<DouyinUser> {

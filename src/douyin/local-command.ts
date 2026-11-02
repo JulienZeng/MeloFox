@@ -21,6 +21,6 @@ export function dyCommandReply(uptimeSeconds = process.uptime()): string {
   const uptime = days ? `${days}天 ${hours % 24}小时 ${minutes % 60}分钟`
     : hours ? `${hours}小时 ${minutes % 60}分钟`
       : minutes ? `${minutes}分钟 ${seconds % 60}秒` : `${seconds}秒`;
-  return ['Douyin OneBot 信息', `版本: ${getVersionInfo().app_version}`,
+  return ['MeloFox（音狐）信息', `版本: ${getVersionInfo().app_version}`,
     `平台: ${process.platform} (${process.arch})`, `运行时间: ${uptime}`].join('\n');
 }

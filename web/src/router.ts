@@ -2,6 +2,7 @@ import { createRouter, createWebHashHistory } from "vue-router";
 import OverviewView from "./views/OverviewView.vue";
 import AccountView from "./views/AccountView.vue";
 import ChannelsView from "./views/ChannelsView.vue";
+import SettingsView from "./views/SettingsView.vue";
 import ActivityView from "./views/ActivityView.vue";
 
 export const router = createRouter({
@@ -11,6 +12,7 @@ export const router = createRouter({
     { path: "/overview", name: "overview", component: OverviewView },
     { path: "/account", name: "account", component: AccountView },
     { path: "/channels", name: "channels", component: ChannelsView },
+    { path: "/settings", name: "settings", component: SettingsView },
     { path: "/activity", name: "activity", component: ActivityView },
     { path: "/:pathMatch(.*)*", redirect: "/overview" },
   ],

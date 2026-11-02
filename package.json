@@ -1,7 +1,7 @@
 {
-  "name": "douyin-onebot",
+  "name": "melofox",
   "version": "0.1.0",
-  "description": "Douyin Web to OneBot 11 gateway focused on group chat messaging.",
+  "description": "MeloFox — a OneBot 11 gateway for Douyin group chats and existing private conversations.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

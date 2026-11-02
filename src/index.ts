@@ -22,7 +22,7 @@ async function main(): Promise<void> {
   const stop = () => shutdown.abort();
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-  logger.info('starting douyin-onebot');
+  logger.info('starting MeloFox (OneBot 11)');
   if (environmentFile) logger.info({ environmentFile }, 'loaded startup environment');
   try {
     await messageCacheStore.initialize();

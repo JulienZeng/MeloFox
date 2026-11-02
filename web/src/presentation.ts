@@ -1,29 +1,10 @@
-import type { ChannelInput } from "./types";
+import type { ChannelInput, ConsoleChannel } from "./types";
 export const views = {
-  overview: {
-    label: "概览",
-    title: "连接，从这里开始",
-    description: "管理你的抖音账号与 OneBot 通道，让每一次连接清晰可见。",
-    icon: "◫",
-  },
-  account: {
-    label: "账号登录",
-    title: "你的账号，连接起点",
-    description: "登录抖音账号，为消息搭起第一座桥。",
-    icon: "◎",
-  },
-  channels: {
-    label: "连接通道",
-    title: "每个通道，都是一种可能",
-    description: "连接 AstrBot 或其他 OneBot 应用，按你的方式收发消息。",
-    icon: "⇄",
-  },
-  activity: {
-    label: "运行记录",
-    title: "连接的每一步，都有迹可循",
-    description: "查看本次运行中的会话恢复与通道变更记录。",
-    icon: "≡",
-  },
+  overview: { label: "概览", title: "运行概览", icon: "◫" },
+  account: { label: "抖音账号", title: "抖音账号", icon: "◎" },
+  channels: { label: "网络配置", title: "网络配置", icon: "⇄" },
+  activity: { label: "运行记录", title: "运行记录", icon: "≡" },
+  settings: { label: "设置", title: "设置", icon: "⚙" },
 };
 export type ViewName = keyof typeof views;
 export const channelTypes = {
@@ -42,6 +23,16 @@ export const statuses: Record<string, string> = {
 };
 export const healthy = (status: string) =>
   ["listening", "connected"].includes(status);
+export function channelSummary(channels: ConsoleChannel[]) {
+  const counts = { ready: 0, waiting: 0, error: 0, disabled: 0 };
+  for (const channel of channels) {
+    if (!channel.enabled) counts.disabled++;
+    else if (healthy(channel.status.state)) counts.ready++;
+    else if (channel.status.state === 'error') counts.error++;
+    else counts.waiting++;
+  }
+  return counts;
+}
 export function endpoint(channel: ChannelInput) {
   if (channel.type.startsWith("reverse-")) {
     try {

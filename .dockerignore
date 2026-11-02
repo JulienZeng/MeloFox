@@ -1,0 +1,23 @@
+# 白名单上下文：本机登录态、令牌、env、抓包、缓存及 Git 历史均不发送给构建器。
+**
+!package.json
+!pnpm-lock.yaml
+!tsconfig.json
+!src/
+!src/**
+!web/
+!web/**
+!proto/
+!proto/**
+!config/
+!config/config.example.yaml
+!docker/
+!docker/healthcheck.mjs
+
+# 即使在源码目录运行开发工具，也不把本地依赖、产物或 env 打入上下文。
+**/node_modules
+**/dist
+**/.env*
+**/.build.env*
+**/*.log
+**/.DS_Store

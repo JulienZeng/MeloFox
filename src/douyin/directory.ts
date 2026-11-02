@@ -213,19 +213,20 @@ export class DouyinDirectory {
     return response;
   }
 
-  async getLoginInfo(): Promise<DouyinUser> {
+  async getLoginInfo(noCache = false): Promise<DouyinUser> {
     await this.ensureFresh();
     if (!this.selfId || !this.authenticated) throw new Error('Douyin account is not authenticated');
-    const cached = this.users.get(this.selfId);
-    if (cached?.name) return cached;
-    const stored = await this.page.evaluate(() => {
+    const id = this.selfId, cached = this.users.get(id);
+    if (!noCache && cached?.name) return cached;
+    const stored = cached?.secUid ? { uid: cached.secUid } : await this.page.evaluate(() => {
       try { return JSON.parse(localStorage.getItem('user_info') ?? 'null') as { uid?: string; nickname?: string; avatarUrl?: string } | null; }
       catch { return null; }
     });
     if (stored?.uid) {
-      await this.loadUsers([{ userId: this.selfId, secUid: stored.uid }]);
+      await this.loadUsers([{ userId: id, secUid: stored.uid }], noCache);
     }
-    return this.users.get(this.selfId) ?? { id: this.selfId };
+    if (id !== this.selfId || !this.authenticated) throw new Error('Account changed while reading login profile');
+    return this.users.get(id) ?? { id };
   }
 
   async getConversations(): Promise<DouyinConversation[]> {

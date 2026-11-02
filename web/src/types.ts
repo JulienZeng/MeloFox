@@ -4,4 +4,6 @@ export type {
   ConsoleChannel,
   ConsoleLogin,
   ConsoleStatus,
+  ConsoleRuntime,
+  ConsoleAuthSession,
 } from "../../src/web/contracts";

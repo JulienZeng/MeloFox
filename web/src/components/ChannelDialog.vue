@@ -88,11 +88,8 @@ async function save() {
     <form id="channel-form" @submit.prevent="save">
       <div class="dialog-heading">
         <div>
-          <span class="small-label">{{
-            editor.id ? "EDIT CONNECTION" : "NEW CONNECTION"
-          }}</span>
           <h2 id="dialog-title">
-            {{ editor.id ? "编辑连接通道" : "创建连接通道" }}
+            {{ editor.id ? "编辑通道" : "新建通道" }}
           </h2>
         </div>
         <button
@@ -105,7 +102,6 @@ async function save() {
           ✕
         </button>
       </div>
-      <p class="muted">选择连接方式，接入你的机器人应用。</p>
       <label for="channel-name">通道名称</label
       ><input
         id="channel-name"
@@ -250,7 +246,7 @@ async function save() {
           class="primary"
           :disabled="saving"
         >
-          {{ saving ? "保存中…" : editor.id ? "保存配置 →" : "创建通道 →" }}
+          {{ saving ? "保存中…" : editor.id ? "保存配置" : "创建通道" }}
         </button>
       </div>
     </form>

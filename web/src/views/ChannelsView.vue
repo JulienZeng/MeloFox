@@ -4,12 +4,13 @@ import { useConsole } from "../console";
 import { channelTypes, endpoint } from "../presentation";
 import StatusPill from "../components/StatusPill.vue";
 const { state, openChannel, toggleChannel } = useConsole();
-const filter = ref("all");
+const filter = ref("all"), search = ref("");
 const filters = { all: "全部通道", enabled: "已启用", disabled: "已停用" };
 const channels = computed(() => state.data!.channels);
 const filtered = computed(() =>
   channels.value.filter(
-    (c) => filter.value === "all" || c.enabled === (filter.value === "enabled"),
+    (c) => (filter.value === "all" || c.enabled === (filter.value === "enabled")) &&
+      `${c.name} ${endpoint(c)} ${channelTypes[c.type]}`.toLocaleLowerCase().includes(search.value.toLocaleLowerCase()),
   ),
 );
 </script>
@@ -27,6 +28,7 @@ const filtered = computed(() =>
           {{ label }}
         </button>
       </div>
+      <label class="search-field"><span class="sr-only">搜索通道</span><input id="channel-search" v-model="search" type="search" placeholder="搜索名称或地址" /></label>
       <button class="primary new-channel" @click="openChannel()">
         ＋ 创建通道
       </button>
@@ -52,7 +54,7 @@ const filtered = computed(() =>
         <div class="channel-endpoint">{{ endpoint(c) }}</div>
         <div class="channel-meta">
           <StatusPill :status="c.status.state" /><span
-            >{{ c.accessToken ? "已配置令牌" : "未设置令牌"
+            >{{ c.type === "reverse-http" ? (c.secret ? "已配置签名" : "未配置签名") : (c.accessToken ? "已配置令牌" : "未设置令牌")
             }}{{
               c.status.clients !== undefined
                 ? ` · ${c.status.clients} 个连接`
@@ -62,8 +64,7 @@ const filtered = computed(() =>
         </div>
         <p v-if="c.status.error" class="channel-error">{{ c.status.error }}</p>
         <div class="channel-card-footer">
-          <span>ONEBOT 11</span
-          ><button
+          <button
             :data-edit="c.id"
             :disabled="state.pendingChannels.has(c.id)"
             @click="openChannel(c)"
@@ -82,27 +83,13 @@ const filtered = computed(() =>
       <div v-if="!filtered.length" class="empty-state">
         <span>⇄</span>
         <h2>
-          {{ channels.length ? "没有符合条件的通道" : "准备好第一条连接" }}
+          {{ channels.length ? "没有符合条件的通道" : "暂无通道" }}
         </h2>
-        <p>
-          {{
-            channels.length
-              ? "切换筛选条件，查看其他通道。"
-              : "选择连接方式，将抖音消息接入你的机器人。"
-          }}
-        </p>
         <button class="primary new-channel" @click="openChannel()">
           ＋ 创建通道
         </button>
       </div>
     </div>
-    <div class="channel-help">
-      <span class="help-icon">i</span>
-      <p>
-        <strong>如何选择连接方式？</strong> HTTP 用于调用接口及访问媒体；正向
-        WebSocket 等待应用连接；反向 WebSocket 主动连接 AstrBot
-        等服务。媒体访问需要启用 HTTP 通道。
-      </p>
-    </div>
+    <details class="channel-help"><summary>连接方式说明</summary><p>HTTP 提供 API 与媒体下载；正向 WebSocket 等待机器人连接；反向 WebSocket 主动连接机器人；反向 HTTP 上报事件。媒体读取需保留一个 HTTP 通道。</p></details>
   </section>
 </template>

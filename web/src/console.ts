@@ -5,6 +5,7 @@ import type {
   ConsoleChannel,
   ConsoleLogin,
   ConsoleStatus,
+  ConsoleAuthSession,
 } from "./types";
 
 export function channelInput(channel: ConsoleChannel): ChannelInput {
@@ -15,6 +16,7 @@ export function createConsole() {
   const state = reactive({
     ready: false,
     authenticated: false,
+    auth: undefined as ConsoleAuthSession | undefined,
     authBusy: false,
     refreshBusy: false,
     data: undefined as ConsoleStatus | undefined,
@@ -33,7 +35,19 @@ export function createConsole() {
   let refreshId = 0,
     loginVersion = 0;
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
-  const api = createApi(invalidate);
+  const api = createApi(invalidate, fetch, requirePasswordChange);
+  function requirePasswordChange() {
+    api.reset();
+    refreshId++;
+    loginVersion++;
+    state.authenticated = true;
+    state.auth = { username: state.auth?.username || "melofox", mustChangePassword: true };
+    state.data = undefined;
+    state.login = undefined;
+    state.refreshBusy = false;
+    state.loginBusy = false;
+    closeDialogs();
+  }
   function closeDialogs() {
     state.editor = undefined;
     state.deleting = undefined;
@@ -44,6 +58,7 @@ export function createConsole() {
     refreshId++;
     loginVersion++;
     state.authenticated = false;
+    state.auth = undefined;
     state.data = undefined;
     state.login = undefined;
     state.refreshBusy = false;
@@ -65,6 +80,7 @@ export function createConsole() {
     }, 4000);
   }
   async function refresh() {
+    if (!state.authenticated || state.auth?.mustChangePassword) return false;
     const id = ++refreshId,
       loginAtStart = loginVersion;
     state.refreshBusy = true;
@@ -85,7 +101,7 @@ export function createConsole() {
       }
       return true;
     } catch (error) {
-      if (id === refreshId && !isCancelled(error))
+      if (id === refreshId && !isCancelled(error) && state.authenticated && !state.auth?.mustChangePassword)
         state.connectionError = `管理服务连接中断：${errorMessage(error)}。显示的是上次获取的数据。`;
       return false;
     } finally {
@@ -95,21 +111,49 @@ export function createConsole() {
       }
     }
   }
-  async function authenticate(token: string) {
+  async function restoreSession() {
+    try {
+      state.auth = await api.request<ConsoleAuthSession>("/api/auth/session");
+      state.authenticated = true;
+      if (!state.auth.mustChangePassword) await refresh();
+    } catch (error) {
+      if (!isCancelled(error) && !(error instanceof ApiError && error.status === 401))
+        state.connectionError = errorMessage(error);
+    } finally { state.ready = true; }
+  }
+  async function authenticate(username: string, password: string) {
     if (state.authBusy) return;
     state.authBusy = true;
     invalidate();
     try {
-      await api.request("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ token }),
+      state.auth = await api.request<ConsoleAuthSession>("/api/auth/login", {
+        method: "POST", body: JSON.stringify({ username, password }),
       });
-      if (!(await refresh()))
+      state.authenticated = true;
+      if (!state.auth.mustChangePassword && !(await refresh()))
         throw new Error(state.connectionError || "无法读取管理状态，请重试");
     } finally {
       state.authBusy = false;
       state.ready = true;
     }
+  }
+  async function updateCredentials(input: { username?: string; currentPassword?: string; newPassword: string; confirmPassword: string }) {
+    if (state.authBusy) return;
+    state.authBusy = true;
+    try {
+      const auth = await api.request<ConsoleAuthSession>("/api/auth/credentials", {
+        method: "POST", body: JSON.stringify(input),
+      });
+      // The server rotates this cookie and revokes every other session.
+      api.reset(); refreshId++; loginVersion++;
+      state.auth = auth;
+      state.authenticated = true;
+      state.refreshBusy = false;
+      state.loginBusy = false;
+      closeDialogs();
+      await refresh();
+      toast("管理账号已更新，其他会话已退出");
+    } finally { state.authBusy = false; }
   }
   async function logout() {
     if (state.authBusy) return;
@@ -221,11 +265,9 @@ export function createConsole() {
       : {};
   }
   function start(isAccountView: () => boolean) {
-    void refresh().finally(() => {
-      state.ready = true;
-    });
+    void restoreSession();
     const statusTimer = setInterval(() => {
-      if (state.authenticated && !document.hidden && !state.refreshBusy)
+      if (state.authenticated && !state.auth?.mustChangePassword && !document.hidden && !state.refreshBusy)
         void refresh();
     }, 4000);
     const loginTimer = setInterval(() => {
@@ -247,6 +289,7 @@ export function createConsole() {
     api,
     refresh,
     authenticate,
+    updateCredentials,
     logout,
     toast,
     loginAction,

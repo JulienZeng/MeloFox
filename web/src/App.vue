@@ -5,6 +5,7 @@ import { consoleKey, createConsole } from "./console";
 import { createTheme, themeKey } from "./composables/theme";
 import { views, type ViewName } from "./presentation";
 import LoginScreen from "./components/LoginScreen.vue";
+import FirstLoginScreen from "./components/FirstLoginScreen.vue";
 import ThemeControl from "./components/ThemeControl.vue";
 import ChannelDialog from "./components/ChannelDialog.vue";
 import DeleteChannelDialog from "./components/DeleteChannelDialog.vue";
@@ -31,7 +32,7 @@ watch(
   () => route.fullPath,
   () => {
     store.closeDialogs();
-    document.title = `${current.value.label} · Douyin OneBot`;
+    document.title = `${current.value.label} · MeloFox`;
   },
   { immediate: true },
 );
@@ -46,7 +47,8 @@ onUnmounted(() => {
 </script>
 <template>
   <LoginScreen v-if="!state.authenticated" />
-  <div v-else id="app" class="app">
+  <FirstLoginScreen v-else-if="state.auth?.mustChangePassword" />
+  <div v-else-if="state.data" id="app" class="app">
     <aside class="sidebar">
       <RouterLink class="brand" to="/overview" data-view="overview">
         <img
@@ -57,9 +59,9 @@ onUnmounted(() => {
           height="31"
           alt=""
         />
-        <span>Douyin<span class="brand-light"> OneBot</span></span>
+        <span>Melo<span class="brand-light">Fox</span></span>
       </RouterLink>
-      <div class="workspace-label">工作空间 <span>LOCAL</span></div>
+
       <nav aria-label="主导航">
         <RouterLink
           v-for="(view, name) in views"
@@ -78,11 +80,6 @@ onUnmounted(() => {
         </RouterLink>
       </nav>
       <div class="sidebar-bottom">
-        <div class="protocol-badge">
-          <span class="dot"></span>
-          <div>OneBot 11<span>消息连接协议</span></div>
-          <span class="protocol-icon">↗</span>
-        </div>
         <button
           id="logout"
           class="nav-item"
@@ -91,13 +88,13 @@ onUnmounted(() => {
         >
           <span>⇥</span> 退出管理台
         </button>
-        <span class="sidebar-version">DOUYIN ONEBOT <span>v0.1.0</span></span>
+        <span class="sidebar-version">OneBot 11 <span>v{{ state.data.runtime.version }}</span></span>
       </div>
     </aside>
     <div class="workspace">
       <header class="topbar">
         <span
-          >工作空间 <span class="breadcrumb">/</span>
+          >MeloFox <span class="breadcrumb">/</span>
           <strong id="breadcrumb-title">{{ current.label }}</strong></span
         >
         <div>
@@ -110,7 +107,7 @@ onUnmounted(() => {
             }"
             >{{ topStatus }}</span
           >
-          <span class="admin-avatar">A</span>
+          <RouterLink class="admin-link" to="/settings">{{ state.auth?.username }}</RouterLink>
           <button
             id="mobile-logout"
             class="icon-button"
@@ -125,11 +122,9 @@ onUnmounted(() => {
       <main class="main">
         <div class="page-heading">
           <div>
-            <div class="eyebrow">YOUR CONNECTION WORKSPACE</div>
             <h1 id="page-title">
-              {{ current.title }}<span class="accent">。</span>
+              {{ current.title }}
             </h1>
-            <p id="page-description" class="muted">{{ current.description }}</p>
           </div>
           <button
             id="refresh"
@@ -149,16 +144,14 @@ onUnmounted(() => {
           {{ state.connectionError || state.data?.error }}
         </div>
         <RouterView />
-        <footer class="main-footer">
-          <span>Douyin OneBot · 把连接变简单</span
-          ><span>ONEBOT 11 / LOCAL CONSOLE</span>
-        </footer>
+
       </main>
     </div>
     <ChannelDialog v-if="state.editor" :editor="state.editor" />
     <DeleteChannelDialog v-if="state.deleting" :channel="state.deleting" />
     <AssistDialog v-if="state.assist" />
   </div>
+  <main v-else class="auth-screen"><section class="auth-card"><h1>正在连接管理服务</h1><p class="error-text">{{ state.connectionError }}</p><button class="secondary" @click="store.refresh">重试</button><button class="text-button auth-exit" @click="store.logout">退出登录</button></section></main>
   <div
     id="toast"
     class="toast"

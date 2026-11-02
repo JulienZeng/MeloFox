@@ -2,6 +2,7 @@
 import { computed, onUnmounted, ref, watch } from "vue";
 import { useConsole } from "../console";
 import { errorMessage, isCancelled } from "../api";
+import AccountAvatar from "../components/AccountAvatar.vue";
 const store = useConsole(),
   { state } = store;
 const code = ref(""),
@@ -76,18 +77,17 @@ async function reconnect() {
     <article class="account-detail">
       <div class="section-heading">
         <div>
-          <span class="small-label">ACCOUNT CONNECTION</span>
-          <h2>抖音账号登录</h2>
+          <h2>登录状态</h2>
         </div>
         <span id="account-status" class="subtle-pill">{{ accountStatus }}</span>
       </div>
       <div id="logged-in" :hidden="!account.loggedIn">
-        <div class="success-mark">✓</div>
-        <h2>账号已登录</h2>
+        <AccountAvatar class="account-profile-avatar" :src="account.avatar" :name="account.name" />
+        <h2>{{ account.name || '账号已登录' }}</h2>
         <p id="account-id" class="muted">抖音账号 ID · {{ account.id }}</p>
-        <p class="muted">登录凭据已保存到服务端配置目录，下次启动自动恢复。</p>
+        <p class="muted">登录状态已保存。</p>
         <button class="primary new-channel" @click="store.openChannel()">
-          创建连接通道 →
+          新建连接
         </button>
       </div>
       <div
@@ -101,8 +101,7 @@ async function reconnect() {
           <div>
             <h3>扫码登录抖音</h3>
             <p class="muted">
-              点击获取二维码，使用抖音 App
-              扫码并在手机上确认，按提示完成验证及保存选择后连接消息服务。
+              使用抖音 App 扫码并确认。
             </p>
           </div>
           <button
@@ -139,7 +138,7 @@ async function reconnect() {
               {{ login ? labels[login.state] : "等待获取二维码" }}
             </h3>
             <p id="qr-state-message" class="muted">
-              {{ login?.message || "二维码由抖音官方登录接口提供。" }}
+              {{ login?.message || "" }}
             </p>
             <p id="qr-expiry" class="field-hint">
               {{
@@ -228,7 +227,7 @@ async function reconnect() {
       </div>
       <div class="account-footer">
         <span class="muted"
-          >浏览器异常或消息连接中断时，可重建会话并复用已保存的登录态。</span
+          >连接异常时可重建会话。</span
         ><button
           id="reconnect"
           class="text-button"
@@ -245,7 +244,7 @@ async function reconnect() {
             state.pollStopped = true;
           "
         >
-          官方页面辅助验证</button
+          辅助验证</button
         ><button
           id="douyin-logout"
           class="secondary"
@@ -258,3 +257,6 @@ async function reconnect() {
     </article>
   </section>
 </template>
+<style scoped>
+.account-profile-avatar { margin:0 auto 16px; width:72px; height:72px; border-radius:22px; }
+</style>

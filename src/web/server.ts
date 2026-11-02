@@ -1,7 +1,4 @@
 import Fastify, { type FastifyInstance } from 'fastify';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
 import { z } from 'zod';
 import type { AppConfig } from '../config/index.js';
 import type { AppLogger } from '../logger/index.js';
@@ -10,6 +7,9 @@ import type { DouyinBridge } from '../douyin/bridge.js';
 import { LoginAssist } from '../douyin/login-assist.js';
 import { ChannelManager } from './channels.js';
 import { registerConsoleAssets } from './assets.js';
+import { registerConsoleAuthentication } from './auth.js';
+import { RuntimeMetrics } from './metrics.js';
+import { AccountProfile, AVATAR_DOMAINS } from './account-profile.js';
 import type { ConsoleStatus } from './contracts.js';
 import {
   DouyinLogin,
@@ -19,6 +19,8 @@ import {
 } from '../douyin/login.js';
 
 export class ConsoleControl {
+  readonly metrics = new RuntimeMetrics(undefined, undefined, () => this.browser?.context?.browser?.() ?? null);
+  readonly profile = new AccountProfile(() => this.bridge);
   browser?: BrowserRuntime;
   bridge?: DouyinBridge;
   recover?: (reason: string) => void;
@@ -40,11 +42,17 @@ export class ConsoleControl {
     this.checkSession = undefined;
   }
   status(): ConsoleStatus {
+    void this.profile.refresh();
+    let chromiumVersion: string | undefined;
+    try { chromiumVersion = this.browser?.context?.browser?.()?.version(); } catch { /* Browser may be restarting. */ }
     return {
+      serverTime: Date.now(),
       startedAt: this.startedAt,
+      runtime: { ...this.metrics.snapshot(), chromiumVersion },
       account: {
         loggedIn: this.bridge?.loggedIn ?? false,
         id: this.bridge?.loggedIn ? this.bridge.accountId : undefined,
+        ...this.profile.snapshot(),
         ...this.bridge?.getStatus()
       },
       browser:
@@ -78,34 +86,7 @@ export async function createConsoleServer(
   const assist = new LoginAssist(() => control.browser);
   control.assisting = () => assist.active;
   const server = Fastify({ bodyLimit: 16 * 1024, requestTimeout: 15_000 });
-  const dir = resolve(config.web.dataDir);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  let adminToken = config.web.token;
-  if (!adminToken) {
-    const path = join(dir, 'admin-token');
-    try {
-      adminToken = (await readFile(path, 'utf8')).trim();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      adminToken = randomBytes(24).toString('base64url');
-      await writeFile(path, `${adminToken}\n`, { mode: 0o600, flag: 'wx' });
-    }
-    if (!adminToken)
-      throw new Error(
-        '管理台令牌文件为空，请设置 WEB_TOKEN 或修复 admin-token'
-      );
-    logger.info(
-      { tokenFile: path },
-      'web console token is stored in this file'
-    );
-  }
-  const digest = (value: string) => createHash('sha256').update(value).digest();
-  const expected = digest(adminToken);
-  const sessions = new Map<string, number>();
-  const attempts = new Map<string, { count: number; until: number }>();
   let developmentNonce: string | undefined;
-  const sessionOf = (cookie?: string) =>
-    cookie?.match(/(?:^|;\s*)dy_console=([\w-]+)/)?.[1];
   server.addHook('onRequest', async (request, reply) => {
     reply
       .header('Cache-Control', 'no-store')
@@ -113,24 +94,23 @@ export async function createConsoleServer(
       .header('Referrer-Policy', 'no-referrer');
     reply.header(
       'Content-Security-Policy',
-      `default-src 'self'; script-src 'self'; style-src 'self'${developmentNonce ? ` 'nonce-${developmentNonce}'` : ''}; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`
+      `default-src 'self'; script-src 'self'; style-src 'self'${developmentNonce ? ` 'nonce-${developmentNonce}'` : ''}; img-src 'self' blob: ${AVATAR_DOMAINS.flatMap(host => [`https://${host}`, `https://*.${host}`]).join(' ')}; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`
     );
     if (!['GET', 'HEAD'].includes(request.method)) {
       const origin = request.headers.origin;
+      let validOrigin = true;
+      if (origin) {
+        try {
+          const url = new URL(origin);
+          validOrigin = ['http:', 'https:'].includes(url.protocol) && url.host === request.headers.host;
+        } catch { validOrigin = false; }
+      }
       if (
         request.headers['sec-fetch-site'] === 'cross-site' ||
-        (origin && new URL(origin).host !== request.headers.host)
+        !validOrigin
       ) {
         return reply.code(403).send({ message: '不允许跨站操作' });
       }
-    }
-    if (!request.url.startsWith('/api/') || request.url === '/api/auth/login')
-      return;
-    const session = sessionOf(request.headers.cookie);
-    const expires = session && sessions.get(session);
-    if (!expires || expires <= Date.now()) {
-      if (session) sessions.delete(session);
-      return reply.code(401).send({ message: '请先登录管理台' });
     }
   });
   server.setErrorHandler((error, _request, reply) => {
@@ -142,61 +122,27 @@ export async function createConsoleServer(
       return reply
         .code(400)
         .send({ message: error.issues.map((i) => i.message).join('；') });
-    const failure = error as Error & { statusCode?: number };
+    const failure = error as Error & { statusCode?: number; code?: string };
     const status = failure.statusCode ?? 500;
+    const requestErrors: Record<string, string> = {
+      FST_ERR_CTP_INVALID_JSON_BODY: '请求内容格式不正确，请刷新页面重试',
+      FST_ERR_CTP_EMPTY_JSON_BODY: '请求内容为空，请填写后重试',
+      FST_ERR_CTP_BODY_TOO_LARGE: '提交的内容过长，请减少输入',
+      FST_ERR_CTP_INVALID_MEDIA_TYPE: '请求格式不正确，请刷新页面重试'
+    };
     return reply.code(status).send({
-      message: status >= 500 ? '服务暂时不可用，请稍后重试' : failure.message
+      message: status >= 500 ? '服务暂时不可用，请稍后重试' : requestErrors[failure.code ?? ''] ?? failure.message
     });
   });
+  await registerConsoleAuthentication(server, config, logger);
+  server.addHook('onReady', () => control.metrics.start(config.web.dataDir));
+  server.addHook('onClose', () => control.metrics.stop());
   if (options.development) {
     const { registerConsoleDevAssets } = await import('./dev-assets.js');
     developmentNonce = await registerConsoleDevAssets(server);
   } else {
     await registerConsoleAssets(server);
   }
-  server.post('/api/auth/login', async (request, reply) => {
-    const now = Date.now();
-    for (const [key, value] of attempts)
-      if (value.until <= now) attempts.delete(key);
-    const attempt = attempts.get(request.ip) ?? {
-      count: 0,
-      until: now + 60_000
-    };
-    if (attempt.count >= 8)
-      return reply
-        .code(429)
-        .header('Retry-After', '60')
-        .send({ message: '尝试过于频繁，请一分钟后重试' });
-    if (attempts.size >= 256 && !attempts.has(request.ip))
-      return reply.code(429).send({ message: '请求过于频繁，请稍后重试' });
-    attempt.count++;
-    attempts.set(request.ip, attempt);
-    const { token } = z
-      .object({ token: z.string().min(1).max(1024) })
-      .parse(request.body);
-    if (!timingSafeEqual(digest(token), expected))
-      return reply.code(401).send({ message: '管理令牌不正确' });
-    attempts.delete(request.ip);
-    for (const [key, expires] of sessions)
-      if (expires <= now) sessions.delete(key);
-    if (sessions.size >= 64) sessions.delete(sessions.keys().next().value!);
-    const session = randomBytes(32).toString('base64url');
-    sessions.set(session, now + 12 * 3600_000);
-    reply.header(
-      'Set-Cookie',
-      `dy_console=${session}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200${request.protocol === 'https' ? '; Secure' : ''}`
-    );
-    return { ok: true };
-  });
-  server.post('/api/auth/logout', async (request, reply) => {
-    const session = sessionOf(request.headers.cookie);
-    if (session) sessions.delete(session);
-    reply.header(
-      'Set-Cookie',
-      'dy_console=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0'
-    );
-    return { ok: true };
-  });
   server.get('/api/status', async () => control.status());
   server.post('/api/channels', async (request, reply) => {
     await control.channels.save(request.body);

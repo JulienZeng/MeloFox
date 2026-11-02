@@ -128,6 +128,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     },
     onebot: {
       ...config.onebot,
+      rateLimitIntervalMs: envNumber('ONEBOT_RATE_LIMIT_INTERVAL_MS') ?? config.onebot.rateLimitIntervalMs,
       accessToken: envString('ONEBOT_ACCESS_TOKEN', true) ?? config.onebot.accessToken,
       http: {
         ...config.onebot.http,

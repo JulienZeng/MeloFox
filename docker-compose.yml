@@ -1,0 +1,97 @@
+services:
+  # MeloFox 服务；保留历史服务名及数据卷名，兼容已有部署和服务发现。
+  douyin-onebot:
+    image: ${IMAGE_NAME:-melofox}:${IMAGE_TAG:-latest}
+    # 本地单架构可 docker compose build；多架构/构建代理见 .build.env 和 build-multiarch.sh。
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${CONTAINER_NAME:-douyin-onebot}
+    restart: unless-stopped
+    shm_size: ${DOCKER_SHM_SIZE:-1gb}
+    stop_grace_period: ${DOCKER_STOP_GRACE_PERIOD:-120s}
+    security_opt:
+      - no-new-privileges:true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+        max-file: "${DOCKER_LOG_MAX_FILES:-3}"
+    environment:
+      # 内部路径/端口固定；.env 的 *_BIND / *_PORT 控制宿主机映射。
+      DOUYIN_ONEBOT_CONFIG: /app/config/config.example.yaml
+      APP_SELF_ID: ${APP_SELF_ID:-douyin_bot_001}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      WEB_ENABLED: "${WEB_ENABLED:-true}"
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "3000"
+      WEB_TOKEN: ${WEB_TOKEN:-}
+      WEB_DATA_DIR: /data/console
+      BROWSER_USER_DATA_DIR: /data/douyin-profile
+      BROWSER_HEADLESS: "true"
+      BROWSER_DOUYIN_URL: ${BROWSER_DOUYIN_URL:-https://www.douyin.com/}
+      DOUYIN_MESSAGE_PAGE_URL: ${DOUYIN_MESSAGE_PAGE_URL:-https://www.douyin.com/chat}
+      DOUYIN_HOOK_MODE: ${DOUYIN_HOOK_MODE:-network}
+      ONEBOT_ACCESS_TOKEN: ${ONEBOT_ACCESS_TOKEN:-}
+      ONEBOT_RATE_LIMIT_INTERVAL_MS: "${ONEBOT_RATE_LIMIT_INTERVAL_MS:-500}"
+      ONEBOT_HTTP_ENABLED: "${ONEBOT_HTTP_ENABLED:-true}"
+      ONEBOT_HTTP_HOST: 0.0.0.0
+      ONEBOT_HTTP_PORT: "3001"
+      ONEBOT_HTTP_PUBLIC_BASE_URL: ${ONEBOT_HTTP_PUBLIC_BASE_URL:-http://127.0.0.1:3001}
+      ONEBOT_REVERSE_WS_ENABLED: "${ONEBOT_REVERSE_WS_ENABLED:-true}"
+      ONEBOT_REVERSE_WS_URL: ${ONEBOT_REVERSE_WS_URL:-ws://host.docker.internal:6700/onebot/v11/ws}
+      ONEBOT_FORWARD_WS_ENABLED: "${ONEBOT_FORWARD_WS_ENABLED:-false}"
+      ONEBOT_FORWARD_WS_HOST: 0.0.0.0
+      ONEBOT_FORWARD_WS_PORT: "3002"
+      ONEBOT_REVERSE_HTTP_ENABLED: "${ONEBOT_REVERSE_HTTP_ENABLED:-false}"
+      ONEBOT_REVERSE_HTTP_URL: ${ONEBOT_REVERSE_HTTP_URL:-http://host.docker.internal:5701}
+      ONEBOT_REVERSE_HTTP_SECRET: ${ONEBOT_REVERSE_HTTP_SECRET:-}
+      ONEBOT_REVERSE_HTTP_TIMEOUT_MS: "${ONEBOT_REVERSE_HTTP_TIMEOUT_MS:-10000}"
+      MEDIA_CACHE_DIR: /data/media-cache
+      MEDIA_CACHE_TTL_MS: "${MEDIA_CACHE_TTL_MS:-604800000}"
+      MEDIA_CACHE_CLEANUP_INTERVAL_MS: "${MEDIA_CACHE_CLEANUP_INTERVAL_MS:-600000}"
+      MEDIA_CACHE_MAX_BYTES: "${MEDIA_CACHE_MAX_BYTES:-1073741824}"
+      MEDIA_CACHE_MAX_FILES: "${MEDIA_CACHE_MAX_FILES:-1000}"
+      MEDIA_CACHE_MAX_FILE_BYTES: "${MEDIA_CACHE_MAX_FILE_BYTES:-134217728}"
+      MEDIA_TRANSCODE_VIDEO_TO_H264: "${MEDIA_TRANSCODE_VIDEO_TO_H264:-true}"
+      MEDIA_FFMPEG_PATH: ffmpeg
+      MEDIA_FFPROBE_PATH: ffprobe
+      # 运行期媒体下载代理与 .build.env 的构建代理相互独立。
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
+      http_proxy: ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,::1}
+      RUNTIME_RECONNECT_INTERVAL_MS: "${RUNTIME_RECONNECT_INTERVAL_MS:-5000}"
+      RUNTIME_ACTION_TIMEOUT_MS: "${RUNTIME_ACTION_TIMEOUT_MS:-15000}"
+      RUNTIME_VIDEO_SEND_TIMEOUT_MS: "${RUNTIME_VIDEO_SEND_TIMEOUT_MS:-120000}"
+      RUNTIME_FILE_SEND_ALLOWED_DIRS: ${RUNTIME_FILE_SEND_ALLOWED_DIRS:-[]}
+      RUNTIME_FILE_SEND_ENABLED: "${RUNTIME_FILE_SEND_ENABLED:-false}"
+      RUNTIME_SHARE_AS_TEXT: "${RUNTIME_SHARE_AS_TEXT:-false}"
+      RUNTIME_STICKER_AS_TEXT: "${RUNTIME_STICKER_AS_TEXT:-true}"
+      RUNTIME_HEARTBEAT_INTERVAL_MS: "${RUNTIME_HEARTBEAT_INTERVAL_MS:-30000}"
+      RUNTIME_SESSION_CHECK_INTERVAL_MS: "${RUNTIME_SESSION_CHECK_INTERVAL_MS:-30000}"
+      RUNTIME_IM_DISCONNECT_GRACE_MS: "${RUNTIME_IM_DISCONNECT_GRACE_MS:-60000}"
+      RUNTIME_MESSAGE_CACHE_LIMIT: "${RUNTIME_MESSAGE_CACHE_LIMIT:-10000}"
+      RUNTIME_MESSAGE_CACHE_TTL_MS: "${RUNTIME_MESSAGE_CACHE_TTL_MS:-604800000}"
+      RUNTIME_MESSAGE_CACHE_PERSIST: "${RUNTIME_MESSAGE_CACHE_PERSIST:-true}"
+      RUNTIME_MESSAGE_CACHE_DIR: /data/message-cache
+      RUNTIME_MESSAGE_CACHE_FLUSH_INTERVAL_MS: "${RUNTIME_MESSAGE_CACHE_FLUSH_INTERVAL_MS:-5000}"
+      RUNTIME_REALTIME_QUEUE_LIMIT: "${RUNTIME_REALTIME_QUEUE_LIMIT:-10000}"
+      RUNTIME_REALTIME_MEDIA_CONCURRENCY: "${RUNTIME_REALTIME_MEDIA_CONCURRENCY:-2}"
+      RUNTIME_REALTIME_MEDIA_DETAIL_WAIT_MS: "${RUNTIME_REALTIME_MEDIA_DETAIL_WAIT_MS:-5000}"
+      RUNTIME_REALTIME_MEDIA_TIMEOUT_MS: "${RUNTIME_REALTIME_MEDIA_TIMEOUT_MS:-120000}"
+    volumes:
+      # 命名卷继承镜像 /data 的 pwuser 权限，不依赖宿主机目录属主。
+      - douyin-data:/data
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3000}:3000"
+      - "${ONEBOT_HTTP_BIND:-127.0.0.1}:${ONEBOT_HTTP_PORT:-3001}:3001"
+      - "${ONEBOT_FORWARD_WS_BIND:-127.0.0.1}:${ONEBOT_FORWARD_WS_PORT:-3002}:3002"
+
+volumes:
+  douyin-data:
+    name: ${DOCKER_DATA_VOLUME:-douyin-onebot-data}
