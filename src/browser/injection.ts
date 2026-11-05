@@ -19,7 +19,7 @@ export async function installDouyinInjection(context: BrowserContext, logger: Ap
     }
   ` });
   if (!enableDomCapture) {
-    logger.info('DOM capture disabled; using Playwright network events');
+    logger.info('消息捕获使用浏览器网络事件');
     return;
   }
   await context.addInitScript(enableDomCapture => {

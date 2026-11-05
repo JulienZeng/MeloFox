@@ -7,6 +7,8 @@ web:
 app:
   selfId: "douyin_bot_001"
   logLevel: "info"
+  # pretty：易读文本；json：结构化日志。Docker 与本机默认一致。
+  logFormat: "pretty"
 
 browser:
   userDataDir: "./douyin-profile"

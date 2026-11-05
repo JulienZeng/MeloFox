@@ -22,8 +22,8 @@ async function main(): Promise<void> {
   const stop = () => shutdown.abort();
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-  logger.info('starting MeloFox (OneBot 11)');
-  if (environmentFile) logger.info({ environmentFile }, 'loaded startup environment');
+  logger.info('正在启动 MeloFox（OneBot 11）');
+  if (environmentFile) logger.info({ environmentFile }, '已加载运行配置');
   try {
     await messageCacheStore.initialize();
     await mediaRegistry.initialize();
@@ -33,8 +33,8 @@ async function main(): Promise<void> {
       web = await createConsoleServer(config, logger, control, { development });
       await web.listen({ host: config.web.host, port: config.web.port });
       control.record('管理服务已启动');
-      logger.info({ url: `http://${config.web.host}:${config.web.port}` }, 'web console started');
-      if (development) logger.info('web console HMR enabled');
+      logger.info({ url: `http://${config.web.host}:${config.web.port}` }, '管理台已启动');
+      if (development) logger.info('管理台热更新已启用');
     }
     await superviseSessions({
       signal: shutdown.signal,

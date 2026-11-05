@@ -143,7 +143,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
       url: safeUrl
     });
 
-    logger.info({ url: safeUrl }, 'douyin websocket opened');
+    logger.info({ url: safeUrl }, '抖音 WebSocket 已打开');
 
     ws.on('framereceived', frame => {
       const payload =
@@ -197,7 +197,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
         url: safeUrl
       });
 
-      logger.warn({ url: safeUrl }, 'douyin websocket closed');
+      logger.warn({ url: safeUrl }, '抖音 WebSocket 已关闭');
     });
   });
 

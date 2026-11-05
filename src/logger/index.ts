@@ -17,18 +17,21 @@ const redactPaths = [
 export function createLogger(config: AppConfig) {
   return pino({
     level: config.app.logLevel,
+    // Most call sites use { error }; Pino only serializes { err } by default.
+    serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
     redact: {
       paths: redactPaths,
       censor: '[redacted]'
     },
     transport:
-      process.env.NODE_ENV === 'production'
+      config.app.logFormat === 'json'
         ? undefined
         : {
             target: 'pino-pretty',
             options: {
-              colorize: true,
-              translateTime: 'SYS:standard'
+              colorize: Boolean(process.stdout.isTTY),
+              translateTime: 'SYS:standard',
+              ignore: 'pid,hostname'
             }
           }
   });

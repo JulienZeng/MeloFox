@@ -39,6 +39,7 @@ BUILDER_NAME="${BUILDER_NAME:-douyin-onebot-builder}"
 DOCKERFILE="${DOCKERFILE:-Dockerfile}"
 CONTEXT="${CONTEXT:-.}"
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
+NODE_IMAGE="${NODE_IMAGE:-node:24-bookworm-slim}"
 PNPM_VERSION="${PNPM_VERSION:-9.15.3}"
 PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-1.63.0}"
 
@@ -46,6 +47,7 @@ fail() { echo "$*" >&2; exit 1; }
 [[ -n "$IMAGE_NAME" ]] || fail "IMAGE_NAME is required in $BUILD_ENV_FILE"
 [[ "$IMAGE_NAME" != *[[:space:]]* && "$IMAGE_NAME" != -* && "$IMAGE_NAME" != *@* ]] || fail "Invalid IMAGE_NAME"
 [[ "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || fail "Invalid IMAGE_TAG"
+[[ "$NODE_IMAGE" != *[[:space:]]* && "$NODE_IMAGE" != -* ]] || fail "Invalid NODE_IMAGE"
 [[ "$PLATFORMS" =~ ^linux/(amd64|arm64)(,linux/(amd64|arm64))*$ ]] || fail "PLATFORMS must contain linux/amd64 and/or linux/arm64"
 [[ -f "$DOCKERFILE" ]] || fail "Dockerfile not found: $DOCKERFILE"
 [[ -d "$CONTEXT" ]] || fail "Build context directory not found: $CONTEXT"
@@ -61,12 +63,15 @@ case "$BUILD_OUTPUT" in
   *) fail "BUILD_OUTPUT must be push, load or cache" ;;
 esac
 
+# docker-container cannot resolve the special host-gateway value for --add-host.
+# Docker Desktop provides host.docker.internal via DNS; elsewhere use a reachable
+# proxy IP/hostname in BUILD_*_PROXY instead of forcing a host gateway mapping.
 args=(buildx build --builder "$BUILDER_NAME" --platform "$PLATFORMS"
   --file "$DOCKERFILE" --tag "${IMAGE_NAME}:${IMAGE_TAG}"
+  --build-arg "NODE_IMAGE=$NODE_IMAGE"
   --build-arg "NPM_REGISTRY=$NPM_REGISTRY"
   --build-arg "PNPM_VERSION=$PNPM_VERSION"
-  --build-arg "PLAYWRIGHT_VERSION=$PLAYWRIGHT_VERSION"
-  --add-host host.docker.internal=host-gateway)
+  --build-arg "PLAYWRIGHT_VERSION=$PLAYWRIGHT_VERSION")
 create_args=(buildx create --name "$BUILDER_NAME" --driver docker-container)
 # Proxy build args are Docker's predefined proxy arguments, not image ENV/ARG.
 # Host CLI proxies and container proxies have separate addresses and scopes.
@@ -75,7 +80,11 @@ for pair in HTTP_PROXY:http_proxy HTTPS_PROXY:https_proxy ALL_PROXY:all_proxy NO
   value="${!variable:-}"
   if [[ -n "$value" ]]; then
     args+=(--build-arg "$upper=$value" --build-arg "$lower=$value")
-    create_args+=(--driver-opt "env.$lower=$value")
+    # Buildx parses each --driver-opt as CSV; quote the whole field so NO_PROXY
+    # lists (and commas/quotes in proxy credentials) remain a single option.
+    driver_opt="env.$lower=$value"
+    driver_opt="${driver_opt//\"/\"\"}"
+    create_args+=(--driver-opt "\"$driver_opt\"")
   fi
 done
 case "$BUILD_OUTPUT" in

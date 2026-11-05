@@ -77,6 +77,14 @@ Chromium 使用当前浏览器实例的 [CDP 会话](https://playwright.dev/docs
 
 部分平台不提供 CPU 频率、环境内存限制或磁盘信息。这些项目显示 `—`、不可用或“未限制或不可用”，不会用零值冒充有效读数。Chromium 尚未启动时显示“尚未就绪”。
 
+## 日志与连接排查
+
+本机和 Docker 默认使用 `APP_LOG_FORMAT=pretty`，显示可读时间、日志级别、消息及错误详情；非终端输出不带 ANSI 颜色。需要对接日志采集器时设为 `json`。`NODE_ENV=production` 不再切换日志格式，详细程度仍由 `APP_LOG_LEVEL` 控制。修改 Compose 环境变量后需重新创建容器，单纯 `docker restart` 不会更新环境。
+
+`ECONNREFUSED` 表示反向 WebSocket 目标地址/端口拒绝连接。请在管理台「网络配置」检查反向 WS 地址：同一自定义 Docker 网络可使用机器人服务名与容器内监听端口；不同网络可使用 `host.docker.internal` 与机器人发布到宿主机的端口，例如 `6189:6189` 对应 `ws://host.docker.internal:6189/ws`（路径以机器人配置为准）。机器人必须启动对应 WS 服务，路径和 token 也需匹配。尚未配置机器人时可先禁用该通道；已有通道由管理台持久化，修改 `ONEBOT_REVERSE_WS_URL` 不会覆盖它。连接失败仍按重连间隔重试，相同错误每分钟汇总一次，错误变化或连接恢复会立即记录。通道卡片显示最近一次失败原因及排查方向，连接恢复后清除。
+
+`抖音 IM 请求未完成` / `Failed to fetch` 表示浏览器中的抖音接口请求失败，不能仅凭这条错误判断为未登录或浏览器缺失。先检查管理台抖音登录/验证状态，再检查容器到 `www.douyin.com`、`imapi.douyin.com` 的 DNS、HTTPS 及网络访问；运行期 `HTTP_PROXY` / `HTTPS_PROXY` 当前仅用于媒体下载，不会代理 Chromium。错误详情会保留具体接口及原始原因。管理台已启动时，这类会话错误不会关闭管理服务。
+
 ## 登录与会话恢复
 
 默认使用无头 Chromium，不弹出浏览器窗口。后台 Chromium 用于抖音消息收发，以及在官方站点会话中执行登录 API（保留官方 Cookie 与请求 SDK）。常规扫码使用接口返回的二维码和状态。遇到支持的短信二次验证时，管理台显示发送验证码及校验表单；只有点击发送才请求短信，60 秒内不重复请求。后台保留官方 SDK 的原扫码事务，验证成功后由外部验证处理器继续请求。随后选择是否在抖音保存快捷登录信息，调用官方 `setTrust`（保存为 1、不保存为 2），成功后保存网关会话。两种选择都会保留本网关的当前会话以便重启恢复，退出登录可清除。SDK 尚未加载、上行短信、滑块等情况仍可点击「官方页面辅助验证」，按需操作官方页面，完成后点击「保存登录」。原生表单已通过本地模拟协议和真实 Chromium UI 验证，真实账号完整流程仍待联调。画面仅在操作或刷新时更新，闲置 10 分钟关闭。
@@ -85,7 +93,11 @@ Chromium 使用当前浏览器实例的 [CDP 会话](https://playwright.dev/docs
 
 ## Docker
 
-Dockerfile 使用多阶段构建：编译 Node 后端及 Vue 管理台后，只复制生产依赖、`dist/`、协议及配置到运行镜像。容器以 `pwuser` 运行，包含 Chromium、ffmpeg/ffprobe 和 tini；Playwright 镜像版本必须与锁文件一致，构建时检查，参见 [Playwright 镜像版本说明](https://playwright.dev/docs/docker#usage)。
+Dockerfile 基于 `node:24-bookworm-slim`，使用多阶段构建：Node 后端及 Vue 管理台固定在构建机原生架构（`BUILDPLATFORM`）编译，生成跨架构通用的 JS 和静态资源；生产依赖分别在目标架构安装。运行镜像只复制对应架构的生产依赖、`dist/`、协议及配置，不复制编译阶段的 `node_modules`。
+
+容器沿用无头模式，只安装其实际使用的 Chromium headless shell 及对应系统依赖，保留 ffmpeg/ffprobe、中文字体和 tini。浏览器通过生产依赖中的 Playwright CLI 下载，`PLAYWRIGHT_VERSION` 与锁文件不一致时构建失败；不再继承包含 Firefox、WebKit 和完整 Chromium 的通用镜像。此方式保持现有 `headless: true`、未设置 `channel` 的启动行为，管理台截图与官方页面辅助验证仍可使用，参见 [Playwright headless shell](https://playwright.dev/docs/browsers#chromium-headless-shell)。Docker 镜像用于无头运行，本机的有界面运行方式不受影响。
+
+容器继续以 `pwuser`（UID/GID `1001:1001`）运行，与原 Playwright Noble 镜像一致，可沿用已有数据卷。`NODE_IMAGE` 可在 `.build.env` 中覆盖为同一 Node Debian slim 镜像的可信镜像源或固定 digest；旧 `.build.env` 未配置时使用默认值。apt 下载包缓存在 BuildKit 中供重试复用，不进入运行镜像；构建结束清理 apt 索引及其他下载缓存。
 
 首次本地构建并部署（已有 `.env` 时直接编辑，不覆盖）：
 
@@ -119,9 +131,11 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 BUILD_ENV_FILE=/path/to/build.env ./build-multiarch.sh
 ```
 
-`BUILD_OUTPUT=push` 构建多平台并推送，需要提前 `docker login`；`load` 仅允许单个平台并导入本机 Docker，可随后 `docker compose up -d --no-build --pull never`；`cache` 只构建，不推送或导出镜像。脚本显式指定构建器，不改变全局选中的 Buildx 构建器。amd64/arm64 跨架构构建需要构建器具备相应原生节点或 QEMU 支持。
+`BUILD_OUTPUT=push` 构建多平台并推送，需要提前 `docker login`；`load` 仅允许单个平台并导入本机 Docker，可随后 `docker compose up -d --no-build --pull never`；`cache` 只构建，不推送或导出镜像。脚本显式指定构建器，不改变全局选中的 Buildx 构建器。源码编译使用原生架构，避免 ARM Mac 在 amd64 模拟环境运行前端编译工具时出现 `Illegal instruction` / 退出码 132；目标架构的系统包和生产依赖安装仍需要相应原生节点或模拟支持，参见 [Docker 多平台构建](https://docs.docker.com/build/building/multi-platform/#cross-compilation)。
 
-`.build.env` 中 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY` 及小写别名用于宿主机 Docker CLI；`BUILD_*_PROXY` 用于构建阶段 RUN，并配置新建 BuildKit 容器的代理。容器内不能用宿主机 `127.0.0.1`，通常改为 `host.docker.internal` 且代理需允许容器访问。已有构建器不会被自动重建，修改其拉取代理需手动配置该构建器；Docker daemon 自身拉取 BuildKit/基础镜像的代理仍由 Docker 设置控制。[Docker 代理构建参数](https://docs.docker.com/build/building/variables/#proxy-arguments)不会写成最终镜像的 `ENV`；私有仓库登录使用 Docker 凭据管理，不在 env 中填写登录密码。
+`.build.env` 中 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY` 及小写别名用于宿主机 Docker CLI；`BUILD_*_PROXY` 用于构建阶段 RUN，并配置新建 BuildKit 容器的代理。容器内不能用宿主机 `127.0.0.1`；Docker Desktop 可使用内置 DNS 提供的 `host.docker.internal`，代理需允许容器访问。Linux Engine 若无法解析该名称，填写构建器可达的宿主机 IP 或代理域名。脚本使用 `docker-container` 驱动，不传入该驱动不支持的 `--add-host host.docker.internal=host-gateway`；遇到相关报错时更新构建脚本后重试，无需重建构建器。
+
+已有构建器不会被自动重建，修改其拉取代理需手动配置该构建器；Docker daemon 拉取 BuildKit 镜像的代理由 Docker 设置控制，BuildKit 拉取基础镜像及推送镜像使用构建器自身的网络与代理。[Docker 代理构建参数](https://docs.docker.com/build/building/variables/#proxy-arguments)不会写成最终镜像的 `ENV`；私有仓库登录使用 Docker 凭据管理，不在 env 中填写登录密码。
 
 运行期媒体下载代理独立配置在 `.env`；它不自动代理浏览器或 OneBot 连接。`.dockerignore` 使用白名单，登录态、所有 env、令牌、抓包和缓存不进入构建上下文。示例 env 的每个变量都附有用途、范围或单位说明。
 

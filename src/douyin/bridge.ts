@@ -160,7 +160,7 @@ export class DouyinBridge {
 
   async start(): Promise<void> {
     await this.directory.refresh().catch(error => {
-      this.logger.warn({ error }, 'douyin account and conversation initialization failed');
+      this.logger.warn({ error }, '抖音账号与会话初始化未完成；请检查管理台登录状态及网络，服务将继续运行并定期检测');
     });
     this.synchronizeCacheAccount();
     if (this.accountId && this.directory.initialSyncState && !this.cache.syncCursors?.['1']) {
@@ -168,7 +168,7 @@ export class DouyinBridge {
       await this.cache.persist?.();
     }
     if (!this.options.enableDomMessageCapture) {
-      this.logger.info('douyin bridge started with realtime network capture');
+      this.logger.info('抖音消息监听已启动');
       return;
     }
 

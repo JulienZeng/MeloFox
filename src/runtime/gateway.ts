@@ -95,7 +95,9 @@ export async function startGatewaySession(config: AppConfig, logger: AppLogger, 
       isImConnected: () => browser!.isImConnected(),
       recover,
       onHealthChange: (healthy, error) => {
-        logger.warn({ healthy, error: error instanceof Error ? error.message : error }, healthy ? 'Douyin session probe recovered' : 'Douyin session unavailable; check login or connectivity');
+        if (healthy) logger.info('抖音会话检测已恢复');
+        else if (error) logger.warn({ error }, '抖音会话检测失败；请检查管理台登录状态及网络');
+        else logger.info('抖音会话尚未就绪，请在管理台检查登录状态');
         void wsHub?.emit(heartbeatEvent(config, bridge.getStatus())).catch(error => logger.warn({ error }, 'heartbeat delivery failed'));
       }
     });

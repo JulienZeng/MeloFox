@@ -73,7 +73,7 @@ docker compose up -d --no-build --pull never
 docker compose exec douyin-onebot cat /data/console/admin-token
 ```
 
-默认构建本地镜像 `melofox:latest`，包含已打包的后端和 Vue 管理台，以及 Chromium、ffmpeg / ffprobe。容器以非 root 用户运行。
+默认构建本地镜像 `melofox:latest`，基于 Node 24 Debian slim，包含已打包的后端和 Vue 管理台，以及无头模式使用的 Chromium headless shell、ffmpeg / ffprobe。仅安装所需浏览器及系统依赖，容器以非 root 用户运行。
 
 | 服务 | 默认宿主机地址 | 用途 |
 | --- | --- | --- |

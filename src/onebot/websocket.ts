@@ -20,6 +20,9 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   private readonly servers: WebSocketServer[] = [];
   private reverseSocket?: WebSocket;
   private reverseReconnectTimer?: NodeJS.Timeout;
+  private reverseFailures = 0;
+  private lastReverseWarning?: { key: string; time: number };
+  private reverseConnectionError?: string;
   private stopped = true;
   private stopPromise?: Promise<void>;
   private readonly outboxes = new Map<'forward' | 'reverse', EventOutbox>();
@@ -34,6 +37,9 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   async start(): Promise<void> {
     this.stopped = false;
     this.stopPromise = undefined;
+    this.reverseFailures = 0;
+    this.lastReverseWarning = undefined;
+    this.reverseConnectionError = undefined;
     for (const kind of ['forward', 'reverse'] as const) {
       if (!(kind === 'forward' ? this.config.onebot.forwardWs.enabled : this.config.onebot.reverseWs.enabled)) continue;
       const destination = kind === 'forward' ? `${this.config.onebot.forwardWs.host}:${this.config.onebot.forwardWs.port}` : this.config.onebot.reverseWs.url;
@@ -60,19 +66,21 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     }));
   }
 
-  status(): { state: string; clients: number; pendingEvents: number } {
+  status(): { state: string; clients: number; pendingEvents: number; error?: string } {
     return {
       state: this.stopped ? 'waiting' : this.config.onebot.reverseWs.enabled
         ? this.reverseSocket?.readyState === WebSocket.OPEN ? 'connected' : 'connecting'
         : 'listening',
       clients: this.clients.size,
-      pendingEvents: [...this.outboxes.values()].reduce((sum, outbox) => sum + outbox.size, 0)
+      pendingEvents: [...this.outboxes.values()].reduce((sum, outbox) => sum + outbox.size, 0),
+      ...(this.reverseConnectionError ? { error: this.reverseConnectionError } : {})
     };
   }
 
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopped = true;
+    this.reverseConnectionError = undefined;
     if (this.reverseReconnectTimer) {
       clearTimeout(this.reverseReconnectTimer);
       this.reverseReconnectTimer = undefined;
@@ -136,17 +144,35 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     });
 
     this.reverseSocket = socket;
+    let connectionError: Error | undefined;
+    const destination = new URL(this.config.onebot.reverseWs.url);
+    // The configured URL may carry credentials or access_token query parameters.
+    const endpoint = `${destination.protocol}//${destination.host}${destination.pathname}`;
 
     socket.on('open', () => {
       if (this.stopped) { socket.close(); return; }
-      this.addClient(socket, 'onebot reverse websocket connected', 'reverse');
+      this.reverseFailures = 0;
+      this.lastReverseWarning = undefined;
+      this.reverseConnectionError = undefined;
+      this.logger.info({ endpoint }, 'OneBot 反向 WebSocket 已连接');
+      this.addClient(socket, undefined, 'reverse');
     });
 
-    socket.on('close', () => {
+    socket.on('close', code => {
       this.clients.delete(socket);
       if (this.reverseSocket === socket) this.reverseSocket = undefined;
       if (this.stopped) return;
-      this.logger.warn('onebot reverse websocket closed');
+      this.reverseConnectionError = describeReverseFailure(connectionError, code);
+      this.reverseFailures++;
+      const key = connectionError ? `${(connectionError as NodeJS.ErrnoException).code ?? ''}:${connectionError.message}` : `close:${code}`;
+      const now = Date.now();
+      if (!this.lastReverseWarning || this.lastReverseWarning.key !== key || now - this.lastReverseWarning.time >= 60000) {
+        this.lastReverseWarning = { key, time: now };
+        this.logger.warn({ endpoint, error: connectionError, closeCode: code, attempts: this.reverseFailures,
+          retryMs: this.config.runtime.reconnectIntervalMs },
+        connectionError ? 'OneBot 反向 WebSocket 连接失败，将自动重试；请检查机器人监听地址、端口和容器网络（相同错误每分钟汇总一次）'
+          : 'OneBot 反向 WebSocket 已断开，将自动重连（相同错误每分钟汇总一次）');
+      }
       this.reverseReconnectTimer = setTimeout(() => {
         this.reverseReconnectTimer = undefined;
         this.connectReverseWebSocket();
@@ -154,14 +180,14 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     });
 
     socket.on('error', error => {
-      this.logger.warn({ error }, 'onebot reverse websocket error');
+      connectionError = error;
     });
   }
 
-  private addClient(socket: WebSocket, message: string, kind: 'forward' | 'reverse'): void {
+  private addClient(socket: WebSocket, message: string | undefined, kind: 'forward' | 'reverse'): void {
     this.clients.add(socket);
     this.kinds.set(socket, kind);
-    this.logger.info(message);
+    if (message) this.logger.info(message);
 
     socket.on('message', payload => {
       void this.handleMessage(socket, payload.toString());
@@ -241,4 +267,17 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
       url.searchParams.get('access_token') === this.config.onebot.accessToken
     );
   }
+}
+
+function describeReverseFailure(error: Error | undefined, closeCode: number): string {
+  if (!error) return `连接已断开（关闭码 ${closeCode}），正在重连`;
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return `无法解析目标地址（${code}），正在重试；使用容器名时请确认双方处于同一自定义 Docker 网络`;
+  if (code === 'ECONNREFUSED') return '目标拒绝连接（ECONNREFUSED），正在重试；请确认机器人 WS 服务已启动，地址和端口正确';
+  if (code === 'ETIMEDOUT' || /opening handshake has timed out/i.test(error.message)) return '连接超时，正在重试；请检查目标地址、容器网络及防火墙';
+  const status = error.message.match(/Unexpected server response: (\d{3})/i)?.[1];
+  if (status === '401' || status === '403') return `握手被拒绝（HTTP ${status}），正在重试；请检查双方令牌及访问权限`;
+  if (status === '404') return 'WS 路径不存在（HTTP 404），正在重试；请检查机器人配置的连接路径';
+  if (status) return `WS 握手失败（HTTP ${status}），正在重试；请检查机器人服务或反向代理配置`;
+  return 'WebSocket 连接失败，正在重试；详细原因请查看服务日志';
 }

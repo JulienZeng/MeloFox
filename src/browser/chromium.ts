@@ -76,7 +76,7 @@ export async function startBrowserRuntime(
       userDataDir: config.browser.userDataDir,
       headless: config.browser.headless
     },
-    'starting persistent chromium'
+    '正在启动 Chromium'
   );
 
   const context = await chromium.launchPersistentContext(config.browser.userDataDir, {
@@ -127,7 +127,7 @@ async function attachBrowserRuntime(
     waitUntil: 'domcontentloaded'
   });
 
-  logger.info({ url: page.url() }, 'douyin chat page opened');
+  logger.info({ url: page.url() }, '抖音聊天页面已打开');
 
   return {
     context,

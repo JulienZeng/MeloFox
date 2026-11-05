@@ -68,7 +68,7 @@ export interface ChannelSession {
 interface RunningChannel {
   emit?(event: OneBotEvent): Promise<void>;
   stop(): Promise<void>;
-  status(): { state: string; clients?: number };
+  status(): { state: string; clients?: number; error?: string };
 }
 
 export class ChannelManager {

@@ -24,6 +24,7 @@ services:
       DOUYIN_ONEBOT_CONFIG: /app/config/config.example.yaml
       APP_SELF_ID: ${APP_SELF_ID:-douyin_bot_001}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      APP_LOG_FORMAT: ${APP_LOG_FORMAT:-pretty}
       WEB_ENABLED: "${WEB_ENABLED:-true}"
       WEB_HOST: 0.0.0.0
       WEB_PORT: "3000"

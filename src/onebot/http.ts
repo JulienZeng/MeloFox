@@ -341,7 +341,7 @@ export async function startOneBotHttpServer(
       host: config.onebot.http.host,
       port: config.onebot.http.port
     },
-    'onebot http server started'
+    'OneBot HTTP 服务已启动'
   );
 
   return {
