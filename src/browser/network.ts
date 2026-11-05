@@ -1,5 +1,5 @@
 import type { Page, Request, WebSocket } from 'playwright';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 
 export interface NetworkEvent {
   time: number;
@@ -66,6 +66,7 @@ export class NetworkRecorder {
 }
 
 export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder = new NetworkRecorder()): NetworkRecorder {
+  logger = scopedLogger(logger, '抖音网络');
   let documentNavigation: Request | undefined;
   page.on('request', request => {
     if (request.isNavigationRequest() && request.frame() === page.mainFrame()) documentNavigation = request;
@@ -164,7 +165,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
           url: safeUrl,
           size: typeof frame.payload === 'string' ? frame.payload.length : frame.payload.byteLength
         },
-        'douyin websocket frame received'
+        '接收抖音 WebSocket 数据帧'
       );
     });
 
@@ -187,7 +188,7 @@ export function attachNetworkDiagnostics(page: Page, logger: AppLogger, recorder
           url: safeUrl,
           size: typeof frame.payload === 'string' ? frame.payload.length : frame.payload.byteLength
         },
-        'douyin websocket frame sent'
+        '发送抖音 WebSocket 数据帧'
       );
     });
 

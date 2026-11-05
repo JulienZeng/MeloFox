@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
 import type { AppConfig } from "../config/index.js";
-import type { AppLogger } from "../logger/index.js";
+import { scopedLogger, type AppLogger } from "../logger/index.js";
 import { OneBotActionRouter } from "../onebot/actions.js";
 import type { OneBotEvent } from "../onebot/types.js";
 import { OneBotReverseHttp } from "../onebot/reverse-http.js";
@@ -82,6 +82,7 @@ export class ChannelManager {
     private readonly config: AppConfig,
     private readonly logger: AppLogger,
   ) {
+    this.logger = scopedLogger(logger, '网络配置');
     this.path = join(config.web.dataDir, "channels.json");
   }
   async initialize(): Promise<void> {
@@ -159,7 +160,7 @@ export class ChannelManager {
           this.errors.set(channel.id, this.describe(error));
           this.logger.warn(
             { channel: channel.name },
-            "channel could not start; repair it in web console",
+            "网络通道启动失败，请在管理台检查配置",
           );
         }
       }
@@ -247,6 +248,7 @@ export class ChannelManager {
     if (channel) this.errors.delete(channel.id);
   }
   private async start(channel: Channel): Promise<RunningChannel> {
+    const logger = scopedLogger(this.logger, '网络配置', { channel: channel.name });
     const config = structuredClone(this.config);
     config.onebot.accessToken = channel.accessToken;
     config.onebot.forwardWs.enabled = channel.type === "forward-ws";
@@ -265,8 +267,8 @@ export class ChannelManager {
       // Each channel needs its own token/config, while sharing the same bridge and media cache.
       const runtime = await startOneBotHttpServer(
         config,
-        this.logger,
-        new OneBotActionRouter(config, session.bridge, session.mediaRegistry),
+        logger,
+        new OneBotActionRouter(config, session.bridge, session.mediaRegistry, logger),
         session.browser,
         session.mediaRegistry,
         session.realtime,
@@ -279,13 +281,13 @@ export class ChannelManager {
     }
     if (channel.type === "reverse-http") {
       config.onebot.reverseHttp = { enabled: true, url: channel.url, secret: channel.secret, timeoutMs: channel.timeoutMs };
-      const runtime = new OneBotReverseHttp(config, this.logger, new OneBotActionRouter(config, session.bridge, session.mediaRegistry));
+      const runtime = new OneBotReverseHttp(config, logger, new OneBotActionRouter(config, session.bridge, session.mediaRegistry, logger));
       await runtime.start(); return runtime;
     }
     const hub = new OneBotWebSocketHub(
       config,
-      this.logger,
-      new OneBotActionRouter(config, session.bridge, session.mediaRegistry),
+      logger,
+      new OneBotActionRouter(config, session.bridge, session.mediaRegistry, logger),
     );
     try {
       await hub.start();

@@ -205,5 +205,5 @@ export async function installDouyinInjection(context: BrowserContext, logger: Ap
     setInterval(installMessageObserver, 1000);
   }, enableDomCapture);
 
-  logger.info('installed douyin browser injection');
+  logger.info('浏览器消息捕获脚本已安装');
 }

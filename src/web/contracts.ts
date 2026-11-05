@@ -1,3 +1,4 @@
+import type { LogEntry } from '../logger/contracts.js';
 // JSON contracts shared by the console server and the bundled browser client.
 export type ChannelType = "http" | "forward-ws" | "reverse-ws" | "reverse-http";
 export interface ChannelInput {
@@ -108,6 +109,6 @@ export interface ConsoleStatus {
   browser: "ready" | "error" | "starting";
   error?: string;
   channels: ConsoleChannel[];
-  activity: Array<{ time: string; message: string }>;
+  logs: LogEntry[];
   login?: ConsoleLogin;
 }

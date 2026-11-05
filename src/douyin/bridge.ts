@@ -1,3 +1,4 @@
+import { messageLog } from '../logger/message.js';
 import { buildInteractiveEmoji } from './interactive-emoji.js';
 import { dyCommandReply, isDyCommand } from './local-command.js';
 import { buildGroupCard } from './group-card.js';
@@ -8,11 +9,11 @@ import { buildLocationContent } from './card-compat.js';
 import { randomUUID } from 'node:crypto';
 import { loadImageData, uploadOutgoingImage, validateOutgoingImage, type LoadedImageData } from './image-upload.js';
 export { loadImageData } from './image-upload.js';
-import { PartialSendError, UncertainSendError } from './types.js';
+import { MessageUnavailableError, PartialSendError, UncertainSendError } from './types.js';
 import { loadOutgoingFile, uploadOutgoingFile } from './file-upload.js';
 import { prepareOutgoingVideo, uploadOutgoingVideo } from './video-upload.js';
 import type { Page } from 'playwright';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import { BoundedCache } from '../runtime/bounded-cache.js';
 import { fetchDouyinResource, parseStickerCatalog, resolveDouyinUrl, awemeShareFromDetail } from './resources.js';
 import { parseDouyinSticker } from './sticker.js';
@@ -85,6 +86,7 @@ export function createDouyinBridgeCache(limit = 10000, ttlMs = 7 * 86400000): Do
 export interface DouyinBridgeOptions {
   requestRestart?: (delayMs: number) => void;
   enableDomMessageCapture?: boolean;
+  logMessageContent?: boolean;
   actionTimeoutMs?: number;
   maxFileBytes?: number;
   fileSendAllowedDirs?: string[];
@@ -105,7 +107,7 @@ export class DouyinBridge {
     this.options.requestRestart(delayMs);
   }
   reportDeferredActionFailure(action: string, retcode: number): void {
-    this.logger.warn({ action, retcode }, 'asynchronous OneBot action failed; no automatic retry');
+    this.logger.warn({ action, retcode }, 'OneBot 异步操作失败，不自动重试');
   }
   private readonly outgoingMedia = new OutgoingMediaCache();
   clearOutgoingMediaCache(): void { this.outgoingMedia.clear(); }
@@ -143,6 +145,7 @@ export class DouyinBridge {
     private readonly logger: AppLogger,
     private readonly options: DouyinBridgeOptions = {}
   ) {
+    this.logger = scopedLogger(logger, '抖音');
     this.identitySecurity = new IdentitySecurityProvider(page, () => this.accountId);
     this.cache = options.cache ?? createDouyinBridgeCache(options.messageCacheLimit, options.messageCacheTtlMs);
     this.messageCache = this.cache.messages;
@@ -184,7 +187,7 @@ export class DouyinBridge {
       });
     });
 
-    this.logger.info('douyin bridge started with DOM message capture fallback');
+    this.logger.info('抖音消息监听已启动，使用页面捕获模式');
   }
 
   onMessage(handler: DouyinMessageHandler): void {
@@ -224,7 +227,7 @@ export class DouyinBridge {
         } catch (error) {
           deadline.remainingMs();
           if (this.accountId !== accountId) throw error;
-          this.logger.warn({ error, groupId: group.shortId }, 'could not read group join requests');
+          this.logger.warn({ error, groupId: group.shortId }, '读取入群申请失败');
         }
       }
     });
@@ -310,6 +313,24 @@ export class DouyinBridge {
     return callbackStatus !== undefined && callbackStatus !== 0 ? undefined : message;
   }
 
+  getMessageTarget(messageId: string): DouyinSendTarget | undefined {
+    if (this.signedOut || !this.accountId) return undefined;
+    this.synchronizeCacheAccount();
+    if (this.cache.restored || this.cache.recalls.get(messageId)) return undefined;
+    const sent = this.cache.sentTargets.get(messageId);
+    if (sent?.senderId === this.accountId) return { ...sent.target };
+    // A bot resolving a reply sends only message_id. Its already received parent
+    // supplies the exact conversation, so no scan of unrelated remote chats is needed.
+    for (const { value: parent } of this.messageCache.snapshot().reverse()) {
+      if (!parent.conversationId || this.cache.recalls.get(parent.messageId) ||
+          (messageCallbackStatus(parent) ?? 0) !== 0 ||
+          !parent.segments?.some(segment => segment.type === 'reply' && String(segment.data.id) === messageId)) continue;
+      return { type: parent.conversationType, conversationId: parent.conversationId,
+        conversationShortId: parent.conversationShortId };
+    }
+    return undefined;
+  }
+
   resolveFileUrl(resource: DouyinFileResource): Promise<string> {
     return resolveDouyinFileUrl(this.page, resource);
   }
@@ -337,13 +358,24 @@ export class DouyinBridge {
   }
 
   async fetchMessage(messageId: string, target: DouyinSendTarget): Promise<DouyinMessage> {
-    const detail = await this.queryMessage(messageId, target);
+    const accountId = this.accountId;
+    if (this.signedOut || !accountId) throw new MessageUnavailableError(messageId, '抖音账号尚未登录');
     this.synchronizeCacheAccount();
-    if (this.cache.recalls.get(messageId)) throw new Error('Message has been recalled');
+    if (this.cache.recalls.get(messageId)) throw new MessageUnavailableError(messageId, '消息已撤回');
+    const cached = this.messageCache.get(messageId);
+    if (cached && (messageCallbackStatus(cached) ?? 0) !== 0)
+      throw new MessageUnavailableError(messageId, '消息未通过抖音发送校验');
+    const detail = await this.queryMessage(messageId, target);
+    if (this.signedOut || this.accountId !== accountId) throw new MessageUnavailableError(messageId, '查询期间账号已切换或退出');
+    this.synchronizeCacheAccount();
+    if (this.cache.recalls.get(messageId)) throw new MessageUnavailableError(messageId, '消息已撤回');
     const message = toDouyinMessage(detail, false, true);
-    if (!message) throw new Error('Message is unavailable');
+    if (!message || (messageCallbackStatus(message) ?? 0) !== 0)
+      throw new MessageUnavailableError(messageId, '抖音未返回可用的聊天消息');
     this.messageCache.set(messageId, message);
     await this.cache.persist?.();
+    if (this.signedOut || this.accountId !== accountId || this.cache.recalls.get(messageId))
+      throw new MessageUnavailableError(messageId, '查询期间消息已撤回或账号发生变化');
     return message;
   }
 
@@ -675,14 +707,14 @@ export class DouyinBridge {
     this.cache.sentTargets.delete(notice.messageId);
     await this.cache.persist?.();
     if (!notice.senderId || (notice.conversationType === 'private' && !notice.peerUserId)) {
-      this.logger.warn({ messageId: notice.messageId }, 'recall author or peer is unknown; suppressing incomplete notice');
+      this.logger.warn({ messageId: notice.messageId }, '撤回消息的操作人或会话未知，已跳过不完整通知');
       return;
     }
     for (const handler of this.recallHandlers) await handler(notice);
     state.emitted = true;
     this.cache.recalls.set(notice.messageId, state);
     await this.cache.persist?.();
-    this.logger.info({ messageId: notice.messageId, operatorId: notice.operatorId, conversationType: notice.conversationType }, 'received douyin recall');
+    this.logger.info({ messageId: notice.messageId, operatorId: notice.operatorId, conversationType: notice.conversationType }, '接收 <- 消息撤回');
   }
 
   recallMessage(messageId: string): Promise<void> {
@@ -725,7 +757,7 @@ export class DouyinBridge {
       this.messageCache.delete(messageId);
       this.cache.sentTargets.delete(messageId);
       await this.cache.persist?.();
-      this.logger.info({ messageId, conversationId: target.conversationId }, 'recalled own douyin message through imapi');
+      this.logger.info({ messageId, conversationId: target.conversationId }, '操作 -> 消息已撤回');
     });
   }
 
@@ -946,7 +978,7 @@ export class DouyinBridge {
     this.sentClientMessageIds.set(messageId, request.clientMessageId);
     this.rememberSentTarget(messageId, input.target);
     await this.cacheOutgoingMessage(input, messageId, request, message.messageType, accountId);
-    this.logger.info({ messageId, conversationShortId, messageType: message.messageType }, 'sent douyin native message through imapi');
+    this.logger.debug?.({ messageId, conversationShortId, messageType: message.messageType }, '原生消息发送详情');
     return { messageId, raw: { source: 'imapi', response: decoded } };
   }
 
@@ -993,7 +1025,7 @@ export class DouyinBridge {
       this.rememberSentTarget(messageId, input.target);
       messageIds.push(messageId);
       await this.cacheOutgoingMessage(input, messageId, request, 27, accountId);
-      this.logger.info(
+      this.logger.debug?.(
         {
           conversationShortId,
           messageId,
@@ -1002,7 +1034,7 @@ export class DouyinBridge {
           imageWidth: uploaded.width,
           imageHeight: uploaded.height
         },
-        'sent douyin image message through imapi'
+        '图片消息发送详情'
       );
 
       lastResult = {
@@ -1046,7 +1078,7 @@ export class DouyinBridge {
     this.sentClientMessageIds.set(messageId, request.clientMessageId);
     this.rememberSentTarget(messageId, input.target);
     await this.cacheOutgoingMessage(input, messageId, request, 30, accountId);
-    this.logger.info({ messageId, conversationShortId, videoSize: video.bytes.length, width: uploaded.width, height: uploaded.height }, 'sent douyin video through imapi');
+    this.logger.debug?.({ messageId, conversationShortId, videoSize: video.bytes.length, width: uploaded.width, height: uploaded.height }, '视频消息发送详情');
     return { messageId, raw: { source: 'imapi', response: decoded } };
   }
 
@@ -1073,7 +1105,7 @@ export class DouyinBridge {
     this.sentClientMessageIds.set(messageId, request.clientMessageId);
     this.rememberSentTarget(messageId, input.target);
     await this.cacheOutgoingMessage(input, messageId, request, 150, accountId);
-    this.logger.info({ messageId, conversationShortId, fileName: uploaded.name, fileSize: uploaded.size }, 'sent douyin file message through imapi');
+    this.logger.debug?.({ messageId, conversationShortId, fileName: uploaded.name, fileSize: uploaded.size }, '文件消息发送详情');
     return { messageId, raw: { source: 'imapi', response: decoded } };
   }
 
@@ -1113,14 +1145,14 @@ export class DouyinBridge {
     this.sentClientMessageIds.set(messageId, request.clientMessageId);
     this.rememberSentTarget(messageId, input.target);
     await this.cacheOutgoingMessage(input, messageId, request, 7, accountId);
-    this.logger.info(
+    this.logger.debug?.(
       {
         conversationShortId,
         messageId,
         clientMessageId: request.clientMessageId,
         mentions: input.mentions?.length ?? 0
       },
-      'sent douyin message through imapi'
+      '文本消息发送详情'
     );
 
     return {
@@ -1130,6 +1162,16 @@ export class DouyinBridge {
         response: decoded
       }
     };
+  }
+
+  private logChatMessage(message: DouyinMessage, peerId?: string): void {
+    const conversation = this.directory.getCachedConversation?.(message.conversationId || message.conversationShortId || '');
+    this.logger.info({ messageId: message.messageId, accountId: this.accountId }, messageLog(message, {
+      selfId: this.accountId, conversation, peerId,
+      sender: this.directory.getCachedUser?.(message.senderId),
+      peer: this.directory.getCachedUser?.(peerId || conversation?.peerUserId || ''),
+      includeContent: this.options.logMessageContent !== false,
+    }));
   }
 
   private async cacheOutgoingMessage(input: DouyinSendMessageInput, messageId: string,
@@ -1142,7 +1184,9 @@ export class DouyinBridge {
         content: request.content, createTime: String(Date.now()), raw: { content: request.content, messageType } }, false, true);
       if (message) this.messageCache.set(messageId, { ...message, segments: [...reply, ...(message.segments ?? [])] });
     }
-    await this.cache.persist?.().catch(error => this.logger.warn({ messageId, error: error instanceof Error ? error.message : String(error) }, 'message delivered but send cache persistence failed'));
+    const sent = this.messageCache.get(messageId);
+    if (sent) this.logChatMessage(sent, input.target.userId);
+    await this.cache.persist?.().catch(error => this.logger.warn({ messageId, error: error instanceof Error ? error.message : String(error) }, '消息已发送，但发送缓存保存失败，请勿重复发送'));
   }
 
   private async postImProtobuf(endpoint: 'message/send' | 'message/set_property', body: Buffer, deadline: ActionDeadline,
@@ -1260,7 +1304,7 @@ export class DouyinBridge {
         emoji: input.emojiReaction.key,
         operation: input.emojiReaction.operation === 1 ? 'remove' : 'add'
       },
-      'sent douyin emoji reaction through imapi'
+      '操作 -> 消息表情回应已更新'
     );
 
     return {
@@ -1536,7 +1580,7 @@ export class DouyinBridge {
       .catch(() => false);
     this.logger.debug(
       { target, activeConversation: selectedConversation, editorVisible },
-      'douyin active conversation check did not match after selecting visible target'
+      '页面当前会话与目标不一致'
     );
     return editorVisible;
   }
@@ -1781,23 +1825,15 @@ export class DouyinBridge {
     }
     const callbackStatus = messageCallbackStatus(message);
     if (callbackStatus !== undefined && callbackStatus !== 0) {
-      this.logger.warn({ messageId: message.messageId, callbackStatus }, 'received rejected message echo; not publishing as a chat message');
+      this.logger.warn({ messageId: message.messageId, callbackStatus }, '消息回执被拒绝，不上报为聊天消息');
       return;
     }
     if (this.cache.notifications.get(`message:${message.messageId}`)) return;
+    if (!isOwnEcho) this.logChatMessage(message);
     if (isDyCommand(message)) {
       await this.replyToLocalCommand(message);
       return;
     }
-    this.logger.info(
-      {
-        messageId: message.messageId,
-        conversationType: message.conversationType,
-        conversationId: message.conversationId,
-        senderId: message.senderId
-      },
-      'received douyin message'
-    );
 
     for (const handler of this.messageHandlers) {
       await handler(message);
@@ -1827,7 +1863,7 @@ export class DouyinBridge {
         text: dyCommandReply()
       });
     } catch (error) {
-      this.logger.warn({ error, messageId: message.messageId }, 'local #dy reply failed; command consumed without forwarding or retry');
+      this.logger.warn({ error, messageId: message.messageId }, '本地 #dy 命令回复失败，命令已消费，不转发或重试');
     }
   }
 

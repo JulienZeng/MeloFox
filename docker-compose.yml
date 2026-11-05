@@ -25,6 +25,8 @@ services:
       APP_SELF_ID: ${APP_SELF_ID:-douyin_bot_001}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
       APP_LOG_FORMAT: ${APP_LOG_FORMAT:-pretty}
+      # 收发日志包含简短内容摘要；设为 false 则仅保留对象和消息类型。
+      APP_LOG_MESSAGE_CONTENT: ${APP_LOG_MESSAGE_CONTENT:-true}
       WEB_ENABLED: "${WEB_ENABLED:-true}"
       WEB_HOST: 0.0.0.0
       WEB_PORT: "3000"

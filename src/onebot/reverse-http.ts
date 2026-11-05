@@ -1,7 +1,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import { join } from 'node:path';
 import type { AppConfig } from '../config/index.js';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import type { OneBotActionRouter } from './actions.js';
 import type { OneBotEvent } from './types.js';
 import { parseOneBotJson, stringifyOneBotJson } from './json.js';
@@ -15,10 +15,13 @@ export class OneBotReverseHttp {
   private flushing?: Promise<void>;
   private stopped = true;
   private online = false;
+  private failures = 0;
+  private lastWarningAt = 0;
   private lifecycle?: OneBotEvent;
   private heartbeat?: OneBotEvent;
   private flushRequested = false;
   constructor(private readonly config: AppConfig, private readonly logger: AppLogger, private readonly router: OneBotActionRouter) {
+    this.logger = scopedLogger(logger, 'OneBot HTTP回传');
     const key = createHash('sha256').update(`http:${config.onebot.reverseHttp.url}:${config.app.selfId}`).digest('hex');
     this.outbox = new EventOutbox(join(config.runtime.messageCacheDir, 'events', `${key}.json`), config.app.selfId);
   }
@@ -71,9 +74,9 @@ export class OneBotReverseHttp {
       for (const params of operations) {
         if (this.stopped) break;
         const result = await this.router.handle({ action: '.handle_quick_operation', params });
-        if (result.status !== 'ok') this.logger.warn({ retcode: result.retcode }, 'Reverse HTTP quick operation failed; not retried');
+        if (result.status !== 'ok') this.logger.warn({ retcode: result.retcode }, '反向 HTTP 快速操作失败，不自动重试');
       }
-    }).catch(() => this.logger.warn('Reverse HTTP outbox persistence failed; delivery will retry'))
+    }).catch(() => this.logger.warn('反向 HTTP 事件队列保存失败，将重试投递'))
       .finally(() => { this.flushing = undefined; if (this.flushRequested) this.flush(); });
   }
   private async post(event: OneBotEvent, signal = AbortSignal.any([
@@ -84,8 +87,9 @@ export class OneBotReverseHttp {
       const response = await fetch(settings.url, { method: 'POST', body, redirect: 'error', signal,
         headers: { 'Content-Type': 'application/json', 'X-Self-ID': this.config.app.selfId,
           ...(settings.secret ? { 'X-Signature': `sha1=${createHmac('sha1', settings.secret).update(body).digest('hex')}` } : {}) } });
-      if (!response.ok) { await response.body?.cancel(); this.online = false; return { ok: false }; }
-      this.online = true;
+      if (!response.ok) { await response.body?.cancel(); throw new Error(`HTTP ${response.status}`); }
+      if (!this.online && !this.stopped) this.logger.info({ endpoint: settings.url }, 'OneBot 反向 HTTP 已连接');
+      this.online = true; this.failures = 0;
       if (event.post_type !== 'message' && event.post_type !== 'request') { await response.body?.cancel(); return { ok: true }; }
       // A 2xx response acknowledges delivery even if its optional quick operation is invalid.
       try {
@@ -99,10 +103,13 @@ export class OneBotReverseHttp {
         } finally { await reader.cancel().catch(() => undefined); }
         const text = Buffer.concat(chunks).toString('utf8').trim();
         return { ok: true, ...(text ? { operation: parseOneBotJson(text) } : {}) };
-      } catch { this.logger.warn('Invalid reverse HTTP quick operation response; event was acknowledged'); return { ok: true }; }
-    } catch {
-      this.online = false;
-      if (!this.stopped) this.logger.warn('Reverse HTTP delivery failed; event retained for retry');
+      } catch { this.logger.warn('反向 HTTP 快速操作响应无效，事件已确认接收'); return { ok: true }; }
+    } catch (error) {
+      this.online = false; this.failures++;
+      if (!this.stopped && (this.failures === 1 || Date.now() - this.lastWarningAt >= 60000)) {
+        this.lastWarningAt = Date.now();
+        this.logger.warn({ endpoint: this.config.onebot.reverseHttp.url, error, attempts: this.failures }, '反向 HTTP 投递失败，事件已保留待重试');
+      }
       return { ok: false };
     }
   }

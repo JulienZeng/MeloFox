@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppConfig } from '../config/index.js';
-import type { AppLogger } from '../logger/index.js';
+import { loggerBuffer, scopedLogger, type AppLogger } from '../logger/index.js';
+import { LogBuffer } from '../logger/buffer.js';
 import type { BrowserRuntime } from '../browser/chromium.js';
 import type { DouyinBridge } from '../douyin/bridge.js';
 import { LoginAssist } from '../douyin/login-assist.js';
@@ -29,12 +30,8 @@ export class ConsoleControl {
   login?: DouyinLogin;
   assisting?: () => boolean;
   readonly startedAt = Date.now();
-  readonly activity: Array<{ time: string; message: string }> = [];
+  logs = new LogBuffer();
   constructor(readonly channels: ChannelManager) {}
-  record(message: string) {
-    this.activity.unshift({ time: new Date().toISOString(), message });
-    this.activity.splice(50);
-  }
   detached() {
     this.browser = undefined;
     this.bridge = undefined;
@@ -63,7 +60,7 @@ export class ConsoleControl {
             : 'starting',
       error: this.error,
       channels: this.channels.list(),
-      activity: this.activity,
+      logs: this.logs.recent(),
       login: this.login?.status()
     };
   }
@@ -75,11 +72,13 @@ export async function createConsoleServer(
   control: ConsoleControl,
   options: { development?: boolean } = {}
 ): Promise<FastifyInstance> {
+  logger = scopedLogger(logger, '管理台');
+  control.logs = loggerBuffer(logger);
   control.login ??= new DouyinLogin(
     config,
     browserPassportTransport(() => control.browser),
     () => {
-      control.record('抖音登录配置已保存');
+      logger.info('抖音登录配置已保存');
       control.recover?.('Douyin API login completed; restore saved session');
     }
   );
@@ -113,7 +112,9 @@ export async function createConsoleServer(
       }
     }
   });
-  server.setErrorHandler((error, _request, reply) => {
+  server.setErrorHandler((error, request, reply) => {
+    if (!(error instanceof z.ZodError) && ((error as { statusCode?: number }).statusCode ?? 500) >= 500)
+      logger.error({ error, method: request.method, route: request.routeOptions.url }, '管理接口执行失败');
     if (error instanceof PassportError)
       return reply
         .code(error.statusCode)
@@ -144,16 +145,23 @@ export async function createConsoleServer(
     await registerConsoleAssets(server);
   }
   server.get('/api/status', async () => control.status());
+  server.get('/api/logs', async request => {
+    const query = z.object({
+      after: z.coerce.number().int().nonnegative().safe().optional(),
+      stream: z.string().uuid().optional(),
+    }).strict().parse(request.query);
+    return control.logs.read(query.after, query.stream);
+  });
   server.post('/api/channels', async (request, reply) => {
     await control.channels.save(request.body);
-    control.record('创建通道');
+    logger.info('创建通道');
     return reply.code(201).send({ ok: true });
   });
   server.put<{ Params: { id: string } }>(
     '/api/channels/:id',
     async (request) => {
       await control.channels.save(request.body, request.params.id);
-      control.record('更新通道配置');
+      logger.info('更新通道配置');
       return { ok: true };
     }
   );
@@ -161,7 +169,7 @@ export async function createConsoleServer(
     '/api/channels/:id',
     async (request) => {
       await control.channels.remove(request.params.id);
-      control.record('删除通道');
+      logger.info('删除通道');
       return { ok: true };
     }
   );
@@ -173,11 +181,21 @@ export async function createConsoleServer(
     await control.login!.completeBrowserLogin(); await assist.close(); return { ok: true };
   });
   server.delete('/api/douyin/assist', async () => { await assist.close(); return { ok: true }; });
-  server.post('/api/douyin/login', async () => control.login!.create());
-  server.post<{ Params: { id: string } }>('/api/douyin/login/:id/sms', async request => control.login!.sendVerificationCode(request.params.id));
+  server.post('/api/douyin/login', async () => {
+    const result = await control.login!.create();
+    logger.info('登录二维码已生成，请使用抖音 App 扫码');
+    return result;
+  });
+  server.post<{ Params: { id: string } }>('/api/douyin/login/:id/sms', async request => {
+    const result = await control.login!.sendVerificationCode(request.params.id);
+    logger.info('登录短信验证码已发送，请在管理台完成验证');
+    return result;
+  });
   server.post<{ Params: { id: string } }>('/api/douyin/login/:id/verify', async request => {
     const body = z.object({ code: z.string().regex(/^[0-9]{4,8}$/) }).strict().parse(request.body);
-    return control.login!.verifyCode(request.params.id, body.code);
+    const result = await control.login!.verifyCode(request.params.id, body.code);
+    logger.info('短信验证已通过，请选择登录保存方式');
+    return result;
   });
   server.post<{ Params: { id: string } }>('/api/douyin/login/:id/trust', async request => {
     const body = z.object({ save: z.boolean() }).strict().parse(request.body);
@@ -191,12 +209,20 @@ export async function createConsoleServer(
       if (browser) await clearBrowserLogin(browser.context);
     });
     control.recover?.('Douyin account signed out');
-    control.record('已退出抖音并清除保存的登录状态');
+    logger.info('已退出抖音并清除保存的登录状态');
     return { ok: true };
   });
   server.get<{ Params: { id: string } }>(
     '/api/douyin/login/:id',
-    async (request) => control.login!.check(request.params.id)
+    async (request) => {
+      const previous = control.login!.status()?.state;
+      const result = await control.login!.check(request.params.id);
+      if (result.state !== previous && result.state !== 'saved') {
+        if (result.state === 'error' || result.state === 'refused') logger.warn(result.message);
+        else logger.info(result.message);
+      }
+      return result;
+    }
   );
   server.get<{ Params: { id: string } }>(
     '/api/douyin/login/:id/qr',
@@ -213,7 +239,7 @@ export async function createConsoleServer(
         statusCode: 409
       });
     control.recover('web console requested reconnect');
-    control.record('手动重连抖音会话');
+    logger.info('手动重连抖音会话');
     return { ok: true };
   });
   return server;

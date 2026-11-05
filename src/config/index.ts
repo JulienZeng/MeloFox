@@ -14,7 +14,8 @@ const ConfigSchema = z.object({
   app: z.object({
     selfId: z.string().min(1),
     logLevel: z.string().default('info'),
-    logFormat: z.enum(['pretty', 'json']).default('pretty')
+    logFormat: z.enum(['pretty', 'json']).default('pretty'),
+    logMessageContent: z.boolean().default(true)
   }),
   browser: z.object({
     userDataDir: z.string().min(1),
@@ -115,7 +116,8 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
       ...config.app,
       selfId: envString('APP_SELF_ID') ?? config.app.selfId,
       logLevel: envString('APP_LOG_LEVEL') ?? config.app.logLevel,
-      logFormat: (envString('APP_LOG_FORMAT') as AppConfig['app']['logFormat'] | undefined) ?? config.app.logFormat
+      logFormat: (envString('APP_LOG_FORMAT') as AppConfig['app']['logFormat'] | undefined) ?? config.app.logFormat,
+      logMessageContent: envBoolean('APP_LOG_MESSAGE_CONTENT') ?? config.app.logMessageContent
     },
     browser: {
       ...config.browser,

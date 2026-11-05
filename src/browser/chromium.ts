@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import type { AppConfig } from '../config/index.js';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import { SessionCleanupError } from '../runtime/supervisor.js';
 import { installDouyinInjection } from './injection.js';
 import { attachNetworkDiagnostics, type NetworkEvent } from './network.js';
@@ -71,6 +71,7 @@ export async function startBrowserRuntime(
   logger: AppLogger,
   options: { onNetworkEvent?: (event: NetworkEvent) => void } = {}
 ): Promise<BrowserRuntime> {
+  logger = scopedLogger(logger, 'Chromium');
   logger.info(
     {
       userDataDir: config.browser.userDataDir,
@@ -120,7 +121,7 @@ async function attachBrowserRuntime(
 
   const networkRecorder = attachNetworkDiagnostics(page, logger);
   const unsubscribe = options.onNetworkEvent
-    ? networkRecorder.subscribe(options.onNetworkEvent, error => logger.error({ error }, 'network event subscriber failed'))
+    ? networkRecorder.subscribe(options.onNetworkEvent, error => logger.error({ error }, '浏览器网络事件处理失败'))
     : undefined;
 
   await page.goto(config.douyin.messagePageUrl, {
@@ -469,9 +470,9 @@ async function fitBrowserWindow(context: BrowserContext, page: Page, logger: App
       height: Math.max(1, available.height - 32)
     } });
     const { bounds } = await session.send('Browser.getWindowBounds', { windowId });
-    logger.info({ available, bounds }, 'headed browser window fitted to available screen; viewport follows window');
+    logger.info({ available, bounds }, '浏览器窗口已适配当前屏幕');
   } catch (error) {
-    logger.warn({ error }, 'could not fit headed browser window to screen');
+    logger.warn({ error }, '浏览器窗口尺寸调整失败');
   } finally {
     await session.detach();
   }

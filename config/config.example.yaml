@@ -9,6 +9,8 @@ app:
   logLevel: "info"
   # pretty：易读文本；json：结构化日志。Docker 与本机默认一致。
   logFormat: "pretty"
+  # 收发日志是否显示最多 180 字符的内容摘要；false 仅显示对象和消息类型。
+  logMessageContent: true
 
 browser:
   userDataDir: "./douyin-profile"

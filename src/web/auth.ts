@@ -74,7 +74,7 @@ export class ConsoleCredentials {
       }
       if (!password) throw new Error('初始管理密码为空，请检查 admin-token 或 WEB_TOKEN');
       await chmod(tokenFile, 0o600);
-      logger.info({ tokenFile }, 'initial console password is stored in this file; username: melofox');
+      logger.info({ tokenFile }, '管理台初始账号为 melofox，初始密码已写入文件');
     }
     const salt = randomBytes(16).toString('hex');
     const record: CredentialRecord = { version: 1, algorithm: 'scrypt', username: 'melofox', salt,
@@ -160,6 +160,7 @@ export async function registerConsoleAuthentication(server: FastifyInstance, con
     const verifiedRevision = await credentials.verify(body.username, body.password);
     if (!verifiedRevision || verifiedRevision !== credentials.currentRevision) return reply.code(401).send({ message: '账号或密码不正确' });
     attempts.delete(request.ip);
+    logger.info({ username: credentials.session().username }, '管理台登录成功');
     const previous = sessionOf(request); if (previous) sessions.delete(previous);
     return issue(request, reply);
   });
@@ -169,12 +170,14 @@ export async function registerConsoleAuthentication(server: FastifyInstance, con
     const session = sessions.get(sessionOf(request) ?? '');
     if (!session) throw failure('请先登录管理台', 401);
     await credentials.change(request.body, session.revision);
+    logger.info('管理账号凭据已更新，其他管理会话已退出');
     sessions.clear();
     attempts.delete(request.ip);
     return issue(request, reply);
   });
   server.post('/api/auth/logout', async (request, reply) => {
     const id = sessionOf(request); if (id) sessions.delete(id);
+    logger.info('已退出管理台');
     reply.header('Set-Cookie', 'dy_console=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
     return { ok: true };
   });

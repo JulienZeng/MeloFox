@@ -111,6 +111,14 @@ export class UncertainSendError extends Error {
   }
 }
 
+/** An expected lookup miss, distinct from transport failures and programming errors. */
+export class MessageUnavailableError extends Error {
+  constructor(readonly messageId: string, reason: string) {
+    super(`消息 ${messageId} 无法读取：${reason}`);
+    this.name = 'MessageUnavailableError';
+  }
+}
+
 export interface DouyinOutgoingMention {
   userId: string;
   name?: string;

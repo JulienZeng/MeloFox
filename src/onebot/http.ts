@@ -3,7 +3,7 @@ import type { BrowserRuntime } from '../browser/chromium.js';
 import type { DouyinBridge } from '../douyin/bridge.js';
 import type { AppConfig } from '../config/index.js';
 import { decodeNetworkResponseBodies, extractRealtimeMessageCandidates } from '../douyin/protobuf.js';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import type { RealtimeMessageProcessor } from '../douyin/realtime.js';
 import type { MediaRegistry } from '../media/registry.js';
 import { supportsOneBotAction, type OneBotActionRouter } from './actions.js';
@@ -25,6 +25,7 @@ export async function startOneBotHttpServer(
   realtime?: RealtimeMessageProcessor,
   bridge?: DouyinBridge
 ): Promise<HttpServerRuntime> {
+  logger = scopedLogger(logger, 'OneBot HTTP');
   const server = Fastify({ routerOptions: { ignoreTrailingSlash: true } });
   const apiError = (message: string, statusCode = 400) => Object.assign(new Error(message), { statusCode });
   const object = (value: unknown): value is Record<string, unknown> => Boolean(value) &&

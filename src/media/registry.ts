@@ -6,7 +6,7 @@ import { extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { AppConfig } from '../config/index.js';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import { z } from 'zod';
 import { readCacheJson, writeCacheJson } from '../runtime/cache-file.js';
 import { decodeDouyinImage, imageFormat, type ImageFormat } from './image.js';
@@ -64,9 +64,10 @@ export class MediaRegistry {
     private readonly config: AppConfig,
     private readonly logger?: AppLogger
   ) {
+    this.logger = logger && scopedLogger(logger, '媒体');
     this.cacheDir = resolve(process.cwd(), config.onebot.mediaCache.dir);
     this.cleanupTimer = setInterval(() => {
-      void this.cleanupExpired().catch(error => this.logger?.warn({ error }, 'media cache cleanup failed'));
+      void this.cleanupExpired().catch(error => this.logger?.warn({ error }, '媒体缓存清理失败'));
     }, config.onebot.mediaCache.cleanupIntervalMs);
     this.cleanupTimer.unref();
   }
@@ -104,7 +105,7 @@ export class MediaRegistry {
         }
       }
     } catch (error) {
-      this.logger?.warn({ error }, 'media index cannot be restored; cleaning owned orphan files');
+      this.logger?.warn({ error }, '媒体索引恢复失败，正在清理无索引的缓存文件');
     }
     await this.pruneCompleted();
     await this.sweepOrphans();
@@ -262,7 +263,7 @@ export class MediaRegistry {
             this.readers.delete(item.id);
             if (this.retired.delete(item.id)) await rm(item.filePath, { force: true });
           }
-        }).catch(error => this.logger?.warn({ error }, 'media reader cleanup failed'));
+        }).catch(error => this.logger?.warn({ error }, '媒体读取资源清理失败'));
       });
       return { item, size: info.size, range, stream };
     });
@@ -502,7 +503,7 @@ export class MediaRegistry {
       await writeFile(downloadPath, buffer, { mode: 0o600 });
       this.logger?.debug(
         { id, bytes: buffer.length, contentType: resolvedContentType, sourceHost: safeUrlHost(sourceUrl) },
-        'downloaded media candidate'
+        '媒体资源已下载'
       );
 
       if (transcodeImage) {
@@ -536,7 +537,7 @@ export class MediaRegistry {
         const keptPath = await preserveDebugFile(downloadPath, `${filePath}.normalize.failed`);
         this.logger?.warn(
           { id, keptPath, ffmpeg: truncate(normalized.stderr ?? '', 4000) },
-          'failed to normalize cached video media'
+          '视频格式转换失败'
         );
         throw new Error('Failed to normalize video media');
       }

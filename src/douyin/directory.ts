@@ -1,7 +1,7 @@
 import { resolve } from 'node:path';
 import protobuf from 'protobufjs';
 import type { Page } from 'playwright';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import type { ActionDeadline } from '../runtime/deadline.js';
 import type { DouyinConversation, DouyinGroupMember, DouyinSendTarget, DouyinUser } from './types.js';
 import { groupMutation, verifyGroupMutation, type GroupOperation } from './group-management.js';
@@ -126,7 +126,9 @@ export class DouyinDirectory {
     private readonly request: DirectoryRequester,
     private readonly logger: AppLogger,
     private readonly timeoutMs = 15000
-  ) {}
+  ) {
+    this.logger = scopedLogger(logger, '会话目录');
+  }
 
   get accountId(): string | undefined { return this.selfId; }
   get loggedIn(): boolean { return this.authenticated; }
@@ -135,6 +137,10 @@ export class DouyinDirectory {
     // A single authenticated init page verifies the account without replaying history or refreshing every profile.
     const response = await this.query(2043, 'InitRequest', { page: 0 }, 'v1/message/get_message_by_init', 1);
     if (!response.body?.messageByInit) throw new Error('Douyin session probe has no conversation page');
+  }
+
+  getCachedConversation(id: string): DouyinConversation | undefined {
+    return this.conversations.get(id) ?? [...this.conversations.values()].find(item => item.shortId === id);
   }
 
   getCachedUser(userId: string): DouyinUser | undefined {
@@ -181,7 +187,7 @@ export class DouyinDirectory {
         for (const [id, conversation] of found) this.conversations.set(id, conversation);
         this.refreshedAt = Date.now();
         await this.enrichConversations([...found.values()]);
-        this.logger.info({ conversations: found.size }, 'loaded douyin conversations through imapi');
+        this.logger.info({ conversations: found.size }, '抖音会话列表已加载');
         return;
       }
       if (!result.nextInitVersion || seenVersions.has(result.nextInitVersion)) throw new Error('Douyin conversation pagination did not advance');
@@ -315,7 +321,7 @@ export class DouyinDirectory {
     }
     const current = this.conversations.get(conversation.id);
     if (current) this.conversations.set(conversation.id, { ...current, name: core.name });
-    this.logger.info({ groupId }, 'updated douyin group name through imapi');
+    this.logger.info({ groupId }, '操作 -> 群名称已更新');
   }
 
   async getGroupMembers(groupId: string, noCache = false, deadline?: ActionDeadline): Promise<DouyinGroupMember[]> {
@@ -473,7 +479,7 @@ export class DouyinDirectory {
         }
       } catch (error) {
         if (noCache) throw error;
-        this.logger.warn({ error, count: batch.length }, 'could not enrich douyin user profiles; keeping real user IDs');
+        this.logger.warn({ error, count: batch.length }, '用户资料补充失败，保留真实用户 ID');
       }
     }
   }

@@ -3,7 +3,7 @@ import OverviewView from "./views/OverviewView.vue";
 import AccountView from "./views/AccountView.vue";
 import ChannelsView from "./views/ChannelsView.vue";
 import SettingsView from "./views/SettingsView.vue";
-import ActivityView from "./views/ActivityView.vue";
+import LogsView from "./views/LogsView.vue";
 
 export const router = createRouter({
   history: createWebHashHistory(),
@@ -13,7 +13,8 @@ export const router = createRouter({
     { path: "/account", name: "account", component: AccountView },
     { path: "/channels", name: "channels", component: ChannelsView },
     { path: "/settings", name: "settings", component: SettingsView },
-    { path: "/activity", name: "activity", component: ActivityView },
+    { path: "/logs", name: "logs", component: LogsView },
+    { path: "/activity", redirect: "/logs" },
     { path: "/:pathMatch(.*)*", redirect: "/overview" },
   ],
 });

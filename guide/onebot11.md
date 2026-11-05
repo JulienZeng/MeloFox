@@ -18,7 +18,7 @@ MeloFox（音狐）支持 **OneBot 11**，将抖音群聊和已有私聊接入�
 | `send_group_msg` | 已接通；抖音实际权限及风控决定是否成功 |
 | `send_msg` | 已接通；按 message_type 或目标字段路由 |
 | `delete_msg` | 已接通；只撤回当前账号自己发送的消息 |
-| `get_msg` | 已接通；缓存优先，远端查询需要已有会话上下文；消息中已知的发送者群名片/角色随缓存持久化、重启恢复 |
+| `get_msg` | 已接通；缓存优先，缺失时利用已接收消息的引用或本账号发送记录定位会话并查询原消息；也支持显式指定已有会话。消息中已知的发送者群名片/角色随缓存持久化、重启恢复 |
 | `get_forward_msg` | 已接通；标准 `message` 为 node 数组，同时保留插件兼容 `messages`；可读取内联/加密转发记录 |
 | `send_like` | 无已确认的同义能力；QQ 好友赞不映射成作品点赞或表情回应 |
 | `set_group_kick` | 已接通，cmd 651；`reject_add_request=false`。true 无永久拒绝入群映射，操作前拒绝 |
@@ -189,7 +189,7 @@ ID 推荐始终使用字符串。作品短链接可通过 `resolve_douyin_share`
 | `get_forward_msg` | `id` 为当前账号缓存中的合并转发卡消息 ID；标准 `message` 为 node 数组，同时保留兼容 `messages`；含内联或经认证解密的记录，不把转发内记录作为新消息入库或上报 |
 | `get_douyin_history` | `user_id` 或 `conversation_id`（已有会话），`cursor` 默认 `"0"`、`count` 1–100、`direction` 1/2/3；返回 `next_cursor`、`has_more` |
 | `search_douyin_messages` | 同上，加 `keyword`；在当前返回页匹配文本，继续翻页由调用方决定 |
-| `get_msg` | 优先缓存；缺失时需补 `user_id`/`conversation_id`，按原 ID 查询；媒体缓存过期可修复 |
+| `get_msg` | 优先缓存；仅传 `message_id` 时，可利用内存中已接收消息的引用或本账号发送记录补查原消息；没有会话线索时需补 `user_id`/`group_id`/`conversation_id`。查询不重放消息事件，也不延长原消息的本地保留期限；媒体缓存过期可修复 |
 | `get_douyin_read_state` | 已有会话，返回自己的已读索引、参与者索引和未读数；未知未读数返回 `null` |
 | `mark_douyin_read` | 显式标记已有会话已读；收消息和历史查询不会自动标记 |
 | `get_douyin_send_result` | `client_message_id`，返回 `sent`、`rejected` 或 `unknown`；未知不会自动重发 |

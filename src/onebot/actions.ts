@@ -1,3 +1,4 @@
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import { mediaDownloadOptions, type MediaDownloadOptions } from '../media/outgoing.js';
 import { DeferredActions } from './deferred-actions.js';
 import type { AppConfig } from '../config/index.js';
@@ -10,7 +11,7 @@ import { toOneBotMessageEvent } from './events.js';
 import { parseCqMessage } from './cq.js';
 import { outgoingEmojiToken, qqFaceNames } from '../douyin/emoji.js';
 import { buildShareContent, nativeSourceId, numericId, type DouyinShareSendInput } from '../douyin/native-message.js';
-import { PartialSendError, UncertainSendError } from '../douyin/types.js';
+import { MessageUnavailableError, PartialSendError, UncertainSendError } from '../douyin/types.js';
 import { ActionDeadline } from '../runtime/deadline.js';
 import { getVersionInfo } from '../runtime/version.js';
 import type { DouyinSendTarget, DouyinEmojiReaction, DouyinMessage, DouyinGroupMember } from '../douyin/types.js';
@@ -65,10 +66,14 @@ export class OneBotActionRouter {
   constructor(
     private readonly config: AppConfig,
     private readonly bridge: DouyinBridge,
-    private readonly mediaRegistry?: MediaRegistry
-  ) {}
+    private readonly mediaRegistry?: MediaRegistry,
+    private readonly logger?: AppLogger
+  ) {
+    this.logger = logger && scopedLogger(logger, 'OneBot API');
+  }
 
   async handle(request: OneBotActionRequest): Promise<OneBotActionResponse> {
+    const started = Date.now();
     try {
       if (!request || typeof request.action !== 'string' || !request.action ||
         (request.params !== undefined && (!request.params || typeof request.params !== 'object' || Array.isArray(request.params) || isLosslessNumber(request.params)))) {
@@ -91,9 +96,13 @@ export class OneBotActionRouter {
         return { status: 'async', retcode: 1, data: null, echo: request.echo };
       }
       const data = await this.dispatch(request);
+      this.logger?.debug?.({ action: request.action, durationMs: Date.now() - started }, 'OneBot 接口执行完成');
       if (request.action === 'set_restart') return { status: 'async', retcode: 1, data: null, echo: request.echo };
       return ok(data, request.echo);
     } catch (error) {
+      if (error instanceof MessageUnavailableError) {
+        this.logger?.warn({ action: request?.action, messageId: error.messageId, reason: error.message }, 'OneBot 消息查询未完成');
+      } else this.logger?.warn({ action: request?.action, durationMs: Date.now() - started, error }, 'OneBot 接口执行失败');
       const message = error instanceof Error ? error.message : String(error);
       let cause = error, unknown: UncertainSendError | undefined;
       for (let depth = 0; depth < 8 && cause instanceof Error; depth++, cause = cause.cause) {
@@ -509,13 +518,15 @@ export class OneBotActionRouter {
   private async getMsg(params: Record<string, unknown>): Promise<unknown> {
     const messageId = requireString(params, 'message_id');
     let cached = this.bridge.getCachedMessage(messageId);
-    if (!cached && (params.user_id || params.group_id || params.conversation_id)) {
-      cached = await this.bridge.fetchMessage(messageId, { type: params.group_id ? 'group' : 'private',
+    if (!cached) {
+      const target: DouyinSendTarget | undefined = (params.user_id || params.group_id || params.conversation_id) ? { type: params.group_id ? 'group' : 'private',
         userId: params.user_id ? requireString(params, 'user_id') : undefined,
-        conversationId: params.conversation_id ? requireString(params, 'conversation_id') : params.group_id ? requireString(params, 'group_id') : undefined });
+        conversationId: params.conversation_id ? requireString(params, 'conversation_id') : params.group_id ? requireString(params, 'group_id') : undefined }
+        : this.bridge.getMessageTarget?.(messageId);
+      if (target) cached = await this.bridge.fetchMessage(messageId, target);
     }
     if (!cached) {
-      throw new Error(`Message not found in cache: ${messageId}`);
+      throw new MessageUnavailableError(messageId, '当前账号没有可用缓存或引用会话信息，请提供 user_id、group_id 或 conversation_id');
     }
 
     if ((cached.messageType === 150 || cached.messageType === 27) && this.mediaRegistry) {

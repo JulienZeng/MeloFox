@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import type { AppConfig } from '../config/index.js';
 import type { DouyinBridgeCache } from '../douyin/bridge.js';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import { cleanupCacheTemps, readCacheJson, writeCacheJson } from './cache-file.js';
 import type { CacheEntry } from './bounded-cache.js';
 import type { CacheArchive, RetainedCache } from './retained-cache.js';
@@ -85,6 +85,7 @@ export class MessageCacheStore {
   private initialized = false;
 
   constructor(private readonly cache: DouyinBridgeCache, private readonly config: AppConfig, private readonly logger: AppLogger) {
+    this.logger = scopedLogger(logger, '消息缓存');
     this.path = resolve(config.runtime.messageCacheDir, 'messages.json');
     this.recordsDir = resolve(config.runtime.messageCacheDir, 'records');
     this.cache.persist = config.runtime.messageCachePersist ? () => this.flush() : undefined;
@@ -123,10 +124,10 @@ export class MessageCacheStore {
           this.deleteRecord('sentTargets', key);
         }
         this.logger.info({ messages: this.records.get('messages')!.size,
-          recalls: this.records.get('recalls')!.size }, 'restored message index; waiting for account verification');
+          recalls: this.records.get('recalls')!.size }, '消息索引已恢复，等待账号验证');
       }
     } catch (error) {
-      this.logger.warn({ error }, 'message cache index cannot be restored; starting with empty memory cache');
+      this.logger.warn({ error }, '消息索引恢复失败，将使用空缓存启动');
     }
     for (const kind of kinds) {
       const collection = this.cache[kind] as RetainedCache<unknown>;
@@ -144,7 +145,7 @@ export class MessageCacheStore {
     }
     await this.sweepOrphans();
     this.timer = setInterval(() => {
-      void this.flush().catch(error => this.logger.error({ error }, 'message cache persistence failed'));
+      void this.flush().catch(error => this.logger.error({ error }, '消息缓存保存失败'));
     }, this.config.runtime.messageCacheFlushIntervalMs);
     this.timer.unref();
   }
@@ -237,7 +238,7 @@ export class MessageCacheStore {
       if (expiresAt <= Date.now()) { this.deleteRecord(kind, key); return undefined; }
       return { key, value, expiresAt };
     } catch (error) {
-      this.logger.warn({ error, kind, key }, 'message cache record cannot be read');
+      this.logger.warn({ error, kind, key }, '消息缓存记录读取失败');
       this.deleteRecord(kind, key);
       return undefined;
     }

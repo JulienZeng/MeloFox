@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { EventOutbox } from './outbox.js';
 import type { IncomingMessage } from 'node:http';
 import type { AppConfig } from '../config/index.js';
-import type { AppLogger } from '../logger/index.js';
+import { scopedLogger, type AppLogger } from '../logger/index.js';
 import type { OneBotActionRouter } from './actions.js';
 import type { OneBotActionRequest, OneBotEvent } from './types.js';
 import { lifecycleEvent } from './events.js';
@@ -32,7 +32,9 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     private readonly config: AppConfig,
     private readonly logger: AppLogger,
     private readonly router: OneBotActionRouter
-  ) {}
+  ) {
+    this.logger = scopedLogger(logger, 'OneBot WS');
+  }
 
   async start(): Promise<void> {
     this.stopped = false;
@@ -106,14 +108,14 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
     });
 
     server.on('connection', (socket, request) => {
-      socket.on('error', error => this.logger.warn({ error }, 'onebot forward websocket error'));
+      socket.on('error', error => this.logger.warn({ error }, '正向 WebSocket 客户端连接异常'));
       if (this.stopped) { socket.terminate(); return; }
       if (!this.isAuthorized(request)) {
         socket.close(1008, 'Unauthorized');
         return;
       }
 
-      this.addClient(socket, 'forward websocket client connected', 'forward');
+      this.addClient(socket, 'OneBot 正向 WebSocket 客户端已连接', 'forward');
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -122,14 +124,14 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
       server.once('error', onError);
       server.once('listening', onListening);
     });
-    server.on('error', error => this.logger.warn({ error }, 'onebot forward websocket server error'));
+    server.on('error', error => this.logger.warn({ error }, '正向 WebSocket 服务异常'));
     this.servers.push(server);
     this.logger.info(
       {
         host: this.config.onebot.forwardWs.host,
         port: this.config.onebot.forwardWs.port
       },
-      'onebot forward websocket server started'
+      'OneBot 正向 WebSocket 服务已启动'
     );
   }
 
@@ -193,7 +195,8 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
       void this.handleMessage(socket, payload.toString());
     });
 
-    socket.on('close', () => {
+    socket.on('close', (code) => {
+      if (kind === 'forward' && !this.stopped) this.logger.info({ closeCode: code }, 'OneBot 正向 WebSocket 客户端已断开');
       this.clients.delete(socket);
       this.kinds.delete(socket);
     });
@@ -213,7 +216,7 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
         catch { clearTimeout(timer); resolve(false); }
       })));
       return results.every(Boolean);
-    }).catch(error => this.logger.error({ error }, 'OneBot event replay failed; pending events retained'));
+    }).catch(error => this.logger.error({ error }, 'OneBot 事件补发失败，未完成事件已保留'));
   }
 
   private async handleMessage(socket: WebSocket, payload: string): Promise<void> {
@@ -242,7 +245,7 @@ export class OneBotWebSocketHub implements OneBotWebSocketRuntime {
   private send(socket: WebSocket, value: unknown): void {
     if (this.stopped || socket.readyState !== WebSocket.OPEN) return;
     socket.send(stringifyOneBotJson(value), error => {
-      if (error) this.logger.warn({ error }, 'onebot websocket send failed');
+      if (error) this.logger.warn({ error }, 'OneBot WebSocket 发送失败');
     });
   }
 

@@ -79,14 +79,14 @@ export async function enrichRealtimeVideoUrl(
 
   const videoKey = extractDouyinVideoKey(parsedContent);
   if (!videoKey) {
-    logger.warn({ messageId: candidate.serverMessageId }, 'douyin video message has no tkey or vid');
+    logger.warn({ messageId: candidate.serverMessageId }, '视频消息缺少必要的资源标识');
     return candidate;
   }
 
   const videoSkey = extractDouyinVideoSkey(parsedContent);
-  logger.info(
-    { messageId: candidate.serverMessageId, videoKey, hasSkey: Boolean(videoSkey) },
-    'resolving douyin video media'
+  logger.debug?.(
+    { messageId: candidate.serverMessageId },
+    '正在解析视频资源'
   );
 
   signal.throwIfAborted();

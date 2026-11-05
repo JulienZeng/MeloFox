@@ -103,7 +103,7 @@ export class RealtimeMessageProcessor {
   enqueue(event: NetworkEvent): boolean {
     if (this.stopped) return false;
     try { if (!isRealtimeNetworkEvent(event)) return false; }
-    catch (error) { this.options.logger.warn({ error }, 'invalid realtime event URL'); return false; }
+    catch (error) { this.options.logger.warn({ error }, '实时事件地址无效'); return false; }
     if (this.events.length >= this.queueLimit) {
       this.overflow('network event');
       return false;
@@ -206,13 +206,13 @@ export class RealtimeMessageProcessor {
             try { await this.accept(candidate); }
             catch (error) {
               this.counters.parseFailures += 1;
-              this.options.logger.warn({ error, messageId: candidate.serverMessageId }, 'failed to process one realtime message');
+              this.options.logger.warn({ error, messageId: candidate.serverMessageId }, '实时消息处理失败');
             }
           }
         }
       } catch (error) {
         this.counters.parseFailures += 1;
-        this.options.logger.warn({ error, eventType: event.type }, 'failed to decode one realtime event');
+        this.options.logger.warn({ error, eventType: event.type }, '实时事件解析失败');
       } finally { this.counters.processedEvents += 1; }
     }
   }
@@ -251,7 +251,7 @@ export class RealtimeMessageProcessor {
     if (this.waitForDetail(job.candidate)) {
       job.timer = setTimeout(() => {
         if (job.candidate.messageType === 7) {
-          this.options.logger.warn({ messageId: id }, 'text message detail timed out; reporting a fallback');
+          this.options.logger.warn({ messageId: id }, '文本详情获取超时，使用已有内容上报');
         }
         this.track(this.ready(job));
       }, this.detailWaitMs);
@@ -292,7 +292,7 @@ export class RealtimeMessageProcessor {
       state.emitted = true;
     } catch (error) {
       this.counters.deliveryFailures += 1;
-      this.options.logger.error({ error, messageId: id }, 'failed to deliver recall notice');
+      this.options.logger.error({ error, messageId: id }, '撤回通知上报失败');
     } finally {
       this.notifyIdle();
     }
@@ -338,7 +338,7 @@ export class RealtimeMessageProcessor {
       if (this.stopped || job.recalled) return;
       this.counters.mediaFailures += 1;
       if ([5, 17, 27, 150].includes(candidate.messageType ?? 0)) candidate = { ...candidate, mediaUnavailable: true, mediaUrl: undefined };
-      this.options.logger.warn({ error, messageId: candidate.serverMessageId }, 'media enrichment failed; reporting original message');
+      this.options.logger.warn({ error, messageId: candidate.serverMessageId }, '媒体详情补充失败，使用原始消息上报');
     } finally {
       clearTimeout(timer);
       this.controllers.delete(controller);
@@ -359,14 +359,14 @@ export class RealtimeMessageProcessor {
       this.counters.emittedMessages += 1;
     } catch (error) {
       this.counters.deliveryFailures += 1;
-      this.options.logger.error({ error, messageId: message.messageId }, 'failed to deliver one realtime message');
+      this.options.logger.error({ error, messageId: message.messageId }, '实时消息上报失败');
     }
   }
 
   private track(task: Promise<void>): void {
     const tracked = task.catch(error => {
       this.counters.deliveryFailures += 1;
-      this.options.logger.error({ error }, 'realtime background task failed');
+      this.options.logger.error({ error }, '消息接收后台任务失败');
     }).finally(() => { this.tasks.delete(tracked); this.notifyIdle(); });
     this.tasks.add(tracked);
   }
@@ -389,7 +389,7 @@ export class RealtimeMessageProcessor {
 
   private overflow(kind: string): void {
     this.counters.overflows += 1;
-    this.options.logger.error({ kind, limit: this.queueLimit }, 'realtime queue overflow; message recovery is required');
+    this.options.logger.error({ kind, limit: this.queueLimit }, '实时消息队列已满，等待消息补偿');
   }
 
   private isIdle(): boolean {

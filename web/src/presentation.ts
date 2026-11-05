@@ -3,7 +3,7 @@ export const views = {
   overview: { label: "概览", title: "运行概览", icon: "◫" },
   account: { label: "抖音账号", title: "抖音账号", icon: "◎" },
   channels: { label: "网络配置", title: "网络配置", icon: "⇄" },
-  activity: { label: "运行记录", title: "运行记录", icon: "≡" },
+  logs: { label: "日志", title: "日志", icon: "≡" },
   settings: { label: "设置", title: "设置", icon: "⚙" },
 };
 export type ViewName = keyof typeof views;

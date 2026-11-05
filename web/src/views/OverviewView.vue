@@ -163,9 +163,9 @@ const localTime = (value: number) => new Date(value).toLocaleString("zh-CN", { h
         <RouterLink v-if="channels.length" class="text-button" to="/channels">全部通道（{{ channels.length }}） →</RouterLink>
       </article>
       <article class="dashboard-card activity-card">
-        <div class="section-heading"><h2>最近记录</h2><RouterLink class="text-button" to="/activity">查看全部 →</RouterLink></div>
-        <div v-for="(item, index) in state.data!.activity.slice(0, 5)" :key="item.time + '-' + index" class="activity-row"><time>{{ new Date(item.time).toLocaleTimeString('zh-CN') }}</time><span>{{ item.message }}</span></div>
-        <p v-if="!state.data!.activity.length" class="muted">暂无记录</p>
+        <div class="section-heading"><h2>最近日志</h2><RouterLink class="text-button" to="/logs">查看全部 →</RouterLink></div>
+        <div v-for="(item, index) in [...(state.data!.logs || [])].reverse()" :key="item.time + '-' + index" class="activity-row"><time>{{ item.time.slice(11, 19) }}</time><span :class="'recent-log-' + item.level"><b>[{{ item.scope }}]</b> {{ item.message }}</span></div>
+        <p v-if="!state.data!.logs?.length" class="muted">暂无日志</p>
       </article>
     </div>
     <details class="metrics-help"><summary>指标说明</summary><p>系统指标反映运行环境可见的资源；容器中可能显示宿主机或虚拟机总量。MeloFox 主进程与 Chromium 进程组分别统计。Chromium 包含本实例报告的浏览器、渲染器、GPU 和工具进程；常驻内存为各进程 RSS 之和，共享页可能重复计入。</p><p>进程 CPU 按单个逻辑核心计量，可超过 100%。新建或退出进程的当次采样标记为部分数据。内存的 ArrayBuffer 包含在外部内存中；环境内存限制与系统总量分别展示。不可读取的指标显示为“—”。通道总数等于就绪、等待、异常、停用四类之和。</p></details>
@@ -244,6 +244,9 @@ progress::-moz-progress-bar { background:var(--accent); border-radius:10px; }
 .network-interface p:last-child { margin-bottom:0; }
 .network-interface p span { color:var(--muted); flex-shrink:0; }
 .network-interface code { overflow-wrap:anywhere; }
+.recent-log-error, .recent-log-fatal { color:var(--error-text); }
+.recent-log-warn { color:var(--warning-text); }
+.activity-row b { font-weight:500; }
 .activity-row { grid-template-columns:85px minmax(0,1fr); font-size:var(--text-14); }
 .metrics-help { font-size:var(--text-14); color:var(--muted); }
 .metrics-help p { margin-top:10px; line-height:1.7; }
