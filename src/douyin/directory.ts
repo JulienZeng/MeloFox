@@ -117,6 +117,7 @@ export class DouyinDirectory {
   private readonly memberCache = new Map<string, { time: number; members: DouyinGroupMember[] }>();
   private readonly memberSnapshots = new Map<string, DouyinGroupMember[]>();
   private refreshedAt = 0;
+  private loadedConversationIds?: Set<string>;
   private refreshPromise?: Promise<void>;
   private selfId?: string;
   private authenticated = false;
@@ -187,7 +188,20 @@ export class DouyinDirectory {
         for (const [id, conversation] of found) this.conversations.set(id, conversation);
         this.refreshedAt = Date.now();
         await this.enrichConversations([...found.values()]);
-        this.logger.info({ conversations: found.size }, '抖音会话列表已加载');
+        // Track completed snapshots separately from cache expiry and individual conversation lookups.
+        const previous = this.loadedConversationIds;
+        if (!previous) {
+          this.logger.info({ conversations: found.size }, '抖音会话列表已加载');
+        } else {
+          const added = [...found.keys()].filter(id => !previous.has(id)).length;
+          const removed = [...previous].filter(id => !found.has(id)).length;
+          if (added || removed) {
+            this.logger.info({ conversations: found.size }, `抖音会话列表已更新：新增 ${added} 个，移除 ${removed} 个`);
+          } else {
+            this.logger.debug?.({ conversations: found.size }, '抖音会话列表已刷新，无变化');
+          }
+        }
+        this.loadedConversationIds = new Set(found.keys());
         return;
       }
       if (!result.nextInitVersion || seenVersions.has(result.nextInitVersion)) throw new Error('Douyin conversation pagination did not advance');
@@ -212,6 +226,7 @@ export class DouyinDirectory {
         this.memberCache.clear();
         this.memberSnapshots.clear();
         this.refreshedAt = 0;
+        this.loadedConversationIds = undefined;
       }
       this.selfId = response.reqUserId;
       this.authenticated = true;
