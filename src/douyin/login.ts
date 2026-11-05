@@ -50,10 +50,8 @@ const common = {
   aid: '6383',
   account_sdk_source: 'web',
   passport_jssdk_type: 'normal',
-  passport_jssdk_version: '4.4.7',
   is_from_ttaccountsdk: '1',
   is_from_iesaccountsaas: '1',
-  p_ui: '2.4.10',
   is_new_login: '1'
 };
 export class PassportError extends Error {
@@ -87,60 +85,19 @@ export function browserPassportTransport(
     try { return await invokeLoginSdk(page, operation); }
     catch (error) {
       const text = error instanceof Error ? error.message : '';
-      const safe = text.match(/(?:官方登录 SDK[^\n]*|官方短信验证能力不可用|验证会话已失效，请重新获取二维码|抖音验证失败（\d+）[^\n]*|官方验证请求未完成[^\n]*)/)?.[0];
+      const safe = text.match(/(?:官方登录 SDK[^\n]*|官方短信验证[^\n]*|请先完成短信验证码校验|验证会话已失效，请重新获取二维码|抖音验证失败（\d+）[^\n]*|官方验证请求未完成[^\n]*)/)?.[0];
       throw new PassportError(safe ?? '官方验证请求未完成，请使用官方页面辅助验证');
     }
   };
   return {
     async request(path, method, params, form) {
-      let sdkUnavailable = false;
-      if (path === '/passport/web/check_qrconnect/' && form) {
-        const result = await sdk({ kind: 'check', params, form });
-        if (!result.sdkUnavailable) return result;
-        sdkUnavailable = true;
+      if (path === '/passport/web/get_qrcode/' && method === 'GET') {
+        return sdk({ kind: 'create', params });
       }
-      const result = await browser().page.evaluate(
-        async ({ path, method, params, form }) => {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 15000);
-          try {
-            const url = new URL(path, location.origin);
-            url.search = new URLSearchParams(params).toString();
-            const csrf =
-              document.cookie
-                .split(';')
-                .map((v) => v.trim())
-                .find((v) => v.startsWith('passport_csrf_token='))
-                ?.split('=')
-                .slice(1)
-                .join('=') ?? '';
-            const response = await fetch(url.toString(), {
-              method,
-              credentials: 'include',
-              signal: controller.signal,
-              headers: {
-                Accept: 'application/json',
-                ...(csrf ? { 'x-tt-passport-csrf-token': csrf } : {}),
-                ...(form
-                  ? { 'Content-Type': 'application/x-www-form-urlencoded' }
-                  : {})
-              },
-              body: form ? new URLSearchParams(form).toString() : undefined
-            });
-            return { status: response.status, text: await response.text() };
-          } finally {
-            clearTimeout(timer);
-          }
-        },
-        { path, method, params, form }
-      );
-      if (result.status !== 200)
-        throw new PassportError(`抖音登录接口返回 HTTP ${result.status}`);
-      try {
-        return { ...JSON.parse(result.text), ...(sdkUnavailable ? { sdkMfa: false } : {}) };
-      } catch {
-        throw new PassportError('抖音登录接口未返回有效 JSON');
+      if (path === '/passport/web/check_qrconnect/' && method === 'POST' && form) {
+        return sdk({ kind: 'check', params, form });
       }
+      throw new PassportError('不支持的抖音登录操作');
     },
     cancel: async () => { const current = getBrowser(); if (current && !current.page.isClosed() && new URL(current.page.url()).origin === 'https://www.douyin.com') await invokeLoginSdk(current.page, { kind: 'cancel' }); },
     sendCode: challenge => sdk({ kind: 'sendCode', challenge }),
@@ -312,7 +269,8 @@ export class DouyinLogin {
       const attempt = this.attempt!;
       if (
         !['waiting', 'scanned', 'confirmed'].includes(attempt.state) ||
-        this.now() - attempt.checkedAt < 2000
+        // Allow the console's 400 ms cadence, with room for timer/network jitter.
+        this.now() - attempt.checkedAt < 300
       )
         return this.status()!;
       attempt.checkedAt = this.now();
@@ -376,9 +334,14 @@ export class DouyinLogin {
       if (!attempt.challenge || !this.transport.sendCode) throw new PassportError('请使用官方页面辅助验证');
       if (this.now() < (attempt.resendAt ?? 0)) throw Object.assign(new Error('请稍后再发送验证码'), { statusCode: 429 });
       // Reserve before the request: an ambiguous response must not result in an immediate duplicate SMS.
-      attempt.resendAt = this.now() + 60000; attempt.codeSent = true;
+      attempt.resendAt = this.now() + 60000;
       const result = await this.transport.sendCode(attempt.challenge);
-      this.unwrap({ data: result }); attempt.codeSent = true; attempt.message = '短信请求已受理，请输入验证码';
+      this.unwrap({ data: result });
+      const retrySeconds = Number(result.retry_time);
+      if (Number.isFinite(retrySeconds) && retrySeconds > 0) {
+        attempt.resendAt = this.now() + Math.max(60, Math.min(retrySeconds, 600)) * 1000;
+      }
+      attempt.codeSent = true; attempt.message = '短信请求已受理，请输入验证码';
       return this.status()!;
     });
   }

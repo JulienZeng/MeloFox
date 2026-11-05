@@ -88,7 +88,6 @@ onUnmounted(() => {
         >
           <span>⇥</span> 退出管理台
         </button>
-        <span class="sidebar-version">OneBot 11 <span>v{{ state.data.runtime.version }}</span></span>
       </div>
     </aside>
     <div class="workspace">

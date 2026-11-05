@@ -34,6 +34,8 @@ export function createConsole() {
   });
   let refreshId = 0,
     loginVersion = 0;
+  let loginPolling = false;
+  let pollError = "";
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   const api = createApi(invalidate, fetch, requirePasswordChange);
   function requirePasswordChange() {
@@ -66,6 +68,7 @@ export function createConsole() {
     state.pollStopped = false;
     state.connectionError = "";
     state.loginError = "";
+    pollError = "";
     state.lastUpdated = 0;
     state.pendingChannels.clear();
     state.toast = undefined;
@@ -173,6 +176,7 @@ export function createConsole() {
     if (state.loginBusy || !state.authenticated) return;
     state.loginBusy = true;
     state.loginError = "";
+    pollError = "";
     const version = ++loginVersion;
     try {
       state.login = await api.request<ConsoleLogin>(path, {
@@ -205,12 +209,40 @@ export function createConsole() {
     if (
       !state.login ||
       state.loginBusy ||
+      loginPolling ||
       !state.authenticated ||
+      state.auth?.mustChangePassword ||
+      state.assist ||
       (!manual && state.pollStopped) ||
-      !["waiting", "scanned", "confirmed"].includes(state.login.state)
+      !["waiting", "scanned", "verifying", "choose_trust", "confirmed"].includes(state.login.state)
     )
       return;
-    await loginAction(`/api/douyin/login/${state.login.id}`, "GET");
+    const previous = state.login, version = ++loginVersion;
+    loginPolling = true;
+    // Background polling must not disable inputs or overwrite a newer user action.
+    const current = () => version === loginVersion && !state.assist && (manual || !state.pollStopped);
+    try {
+      const login = await api.request<ConsoleLogin>(`/api/douyin/login/${previous.id}`);
+      if (!current()) return;
+      state.login = login;
+      if (manual || login.state !== previous.state || (pollError && state.loginError === pollError))
+        state.loginError = "";
+      pollError = "";
+      state.pollStopped = false;
+      if (login.state === "saved") {
+        toast(login.message);
+        await refresh();
+      }
+    } catch (error) {
+      if (current() && !isCancelled(error)) {
+        pollError = state.loginError = errorMessage(error);
+        if (error instanceof ApiError && (error.code || [404, 410].includes(error.status)))
+          state.pollStopped = true;
+      }
+    } finally {
+      if (version === loginVersion) loginVersion++;
+      loginPolling = false;
+    }
   }
   async function loginStep(step: string, body?: object) {
     if (state.login)
@@ -271,8 +303,13 @@ export function createConsole() {
         void refresh();
     }, 4000);
     const loginTimer = setInterval(() => {
-      if (!document.hidden && isAccountView()) void pollLogin();
-    }, 2500);
+      if (document.hidden || !isAccountView() || !state.authenticated || state.auth?.mustChangePassword || state.assist)
+        return;
+      // Saving the session precedes the bridge reconnect; update the account card promptly too.
+      if (state.login?.state === "saved" && !state.data?.account.loggedIn) {
+        if (!state.refreshBusy && !state.loginBusy) void refresh();
+      } else void pollLogin();
+    }, 400);
     const visible = () => {
       if (!document.hidden && state.authenticated) void refresh();
     };

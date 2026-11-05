@@ -594,19 +594,6 @@ code {
   margin-left: auto;
   color: var(--muted);
 }
-.sidebar-version {
-  border-top: 1px solid var(--line);
-  padding: 20px 12px 0;
-  margin-top: 15px;
-  display: flex;
-  justify-content: space-between;
-  color: var(--muted);
-  font-size: var(--text-14);
-  letter-spacing: 1px;
-}
-.sidebar-version > span {
-  letter-spacing: 0;
-}
 .workspace {
   margin-left: 240px;
   width: calc(100% - 240px);
@@ -1143,45 +1130,6 @@ code {
 .channel-help .help-icon {
   margin-top: 2px;
 }
-.login-instructions {
-  display: flex;
-  gap: 24px;
-  align-items: center;
-  margin-top: 30px;
-}
-.login-instructions h3 {
-  font-size: var(--text-14);
-  margin-bottom: 9px;
-}
-.login-instructions p {
-  font-size: var(--text-14);
-  max-width: 600px;
-}
-.account-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  padding-top: 22px;
-  font-size: var(--text-14);
-}
-.account-footer {
-  margin-top: 25px;
-  border-top: 1px solid var(--line);
-}
-#logged-in {
-  text-align: center;
-  padding: 40px 10px;
-}
-#logged-in h2 {
-  margin: 15px 0 10px;
-}
-#logged-in p {
-  font-size: var(--text-14);
-}
-#logged-in .primary {
-  margin-top: 25px;
-}
 .success-mark {
   height: 65px;
   width: 65px;
@@ -1601,20 +1549,6 @@ dialog select {
     padding: 8px 10px;
     min-height: 33px;
   }
-  .login-instructions {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 16px;
-    margin-top: 22px;
-  }
-  .account-footer {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 13px;
-  }
-  .account-footer .muted {
-    font-size: var(--text-14);
-  }
   .activity-card .tiny-label {
     font-size: var(--text-14);
   }
@@ -1655,70 +1589,6 @@ dialog select {
     display: none;
   }
 }
-.qr-login-card {
-  display: flex;
-  align-items: center;
-  gap: 36px;
-  margin-top: 26px;
-  padding: 32px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface-soft);
-}
-.qr-code-wrap {
-  width: min(224px, 100%);
-  aspect-ratio: 1;
-  flex-shrink: 0;
-  background: #fff;
-  border: 1px solid #e8dacb;
-  border-radius: 12px;
-  display: grid;
-  place-items: center;
-  padding: 12px;
-}
-#login-qrcode {
-  width: 100%;
-  max-width: 200px;
-  height: auto;
-  aspect-ratio: 1;
-  image-rendering: pixelated;
-}
-#qr-placeholder {
-  text-align: center;
-  color: #785e4b;
-  font-size: var(--text-14);
-}
-#qr-placeholder > span {
-  display: block;
-  font-size: var(--text-48);
-  margin-bottom: 20px;
-}
-.qr-login-copy h3 {
-  font-size: var(--text-18);
-  margin-bottom: 12px;
-}
-.qr-login-copy {
-  min-width: 0;
-  max-width: 100%;
-}
-.qr-login-copy .muted {
-  font-size: var(--text-14);
-}
-.qr-login-copy .field-hint {
-  margin-top: 15px;
-}
-.qr-login-copy .error-text {
-  max-width: 480px;
-}
-@media (max-width: 760px) {
-  .qr-login-card {
-    flex-direction: column;
-    padding: 24px 16px;
-    gap: 24px;
-    text-align: center;
-  }
-}
-
 /* Larger supporting text needs space to wrap without shrinking its type. */
 body {
   line-height: 1.6;
@@ -1739,15 +1609,10 @@ dialog select {
   height: 20px;
 }
 .story-footer,
-.sidebar-version,
 .workspace-tip,
 .main-footer {
   flex-wrap: wrap;
   row-gap: 10px;
-}
-.sidebar-version {
-  gap: 8px;
-  letter-spacing: 0;
 }
 .stat > small {
   display: block;
@@ -2005,13 +1870,6 @@ dialog select {
 #assist-image { display: block; width: min(100%, calc((100dvh - 340px) * 1.31579)); height: auto; margin: 0 auto; touch-action: none; border: 1px solid var(--line); }
 .assist-toolbar { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .assist-toolbar button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); cursor: pointer; }
-
-#verify-form:not([hidden]) { display: grid; gap: 12px; max-width: 400px; }
-#verify-form label, #verify-form .field-hint { margin: 0; }
-#verify-form input { width: 100%; }
-#verify-form button { justify-self: start; }
-#trust-choice:not([hidden]) { display: flex; flex-wrap: wrap; gap: 12px; }
-#trust-choice > p { flex-basis: 100%; margin: 0; }
 
 /* Compact console: operational status and forms take priority over decoration. */
 .auth-screen { min-height:100dvh; display:grid; place-items:center; padding:76px 24px 32px; background:var(--bg); }
