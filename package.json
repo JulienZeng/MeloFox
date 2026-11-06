@@ -10,7 +10,9 @@
     "start": "node dist/index.js",
     "test": "pnpm build:web && tsx --test tests/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && vue-tsc -p web/tsconfig.json --noEmit",
-    "build:web": "vue-tsc -p web/tsconfig.json --noEmit && vite build --config web/vite.config.ts"
+    "build:web": "vue-tsc -p web/tsconfig.json --noEmit && vite build --config web/vite.config.ts",
+    "release:prepare": "node scripts/release.mjs prepare",
+    "release:package": "node scripts/release.mjs package"
   },
   "dependencies": {
     "fast-xml-parser": "^5.11.2",

@@ -4,6 +4,8 @@
 
 ## 本机生产部署
 
+GitHub Release 提供已经编译的通用 Node.js 安装包，Docker Hub 提供对应 tag 的多架构镜像；自动发布配置见[自动构建与发布](releasing.md)。下载安装包后直接安装生产依赖并启动，无需再次构建。
+
 需要 Node.js 20.12+、pnpm、Playwright Chromium，以及可执行的 ffmpeg / ffprobe。Linux 安装 Chromium 时可用 `pnpm exec playwright install --with-deps chromium` 一并安装系统依赖。
 
 先安装完整依赖，再打包和启动：

@@ -89,6 +89,12 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 
 多架构构建和代理参数放在 `.build.env`，参考 [`.build.env.example`](.build.env.example)。脚本支持 `push`、`load`、`cache` 及 `--dry-run`；使用方法见[镜像构建与代理](guide/deployment.md#镜像构建与代理)。若使用自己已发布的镜像，在 `.env` 设置对应仓库和标签，执行 `docker compose pull` 后启动即可。
 
+## 自动发布
+
+GitHub Actions 在 main 推送和 PR 时检查构建；推送 `v1.2.3` 这类 tag 后，自动发布 GitHub Release、编译后的 `.tar.gz` / `.zip` 安装包，以及 Docker Hub 的 amd64 / arm64 镜像。安装包、镜像和管理台版本统一取自 tag；正式版更新 `latest`，预发布版保持独立。
+
+使用前在 GitHub 仓库配置 Variables：`DOCKERHUB_USERNAME`、`DOCKERHUB_IMAGE`，以及 Secret：`DOCKERHUB_TOKEN`。配置、发布和升级步骤见[自动构建与发布](guide/releasing.md)。
+
 ## 接入机器人
 
 在机器人端选择 **OneBot 11** 适配器，在 MeloFox「网络配置」中配置相同的地址和 Access Token。支持以下方式：

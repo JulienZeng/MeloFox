@@ -1,6 +1,8 @@
 # 依赖与构建产物
 node_modules/
 dist/
+release/
+.release/
 
 # 本地环境与构建配置（保留可发布的示例）
 .env
@@ -22,9 +24,8 @@ data/
 *.log
 captures/
 
-# 本地测试与 GitHub 自动化（不纳入发布仓库）
+# 本地测试（不纳入发布仓库；GitHub 自动化参与版本管理）
 tests/
-.github/workflows/
 
 # 本地参考文档
 docs/
