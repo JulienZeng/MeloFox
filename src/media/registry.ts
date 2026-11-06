@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { readCacheJson, writeCacheJson } from '../runtime/cache-file.js';
 import { decodeDouyinImage, imageFormat, type ImageFormat } from './image.js';
 import { decodeDouyinFile, type FilePayload } from './file.js';
+import { mediaUrl } from './url.js';
 import { audioFormat } from './audio.js';
 
 interface CacheOptions {
@@ -65,10 +66,10 @@ export class MediaRegistry {
     private readonly logger?: AppLogger
   ) {
     this.logger = logger && scopedLogger(logger, '媒体');
-    this.cacheDir = resolve(process.cwd(), config.onebot.mediaCache.dir);
+    this.cacheDir = resolve(process.cwd(), config.media.cache.dir);
     this.cleanupTimer = setInterval(() => {
       void this.cleanupExpired().catch(error => this.logger?.warn({ error }, '媒体缓存清理失败'));
-    }, config.onebot.mediaCache.cleanupIntervalMs);
+    }, config.media.cache.cleanupIntervalMs);
     this.cleanupTimer.unref();
   }
 
@@ -124,7 +125,7 @@ export class MediaRegistry {
   }
 
   private expired(item: RegisteredMedia): boolean {
-    return Date.now() - item.createdAt >= this.config.onebot.mediaCache.ttlMs;
+    return Date.now() - item.createdAt >= this.config.media.cache.ttlMs;
   }
 
   private async removeItem(item: RegisteredMedia): Promise<void> {
@@ -142,12 +143,12 @@ export class MediaRegistry {
   private async pruneCompleted(reserveBytes = 0, reserveFiles = 0): Promise<void> {
     for (const item of [...this.items.values()]) {
       const info = await lstat(item.filePath).catch(() => undefined);
-      if (this.expired(item) || !info?.isFile() || info.size !== item.size || item.size > this.config.onebot.mediaCache.maxFileBytes) {
+      if (this.expired(item) || !info?.isFile() || info.size !== item.size || item.size > this.config.media.cache.maxFileBytes) {
         await this.removeItem(item);
       }
     }
     const ordered = [...this.items.values()].sort((a, b) => a.createdAt - b.createdAt);
-    const { maxBytes, maxFiles } = this.config.onebot.mediaCache;
+    const { maxBytes, maxFiles } = this.config.media.cache;
     for (const item of ordered) {
       const usage = this.usage();
       if (usage.bytes + reserveBytes <= maxBytes && usage.files + reserveFiles <= maxFiles) break;
@@ -173,7 +174,7 @@ export class MediaRegistry {
     await this.initialize();
     return { ...this.usage(), activeDownloads: this.downloads.size,
       activeReaders: [...this.readers.values()].reduce((sum, count) => sum + count, 0),
-      maxBytes: this.config.onebot.mediaCache.maxBytes, maxFiles: this.config.onebot.mediaCache.maxFiles };
+      maxBytes: this.config.media.cache.maxBytes, maxFiles: this.config.media.cache.maxFiles };
   }
 
   async cacheRemote(
@@ -214,8 +215,8 @@ export class MediaRegistry {
   }
 
   assertFileSize(size: number): void {
-    if (!Number.isSafeInteger(size) || size < 0 || size > this.config.onebot.mediaCache.maxFileBytes ||
-        size > this.config.onebot.mediaCache.maxBytes) throw new Error('File exceeds cache size limit');
+    if (!Number.isSafeInteger(size) || size < 0 || size > this.config.media.cache.maxFileBytes ||
+        size > this.config.media.cache.maxBytes) throw new Error('File exceeds cache size limit');
   }
 
   private async validateFileCache(url: string, file?: FilePayload): Promise<string> {
@@ -341,13 +342,13 @@ export class MediaRegistry {
       }
       const id = `${randomUUID()}.${format}`, output = resolve(this.cacheDir, id);
       try {
-        const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+        const result = await runFfmpeg(this.config.media.cache.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
           '-protocol_whitelist', 'file,pipe', '-i', original.filePath, '-map', '0:a:0', '-vn', '-c:a', codecs[format][0],
-          ...(format === 'amr' ? ['-ar', '8000', '-ac', '1'] : []), '-fs', String(this.config.onebot.mediaCache.maxFileBytes + 1), output], signal);
+          ...(format === 'amr' ? ['-ar', '8000', '-ac', '1'] : []), '-fs', String(this.config.media.cache.maxFileBytes + 1), output], signal);
         signal.throwIfAborted();
         if (result.exitCode !== 0) throw new Error(`Audio conversion to ${format} failed; check the configured ffmpeg encoder`);
         const info = await stat(output); this.assertFileSize(info.size);
-        if (info.size >= this.config.onebot.mediaCache.maxFileBytes) throw new Error('Converted audio exceeds cache size limit');
+        if (info.size >= this.config.media.cache.maxFileBytes) throw new Error('Converted audio exceeds cache size limit');
         await chmod(output, 0o600);
         await this.pruneCompleted(info.size, 1);
         this.items.set(id, { id, sourceUrl, filePath: output, contentType: codecs[format][1], size: info.size,
@@ -480,7 +481,7 @@ export class MediaRegistry {
     let completed = false;
     this.activeIds.add(cacheId);
     try {
-      const fileLimit = Math.min(this.config.onebot.mediaCache.maxFileBytes, this.config.onebot.mediaCache.maxBytes);
+      const fileLimit = Math.min(this.config.media.cache.maxFileBytes, this.config.media.cache.maxBytes);
       let buffer = await readBoundedMedia(upstream, options.filePayload ? fileLimit * 2 + 256 : fileLimit, options.signal);
       options.signal?.throwIfAborted();
       if (options.filePayload) buffer = decodeDouyinFile(buffer, options.filePayload);
@@ -507,7 +508,7 @@ export class MediaRegistry {
       );
 
       if (transcodeImage) {
-        const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath,
+        const result = await runFfmpeg(this.config.media.cache.ffmpegPath,
           ['-hide_banner', '-loglevel', 'error', '-y', '-i', downloadPath, '-frames:v', '1', filePath], options.signal);
         options.signal?.throwIfAborted();
         if (result.exitCode !== 0) throw new Error('Failed to convert HEIF image to PNG');
@@ -515,20 +516,20 @@ export class MediaRegistry {
       } else if (options.normalizeImage) {
         if (options.validateImage) await options.validateImage(buffer, imageFormat(buffer)!, options.signal);
         else {
-          const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath,
+          const result = await runFfmpeg(this.config.media.cache.ffmpegPath,
             ['-hide_banner', '-loglevel', 'error', '-i', downloadPath, '-frames:v', '1', '-f', 'null', '-'], options.signal);
           if (result.exitCode !== 0) throw new Error('Image payload cannot be decoded');
         }
         options.signal?.throwIfAborted();
       }
       if (options.validateAudio) {
-        const result = await runFfmpeg(this.config.onebot.mediaCache.ffmpegPath,
+        const result = await runFfmpeg(this.config.media.cache.ffmpegPath,
           ['-hide_banner', '-loglevel', 'error', '-xerror', '-i', downloadPath, '-map', '0:a:0', '-f', 'null', '-'], options.signal);
         options.signal?.throwIfAborted();
         if (result.exitCode !== 0) throw new Error('Voice audio payload cannot be decoded');
       }
       const isVideo = /video\//i.test(resolvedContentType);
-      const shouldProcessVideo = isVideo && (this.config.onebot.mediaCache.transcodeVideoToH264 || Boolean(options.douyinDecryptKeyHex));
+      const shouldProcessVideo = isVideo && (this.config.media.cache.transcodeVideoToH264 || Boolean(options.douyinDecryptKeyHex));
       const normalized = await normalizeVideoFile(
         downloadPath, filePath, resolvedContentType, this.config, options.douyinDecryptKeyHex, options.signal
       ).catch(error => ({ ok: false, stderr: stringifyError(error) }));
@@ -546,7 +547,7 @@ export class MediaRegistry {
       const fileStat = await stat(filePath);
       await chmod(filePath, 0o600);
       options.signal?.throwIfAborted();
-      if (fileStat.size > this.config.onebot.mediaCache.maxFileBytes || fileStat.size > this.config.onebot.mediaCache.maxBytes) {
+      if (fileStat.size > this.config.media.cache.maxFileBytes || fileStat.size > this.config.media.cache.maxBytes) {
         throw new Error('Normalized media exceeds cache size limit');
       }
       await this.exclusive(async () => {
@@ -574,13 +575,7 @@ export class MediaRegistry {
   }
 
   private publicUrl(id: string): string {
-    const configured = this.config.onebot.http.publicBaseUrl;
-    if (configured) {
-      return `${configured.replace(/\/$/, '')}/media/${id}`;
-    }
-
-    const host = this.config.onebot.http.host === '0.0.0.0' ? '127.0.0.1' : this.config.onebot.http.host;
-    return `http://${host}:${this.config.onebot.http.port}/media/${id}`;
+    return mediaUrl(this.config, id);
   }
 }
 
@@ -710,7 +705,7 @@ async function normalizeVideoFile(
   decryptionKeyHex?: string,
   signal?: AbortSignal
 ): Promise<{ ok: boolean; stderr?: string }> {
-  const shouldTranscode = config.onebot.mediaCache.transcodeVideoToH264;
+  const shouldTranscode = config.media.cache.transcodeVideoToH264;
   if ((!shouldTranscode && !decryptionKeyHex) || !/video\//i.test(contentType)) {
     return { ok: false };
   }
@@ -740,7 +735,7 @@ async function normalizeVideoFile(
       ]
     : ['-c', 'copy'];
 
-  const result = await runFfmpeg(config.onebot.mediaCache.ffmpegPath, [
+  const result = await runFfmpeg(config.media.cache.ffmpegPath, [
     '-hide_banner',
     '-loglevel',
     'error',

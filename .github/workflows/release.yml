@@ -57,7 +57,7 @@ jobs:
       - name: Resolve and stamp tag version
         id: version
         run: node scripts/release.mjs prepare "$RELEASE_TAG" --verify-tag
-      - name: Reject an already published version
+      - name: Validate changelog and reject an already published version
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/publish-release.mjs check "$RELEASE_TAG"

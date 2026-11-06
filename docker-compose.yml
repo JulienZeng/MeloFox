@@ -34,10 +34,8 @@ services:
       WEB_DATA_DIR: /data/console
       BROWSER_USER_DATA_DIR: /data/douyin-profile
       BROWSER_HEADLESS: "true"
-      ONEBOT_HTTP_HOST: 0.0.0.0
-      ONEBOT_HTTP_PORT: "3001"
-      ONEBOT_FORWARD_WS_HOST: 0.0.0.0
-      ONEBOT_FORWARD_WS_PORT: "3002"
+      MEDIA_HOST: 0.0.0.0
+      MEDIA_PORT: "3001"
       MEDIA_CACHE_DIR: /data/media-cache
       RUNTIME_MESSAGE_CACHE_DIR: /data/message-cache
     volumes:
@@ -45,8 +43,7 @@ services:
       - douyin-data:/data
     ports:
       - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3000}:3000"
-      - "${ONEBOT_HTTP_BIND:-127.0.0.1}:${ONEBOT_HTTP_PORT:-3001}:3001"
-      - "${ONEBOT_FORWARD_WS_BIND:-127.0.0.1}:${ONEBOT_FORWARD_WS_PORT:-3002}:3002"
+      - "${MEDIA_BIND:-127.0.0.1}:${MEDIA_PORT:-3001}:${MEDIA_TARGET_PORT:-3001}"
 
 volumes:
   douyin-data:

@@ -1,5 +1,5 @@
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
-import { artifactNames, checksum, checksums, command, compareStableTags, dockerImage, json, releaseVersion } from './release-lib.mjs';
+import { artifactNames, checksum, checksums, command, compareStableTags, dockerImage, json, readChangelog, releaseVersion } from './release-lib.mjs';
 
 const repository = process.env.GITHUB_REPOSITORY;
 const token = process.env.GH_TOKEN;
@@ -34,6 +34,7 @@ async function publish() {
   const meta = releaseVersion(info.tag);
   if (info.version !== meta.version || info.image !== image || info.commit !== command('git', ['rev-parse', 'HEAD']))
     throw new Error('发布产物、镜像仓库或源码提交不一致');
+  const notes = await readChangelog(meta.tag);
   let release = await check(meta.tag, info.commit);
   const files = artifactNames(info.version);
   const sums = new Map((await readFile('release/SHA256SUMS', 'utf8')).trim().split('\n').map(line => {
@@ -59,9 +60,10 @@ async function publish() {
   const generated = await api(`${base}/releases/generate-notes`, 'POST', { tag_name: meta.tag, target_commitish: info.commit });
   const body = `<!-- melofox-release: ${info.commit} -->\n<!-- melofox-image: ${image}@${manifest.digest} -->\n\n` +
     `支持 OneBot 11。版本：\`${meta.version}\`。\n\n` +
+    `## 更新说明\n\n${notes}\n\n## 安装与下载\n\n` +
     `Docker（linux/amd64、linux/arm64）：\n\n\`\`\`sh\ndocker pull ${image}:${meta.version}\n\`\`\`\n\n` +
     `固定镜像摘要：\`${image}@${manifest.digest}\`\n\n` +
-    `下载 tar.gz / zip 获得编译后的通用 Node.js 包；仍需安装生产依赖、Chromium 及 ffmpeg。Docker 用户可下载 docker-compose.yml 和 melofox.env.example（复制为 .env）。下载后使用 SHA256SUMS 校验。\n\n${generated.body}`;
+    `下载 tar.gz / zip 获得编译后的通用 Node.js 包；仍需安装生产依赖、Chromium 及 ffmpeg。Docker 用户可下载 docker-compose.yml 和 melofox.env.example（复制为 .env）。下载后使用 SHA256SUMS 校验。\n\n## GitHub 自动生成的说明\n\n${generated.body}`;
   const record = { tag_name: meta.tag, target_commitish: info.commit, name: `MeloFox ${meta.tag}`, body,
     draft: true, prerelease: meta.prerelease, make_latest: 'false' };
   release = release ? await api(`${base}/releases/${release.id}`, 'PATCH', record) : await api(`${base}/releases`, 'POST', record);
@@ -101,7 +103,10 @@ async function latest() {
 }
 try {
   const [mode, tag] = process.argv.slice(2);
-  if (mode === 'check') await check(tag, command('git', ['rev-parse', 'HEAD']));
+  if (mode === 'check') {
+    await readChangelog(tag);
+    await check(tag, command('git', ['rev-parse', 'HEAD']));
+  }
   else if (mode === 'publish') await publish();
   else if (mode === 'latest') await latest();
   else throw new Error('用法：node scripts/publish-release.mjs check v1.2.3 | publish | latest');

@@ -22,7 +22,7 @@
 
 ## 发布一个版本
 
-先提交并推送待发布代码，再为该提交创建 tag：
+先在根目录 `CHANGELOG.md` 写好本版本的说明，连同待发布代码提交并推送，再为该提交创建 tag：
 
 ```sh
 git tag -a v1.2.3 -m "MeloFox v1.2.3"
@@ -43,13 +43,37 @@ git push origin v1.2.3
 
 源码仓库中的 `package.json` 保留开发版本；GitHub 自动生成的 Source code 压缩包也保持源码原样。运行部署请使用本工作流附加的安装包或镜像。
 
+## 编写发布说明
+
+统一维护根目录 [CHANGELOG.md](../CHANGELOG.md)，新版本放在前面。每个版本使用二级标题，具体分类使用三级标题，例如：
+
+```markdown
+## [0.1.1-beta] - 2026-11-06
+
+### 新增
+- 面向使用者描述新增功能。
+
+### 调整与修复
+- 描述行为变化及解决的问题。
+
+### 升级说明
+- 配置迁移、端口调整及需要执行的操作。
+
+### 已知限制
+- 当前仍未解决的问题。
+```
+
+`v0.1.1-beta` 对应 `## [0.1.1-beta]`，也兼容标题版本带 `v` 或不加方括号；日期可省略。只截取该版本标题与下一个二级标题之间的内容，忽略代码块内的标题，不混入其他版本或 `Unreleased`。文件必须随待发布提交一起入库，发布工作流读取 tag 对应的代码。
+
+最终 Release 描述依次包含本版本更新说明、镜像与安装信息、GitHub 自动生成的 PR / 贡献者 / 版本比较说明。tag 的注释不会替代更新日志。缺少文件、找不到对应版本、版本标题重复或正文为空时，在安装依赖和构建镜像前停止发布；发布阶段也会重新校验。普通分支 CI 打包不要求开发版本已有发布条目。
+
 ## 自动执行的内容
 
 **CI** 在 main 推送、Pull Request 和手动触发时运行：使用 Node.js 20 / 24，锁定依赖安装，编译后端与 Vue 管理台，检查 Compose 和构建脚本，并生成安装包、验证 SHA256 校验和。`tests/` 保持本地，CI 不调用缺少测试文件的 `pnpm test`。
 
 **Release** 按顺序执行：
 
-1. 校验 tag、目标镜像仓库和发布凭据是否齐全，将版本写入构建目录，编译并打包。
+1. 校验 tag、对应更新日志、目标镜像仓库和发布凭据是否齐全，将版本写入构建目录，编译并打包。
 2. 原生构建 `linux/amd64`、`linux/arm64` 镜像，先按 digest 推送；在各自架构的实际镜像内校验 OneBot 11 版本信息并启动、关闭一次 Chromium。
 3. 两个架构通过后，合并多架构镜像并创建两个精确版本 tag；验证安装包校验和，把所有附件上传到 Release 草稿，再公开发布。
 4. 正式版本发布成功后，串行更新 Docker `latest` 与 GitHub Latest，按已经发布的最高正式版本选择。补发旧 tag 不会让 latest 降级；预发布版本不更新 latest。
@@ -60,7 +84,7 @@ git push origin v1.2.3
 
 每个 Release 包含：
 
-- `melofox-1.2.3.tar.gz`、`melofox-1.2.3.zip`：编译后的通用 Node.js 包，包含后端、管理台、协议文件、依赖清单、示例配置、运行说明和 MIT 许可证。
+- `melofox-1.2.3.tar.gz`、`melofox-1.2.3.zip`：编译后的通用 Node.js 包，包含后端、管理台、协议文件、依赖清单、示例配置、运行说明、更新日志和 MIT 许可证。
 - `docker-compose.yml`、`melofox.env.example`：用于直接拉取该版本镜像；将后者复制为 `.env`。发布用 Compose 已移除本地 build，避免下载后缺少源码或 Dockerfile。
 - `build-info.json`：版本、tag、源码提交及镜像仓库。
 - `image-digest.txt`：合并后的多架构镜像固定引用。
@@ -86,6 +110,8 @@ cp melofox.env.example .env
 docker compose pull
 docker compose up -d --no-build
 ```
+
+新安装仅默认映射管理台 `3000` 和媒体服务 `3001`，OneBot 通道按需创建。升级到独立媒体服务的版本时，按实际迁移后的媒体端口调整 Compose 映射和反向代理，并保留原 OneBot 通道的映射，具体见[媒体服务迁移](deployment.md#独立媒体服务)。
 
 已有部署不要覆盖现有 `.env` 和数据卷。将 `IMAGE_NAME` 设为配置的 Docker Hub 仓库，将 `IMAGE_TAG` 改为目标版本后更新即可；使用精确版本可以避免自动跟随 latest。
 

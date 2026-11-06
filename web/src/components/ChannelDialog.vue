@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useConsole } from "../console";
 import { errorMessage, isCancelled } from "../api";
 import type { ChannelInput } from "../types";
@@ -10,26 +10,25 @@ const store = useConsole(),
   dialog = ref<HTMLDialogElement>(),
   saving = ref(false),
   error = ref("");
-const form = reactive<ChannelInput>({
+const form = reactive<Omit<ChannelInput, 'port'> & { port: number | '' }>({
   name: "",
   type: "reverse-ws",
   enabled: true,
-  host: "127.0.0.1",
-  port: 3002,
-  url: "ws://127.0.0.1:6700/onebot/v11/ws",
+  host: "",
+  url: "",
   secret: "",
   timeoutMs: 10000,
   accessToken: "",
-  publicBaseUrl: "",
   ...props.editor.initial,
+  port: props.editor.initial?.port ?? '',
 });
 const reverse = computed(() => form.type.startsWith("reverse-"));
 const hints = {
-  http: "提供 OneBot HTTP API 和媒体下载服务。",
+  http: "提供 OneBot HTTP API。媒体下载在设置中的媒体服务独立管理。",
   "forward-ws": "本服务监听端口，机器人应用主动连入。",
   "reverse-ws": "本服务主动连接应用；适用于 AstrBot 的反向 WebSocket 接入。",
   "reverse-http":
-    "向应用上报事件，支持签名、离线重试和快速回复。媒体下载需另配 HTTP 通道。",
+    "向应用上报事件，支持签名、离线重试和快速回复。媒体下载使用独立媒体服务。",
 };
 let mounted = true;
 onMounted(() => dialog.value?.showModal());
@@ -40,19 +39,6 @@ onUnmounted(() => {
 function close() {
   if (store.state.editor === props.editor) store.state.editor = undefined;
 }
-watch(
-  () => form.type,
-  (type) => {
-    if (
-      type === "reverse-http" &&
-      form.url === "ws://127.0.0.1:6700/onebot/v11/ws"
-    )
-      form.url = "http://127.0.0.1:5701";
-    else if (type === "reverse-ws" && form.url === "http://127.0.0.1:5701")
-      form.url = "ws://127.0.0.1:6700/onebot/v11/ws";
-    if (!props.editor.id) form.port = type === "http" ? 3001 : 3002;
-  },
-);
 async function save() {
   if (saving.value) return;
   saving.value = true;
@@ -64,8 +50,9 @@ async function save() {
         method: props.editor.id ? "PUT" : "POST",
         body: JSON.stringify({
           ...form,
+          host: reverse.value ? "" : form.host,
+          port: reverse.value || form.port === '' ? undefined : form.port,
           url: reverse.value ? form.url : "",
-          publicBaseUrl: form.type === "http" ? form.publicBaseUrl : "",
         }),
       },
     );
@@ -122,7 +109,7 @@ async function save() {
         <option value="reverse-ws">反向 WebSocket · 主动连接应用</option>
         <option value="forward-ws">正向 WebSocket · 等待应用连接</option>
         <option value="reverse-http">反向 HTTP · 上报事件</option>
-        <option value="http">HTTP · 接口与媒体服务</option>
+        <option value="http">HTTP · OneBot API</option>
       </select>
       <p id="type-hint" class="field-hint">{{ hints[form.type] }}</p>
       <div id="url-fields" :hidden="!reverse">
@@ -136,8 +123,8 @@ async function save() {
           :disabled="!reverse || saving"
           :placeholder="
             form.type === 'reverse-http'
-              ? 'http://127.0.0.1:5701'
-              : 'ws://127.0.0.1:6700/onebot/v11/ws'
+              ? '填写 HTTP(S) 事件接收地址'
+              : '填写 WS(S) 连接地址'
           "
         />
       </div>
@@ -192,21 +179,6 @@ async function save() {
         </div>
         <p class="field-hint">
           127.0.0.1 仅本机访问；0.0.0.0 允许其他设备连接。
-        </p>
-      </div>
-      <div id="media-fields" :hidden="form.type !== 'http'">
-        <label for="channel-public-url"
-          >媒体公开地址 <span class="optional">可选</span></label
-        ><input
-          id="channel-public-url"
-          v-model="form.publicBaseUrl"
-          name="publicBaseUrl"
-          type="url"
-          placeholder="http://你的服务器:3001"
-          :disabled="form.type !== 'http' || saving"
-        />
-        <p class="field-hint">
-          填写机器人可访问的 HTTP 地址；Docker 部署需映射相应端口。
         </p>
       </div>
       <div id="channel-token-fields" :hidden="form.type === 'reverse-http'">

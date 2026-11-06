@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
+import { validateMediaListener } from "../config/listeners.js";
 import type { AppConfig } from "../config/index.js";
 import { scopedLogger, type AppLogger } from "../logger/index.js";
 import { OneBotActionRouter } from "../onebot/actions.js";
@@ -21,24 +22,19 @@ export const ChannelSchema = z
     name: z.string().trim().min(1).max(60),
     type: z.enum(["http", "forward-ws", "reverse-ws", "reverse-http"]),
     enabled: z.boolean(),
-    host: z.string().trim().min(1).max(253).default("127.0.0.1"),
-    port: port.default(3002),
+    host: z.string().trim().max(253).default(""),
+    port: port.optional(),
     url: z.string().max(2048).default(""),
     secret: z.string().max(512).default(""),
     timeoutMs: z.number().int().min(100).max(60000).default(10000),
     accessToken: z.string().max(512).default(""),
-    publicBaseUrl: z
-      .union([
-        z.literal(""),
-        z
-          .string()
-          .url()
-          .refine((v) => /^https?:\/\//.test(v), "媒体地址须使用 HTTP(S)"),
-      ])
-      .default(""),
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.type === "http" || value.type === "forward-ws") {
+      if (!value.host) ctx.addIssue({ code: "custom", path: ["host"], message: "请填写监听地址" });
+      if (value.port === undefined) ctx.addIssue({ code: "custom", path: ["port"], message: "请填写监听端口" });
+    }
     if (value.type === "reverse-ws" || value.type === "reverse-http") {
       try {
         const url = new URL(value.url);
@@ -87,19 +83,17 @@ export class ChannelManager {
   }
   async initialize(): Promise<void> {
     try {
-      this.channels = z
-        .array(ChannelSchema)
-        .max(32)
-        .parse(JSON.parse(await readFile(this.path, "utf8")));
+      const saved: unknown = JSON.parse(await readFile(this.path, "utf8"));
+      const legacy = Array.isArray(saved) && saved.some(channel => channel && Object.hasOwn(channel, 'publicBaseUrl'));
+      this.channels = z.array(ChannelSchema).max(32).parse(Array.isArray(saved)
+        ? saved.map(({ publicBaseUrl: _legacy, ...channel }: Record<string, unknown>) => channel) : saved);
+      if (legacy) await this.persist(this.channels);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       const base = {
         enabled: true,
-        host: "127.0.0.1",
-        port: 3002,
         url: "",
         accessToken: this.config.onebot.accessToken,
-        publicBaseUrl: "",
       };
       if (this.config.onebot.http.enabled)
         this.channels.push(
@@ -137,7 +131,6 @@ export class ChannelManager {
       await this.persist(this.channels);
     }
     this.validate(this.channels);
-    this.syncMediaConfig();
   }
   list() {
     return this.channels.map((channel) => ({
@@ -242,7 +235,6 @@ export class ChannelManager {
       });
     }
     this.channels = next;
-    this.syncMediaConfig();
     if (channel && runtime) this.running.set(channel.id, runtime);
     if (old) this.errors.delete(old.id);
     if (channel) this.errors.delete(channel.id);
@@ -262,7 +254,6 @@ export class ChannelManager {
         enabled: true,
         host: channel.host,
         port: channel.port,
-        publicBaseUrl: channel.publicBaseUrl || undefined,
       };
       // Each channel needs its own token/config, while sharing the same bridge and media cache.
       const runtime = await startOneBotHttpServer(
@@ -298,6 +289,7 @@ export class ChannelManager {
     }
   }
   private validate(channels: Channel[]): void {
+    validateMediaListener(this.config, channels);
     if (channels.length > 32)
       throw Object.assign(new Error("最多创建 32 个通道"), { statusCode: 400 });
     if (new Set(channels.map((c) => c.id)).size !== channels.length)
@@ -309,24 +301,13 @@ export class ChannelManager {
     for (const c of channels.filter(
       (c) => c.enabled && ["http", "forward-ws"].includes(c.type),
     )) {
-      if (ports.has(c.port) || c.port === this.config.web.port)
+      if (ports.has(c.port!) || c.port === this.config.web.port)
         throw Object.assign(
           new Error(`端口 ${c.port} 与其他通道或管理台冲突`),
           { statusCode: 409 },
         );
-      ports.add(c.port);
+      ports.add(c.port!);
     }
-  }
-  private syncMediaConfig(): void {
-    const channel = this.channels.find((c) => c.enabled && c.type === "http");
-    if (channel)
-      this.config.onebot.http = {
-        enabled: true,
-        host: channel.host,
-        port: channel.port,
-        publicBaseUrl: channel.publicBaseUrl || undefined,
-      };
-    else this.config.onebot.http.enabled = false;
   }
   private async persist(channels: Channel[]): Promise<void> {
     await mkdir(this.config.web.dataDir, { recursive: true, mode: 0o700 });

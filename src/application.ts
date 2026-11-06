@@ -2,6 +2,8 @@ import { RuntimeSettingsStore } from './config/settings.js';
 import { createDouyinBridgeCache } from './douyin/bridge.js';
 import { createLogger, type AppLogger } from './logger/index.js';
 import { sanitizeLogText } from './logger/sanitize.js';
+import { startMediaHttpServer } from './media/http.js';
+import { validateMediaListener } from './config/listeners.js';
 import { MediaRegistry } from './media/registry.js';
 import { MessageCacheStore } from './runtime/message-cache-store.js';
 import { startGatewaySession } from './runtime/gateway.js';
@@ -30,6 +32,8 @@ async function main(): Promise<void> {
   const messageCache = createDouyinBridgeCache(config.runtime.messageCacheLimit, config.runtime.messageCacheTtlMs);
   const messageCacheStore = new MessageCacheStore(messageCache, config, logger);
   const control = config.web.enabled ? new ConsoleControl(new ChannelManager(config, logger)) : undefined;
+  if (control) control.media = { state: config.media.enabled ? 'starting' : 'disabled', host: config.media.host, port: config.media.port };
+  let media: Awaited<ReturnType<typeof startMediaHttpServer>>;
   let web: Awaited<ReturnType<typeof createConsoleServer>> | undefined;
   const restart = () => {
     if (shutdown.signal.aborted) return;
@@ -50,6 +54,16 @@ async function main(): Promise<void> {
       logger.info({ url: `http://${config.web.host}:${config.web.port}` }, '管理台已启动');
       if (development) logger.info('管理台热更新已启用');
     }
+    if (!control) validateMediaListener(config);
+    try {
+      media = await startMediaHttpServer(config, mediaRegistry, logger);
+      if (control?.media && media) control.media.state = 'listening';
+    } catch (error) {
+      if (!control) throw error;
+      control.media = { state: 'error', host: config.media.host, port: config.media.port,
+        error: '媒体服务启动失败，请检查监听地址与端口，保存后重启服务。' };
+      logger.error({ error }, control.media.error);
+    }
     await superviseSessions({
       signal: shutdown.signal,
       retryMs: config.runtime.reconnectIntervalMs,
@@ -60,7 +74,7 @@ async function main(): Promise<void> {
       }
     });
   } finally {
-    try { await web?.close(); }
+    try { await Promise.all([web?.close(), media?.close()]); }
     finally {
       try { await mediaRegistry.stop(); } finally { await messageCacheStore.stop(); }
       logger.info(restarting ? '服务已停止，正在启动新进程并加载保存的设置' : 'MeloFox 已停止');

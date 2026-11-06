@@ -80,7 +80,7 @@ MeloFox（音狐）支持 **OneBot 11**，将抖音群聊和已有私聊接入�
 
 URL 下载默认使用缓存和环境 HTTP(S)_PROXY/NO_PROXY，proxy=0 直连；cache=0 跳过并移除该 URL 的缓存。timeout 单位秒，与整个发送动作的截止时间共同生效。缓存每账号最多 64 MiB、10 分钟，注销/切换账号/clean_cache 清除，正在下载的旧任务不能回填已清空缓存。并行首次请求不承诺只下载一次。
 
-接收侧注册媒体的复用另受 `onebot.mediaCache` 的大小、TTL 和清理规则约束；拒绝过期、缺失、类型不匹配或被替换为符号链接的文件。普通远程 URL 保留原下载参数语义。带反向代理路径前缀的本站 URL 也可查询和复用。混合发送各条之间及缓存准备后检查账号，账号改变时停止余下发送；已有回执仍按 partial 返回。
+接收侧注册媒体的复用另受 `media.cache` 的大小、TTL 和清理规则约束；拒绝过期、缺失、类型不匹配或被替换为符号链接的文件。普通远程 URL 保留原下载参数语义。带反向代理路径前缀的本站 URL 也可查询和复用。混合发送各条之间及缓存准备后检查账号，账号改变时停止余下发送；已有回执仍按 partial 返回。
 
 ## 事件与调用方式
 
@@ -224,7 +224,7 @@ JSON 支持上述 `share/location/contact/music` 消息段封装及 `com.tencent
 
 ## HTTP 与缓存兼容细节
 
-图片和视频可以通过已注册的缓存文件名、缓存路径（包括 `file://`）或本站媒体 URL 再发送；图片缓存名可从 `get_image` 的 `filename` 取得。缓存复用不要求本地媒体 HTTP 端口在线，也不要求把媒体缓存目录加入 `RUNTIME_FILE_SEND_ALLOWED_DIRS`。缓存失效或类型错误会失败；普通本地文件继续受目录白名单约束，普通远程 URL 继续使用 cache/proxy/timeout。`publicBaseUrl` 带反向代理路径前缀时也支持媒体查询与复用。
+图片和视频可以通过已注册的缓存文件名、缓存路径（包括 `file://`）或本站媒体 URL 再发送；图片缓存名可从 `get_image` 的 `filename` 取得。缓存复用不要求本地媒体 HTTP 端口在线，也不要求把媒体缓存目录加入 `RUNTIME_FILE_SEND_ALLOWED_DIRS`。缓存失效或类型错误会失败；普通本地文件继续受目录白名单约束，普通远程 URL 继续使用 cache/proxy/timeout。`media.publicBaseUrl` 带反向代理路径前缀时也支持媒体查询与复用。
 
 新收到的群消息会在有效本地成员资料可用时输出 `sender.card` 和 `sender.role`，没有可靠角色时省略；消息缓存保留这些字段供 `get_msg` 和重启恢复使用。`get_group_member_info(no_cache=true)` 同时刷新成员资料和可查询的昵称，资料查询失败不回传旧昵称冒充成功。
 

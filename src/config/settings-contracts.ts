@@ -4,7 +4,8 @@ export interface RuntimeSettings {
   app: AppConfig['app'];
   browser: Pick<AppConfig['browser'], 'douyinUrl'>;
   douyin: AppConfig['douyin'];
-  onebot: Pick<AppConfig['onebot'], 'rateLimitIntervalMs'> & { mediaCache: Omit<AppConfig['onebot']['mediaCache'], 'dir'> };
+  onebot: Pick<AppConfig['onebot'], 'rateLimitIntervalMs'>;
+  media: Omit<AppConfig['media'], 'cache'> & { cache: Omit<AppConfig['media']['cache'], 'dir'> };
   network: AppConfig['network'];
   runtime: Omit<AppConfig['runtime'], 'messageCacheDir'>;
 }
@@ -58,15 +59,22 @@ export const settingsGroups: Array<{ id: string; title: string; fields: Settings
     number('runtime.actionTimeoutMs', '普通动作超时', '毫秒', '超时不代表抖音端一定未执行。'),
     number('runtime.videoSendTimeoutMs', '视频发送超时', '毫秒', '包含读取、转码、封面、上传和提交。'),
   ] },
-  { id: 'media', title: '媒体缓存与转换', fields: [
-    number('onebot.mediaCache.ttlMs', '媒体保留时间', '毫秒', '默认 7 天，容量不足时会提前淘汰。', 1, Number.MAX_SAFE_INTEGER),
-    number('onebot.mediaCache.cleanupIntervalMs', '媒体清理间隔', '毫秒', '定期清理过期媒体文件。'),
-    number('onebot.mediaCache.maxBytes', '缓存总容量', '字节', '默认 1 GiB（1073741824 字节）。', 1, Number.MAX_SAFE_INTEGER),
-    number('onebot.mediaCache.maxFiles', '缓存文件数量', '个', '已完成媒体的数量上限。'),
-    number('onebot.mediaCache.maxFileBytes', '单文件大小上限', '字节', '限制下载文件和转码成品，默认 128 MiB。', 1, Number.MAX_SAFE_INTEGER),
-    toggle('onebot.mediaCache.transcodeVideoToH264', '自动转换视频格式', '需要时转换为 H264/AAC MP4，提升播放兼容性。'),
-    { path: 'onebot.mediaCache.ffmpegPath', label: 'ffmpeg 路径', kind: 'text', hint: '可填写命令名或绝对路径；Docker 默认使用 ffmpeg。' },
-    { path: 'onebot.mediaCache.ffprobePath', label: 'ffprobe 路径', kind: 'text', hint: '可填写命令名或绝对路径；Docker 默认使用 ffprobe。' },
+  { id: 'media-service', title: '媒体服务', fields: [
+    toggle('media.enabled', '启用媒体服务', '独立提供图片、视频、语音和文件下载，不依赖 OneBot HTTP 通道。'),
+    { path: 'media.host', label: '监听地址', kind: 'text', hint: 'Docker 通常使用 0.0.0.0；127.0.0.1 仅容器或本机内部可达。' },
+    number('media.port', '监听端口', '', '默认 3001，不可与管理台、OneBot HTTP 或正向 WebSocket 重复；Docker 映射目标端口需同步调整。', 1, 65535),
+    { path: 'media.publicBaseUrl', label: '媒体公开地址', kind: 'text', hint: '填写接收端可访问的根地址。同一 Docker 网络可用 http://melofox:3001；留空使用监听地址，0.0.0.0 会回退为 127.0.0.1。' },
+    { path: 'media.signingKey', label: '下载签名密钥', kind: 'password', hint: '可选，至少 16 个字符。配置后下载链接自动携带签名，无需 OneBot 令牌；留空允许持有链接者下载。修改密钥会使旧签名失效。' },
+  ] },
+  { id: 'media', title: '媒体缓存', fields: [
+    number('media.cache.ttlMs', '媒体保留时间', '毫秒', '默认 7 天，容量不足时会提前淘汰。', 1, Number.MAX_SAFE_INTEGER),
+    number('media.cache.cleanupIntervalMs', '媒体清理间隔', '毫秒', '定期清理过期媒体文件。'),
+    number('media.cache.maxBytes', '缓存总容量', '字节', '默认 1 GiB（1073741824 字节）。', 1, Number.MAX_SAFE_INTEGER),
+    number('media.cache.maxFiles', '缓存文件数量', '个', '已完成媒体的数量上限。'),
+    number('media.cache.maxFileBytes', '单文件大小上限', '字节', '限制下载文件和转码成品，默认 128 MiB。', 1, Number.MAX_SAFE_INTEGER),
+    toggle('media.cache.transcodeVideoToH264', '自动转换视频格式', '需要时转换为 H264/AAC MP4，提升播放兼容性。'),
+    { path: 'media.cache.ffmpegPath', label: 'ffmpeg 路径', kind: 'text', hint: '可填写命令名或绝对路径；Docker 默认使用 ffmpeg。' },
+    { path: 'media.cache.ffprobePath', label: 'ffprobe 路径', kind: 'text', hint: '可填写命令名或绝对路径；Docker 默认使用 ffprobe。' },
   ] },
   { id: 'cache', title: '消息缓存与队列', fields: [
     toggle('runtime.messageCachePersist', '持久化消息记录', '保存消息、游标与去重记录；各通道的事件队列独立保存。'),

@@ -1,13 +1,13 @@
 import { stripVTControlCharacters } from 'node:util';
 
-const secretKeys = /^(?:.*token|.*password|.*secret|cookie|setcookie|authorization|proxyauthorization|passwd|sessionid|sessionidss|sessionkey|localstorage|storagestate|encryptuid|verifyticket|ticket|verificationcode|verifycode|smscode|tkey|abogus|xbogus)$/i;
+const secretKeys = /^(?:.*token|.*password|.*secret|cookie|setcookie|authorization|proxyauthorization|passwd|sessionid|sessionidss|sessionkey|signingkey|signature|localstorage|storagestate|encryptuid|verifyticket|ticket|verificationcode|verifycode|smscode|tkey|abogus|xbogus)$/i;
 const normalizeKey = (key: string) => key.replace(/[-_]/g, '');
 export function sanitizeLogText(value: string, secrets: readonly string[] = []): string {
   let text = stripVTControlCharacters(value)
     .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028-\u202e\u2066-\u2069]/g, '')
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_=.~-]+/gi, '[redacted]')
     .replace(/\b(?:https?|wss?):\/\/[^\s/]+@/gi, prefix => prefix.slice(0, prefix.indexOf('://') + 3) + '[redacted]@')
-    .replace(/((?:["']?)\b(?:[\w-]*token|[\w-]*password|secret|session[_-]?id(?:_ss)?|encrypt[_-]?uid|(?:verify[_-]?)?ticket|(?:sms|verify|verification)[_-]?code|tkey|a_bogus|x_bogus|cookie|set-cookie|authorization)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s&;,<>]+)/gi, '$1[redacted]')
+    .replace(/((?:["']?)\b(?:[\w-]*token|[\w-]*password|secret|signing[_-]?key|signature|session[_-]?id(?:_ss)?|encrypt[_-]?uid|(?:verify[_-]?)?ticket|(?:sms|verify|verification)[_-]?code|tkey|a_bogus|x_bogus|cookie|set-cookie|authorization)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s&;,<>]+)/gi, '$1[redacted]')
     .replace(/((?:set-cookie|cookie|authorization)\s*:\s*)[^\r\n]+/gi, '$1[redacted]')
     .replace(/(?:data:[^;,\s]+;base64,|base64:\/\/)[A-Za-z0-9+/=]+/gi, '[二进制数据]');
   for (const secret of secrets) if (secret.length >= 4) text = text.split(secret).join('[redacted]');

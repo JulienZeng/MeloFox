@@ -8,6 +8,34 @@ function proxyUrl() {
   }, '代理地址须为有效的 HTTP(S) URL').default('');
 }
 
+// Legacy first-start channel imports stay empty until explicitly configured.
+const listenerConfig = z.object({
+  enabled: z.boolean().default(false),
+  host: z.string().trim().max(253).default(''),
+  port: z.number().int().min(1).max(65535).optional()
+}).superRefine((value, ctx) => {
+  if (!value.enabled) return;
+  if (!value.host) ctx.addIssue({ code: 'custom', path: ['host'], message: '请填写监听地址' });
+  if (value.port === undefined) ctx.addIssue({ code: 'custom', path: ['port'], message: '请填写监听端口' });
+});
+
+const reverseConfig = z.object({
+  enabled: z.boolean().default(false),
+  url: z.string().max(2048).default('')
+});
+
+function validateReverseUrl(protocols: string[]) {
+  return (value: { enabled: boolean; url: string }, ctx: z.RefinementCtx) => {
+    if (!value.enabled && !value.url) return;
+    try {
+      const url = new URL(value.url);
+      if (!protocols.includes(url.protocol) || url.username || url.password || url.hash) throw new Error();
+    } catch {
+      ctx.addIssue({ code: 'custom', path: ['url'], message: '请填写与通道类型匹配的有效地址，不含凭据或片段' });
+    }
+  };
+}
+
 export const ConfigSchema = z.object({
   web: z.object({
     enabled: z.boolean().default(true),
@@ -34,31 +62,25 @@ export const ConfigSchema = z.object({
   onebot: z.object({
     rateLimitIntervalMs: z.number().int().min(0).max(60000).default(500),
     accessToken: z.string().default(''),
-    http: z.object({
-      enabled: z.boolean().default(true),
-      host: z.string().default('127.0.0.1'),
-      port: z.number().int().min(1).max(65535).default(3001),
-      publicBaseUrl: z.string().url().optional()
-    }).default({}),
-    reverseWs: z.object({
-      enabled: z.boolean().default(false),
-      url: z.string().url().default('ws://127.0.0.1:6700/onebot/v11/ws')
-    }).default({}),
-    reverseHttp: z.object({
-      enabled: z.boolean().default(false),
-      url: z.string().url().refine(value => {
-        const url = new URL(value);
-        return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.hash;
-      }).default('http://127.0.0.1:5701'),
+    http: listenerConfig.default({}),
+    reverseWs: reverseConfig.superRefine(validateReverseUrl(['ws:', 'wss:'])).default({}),
+    reverseHttp: reverseConfig.extend({
       secret: z.string().max(512).default(''),
       timeoutMs: z.number().int().min(100).max(60000).default(10000)
-    }).default({}),
-    forwardWs: z.object({
-      enabled: z.boolean().default(true),
-      host: z.string().default('127.0.0.1'),
-      port: z.number().int().min(1).max(65535).default(3002)
-    }).default({}),
-    mediaCache: z.object({
+    }).superRefine(validateReverseUrl(['http:', 'https:'])).default({}),
+    forwardWs: listenerConfig.default({})
+  }).default({}),
+  media: z.object({
+    enabled: z.boolean().default(true),
+    host: z.string().trim().min(1).max(253).default('127.0.0.1'),
+    port: z.number().int().min(1).max(65535).default(3001),
+    publicBaseUrl: z.string().max(2048).refine(value => {
+      if (!value) return true;
+      try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash; }
+      catch { return false; }
+    }, '媒体公开地址须为 HTTP(S) 地址，不含凭据、查询参数或片段').default(''),
+    signingKey: z.string().max(512).refine(value => !value || value.length >= 16, '下载签名密钥至少 16 个字符').default(''),
+    cache: z.object({
       dir: z.string().min(1).default('./media-cache'),
       ttlMs: z.number().int().positive().safe().default(7 * 86400000),
       cleanupIntervalMs: z.number().int().positive().max(2147483647).default(10 * 60 * 1000),

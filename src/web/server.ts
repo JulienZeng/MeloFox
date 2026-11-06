@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppConfig } from '../config/index.js';
+import { validateMediaListener } from '../config/listeners.js';
 import { RuntimeSettingsStore } from '../config/settings.js';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -30,6 +31,7 @@ export class ConsoleControl {
   recover?: (reason: string) => void;
   checkSession?: () => Promise<void>;
   error?: string;
+  media?: ConsoleStatus['media'];
   login?: DouyinLogin;
   assisting?: () => boolean;
   readonly startedAt = Date.now();
@@ -62,6 +64,7 @@ export class ConsoleControl {
             ? 'error'
             : 'starting',
       error: this.error,
+      media: this.media,
       channels: this.channels.list(),
       logs: this.logs.recent(),
       login: this.login?.status()
@@ -187,7 +190,12 @@ export async function createConsoleServer(
     }).strict().parse(request.query);
     return control.logs.read(query.after, query.stream);
   });
+  const validatePendingMedia = async (input: unknown, id?: string) => {
+    const current = control.channels.list();
+    validateMediaListener((await getSettings()).config(), [...current.filter(c => c.id !== id), input]);
+  };
   server.post('/api/channels', async (request, reply) => {
+    await validatePendingMedia(request.body);
     await control.channels.save(request.body);
     logger.info('创建通道');
     return reply.code(201).send({ ok: true });
@@ -195,6 +203,7 @@ export async function createConsoleServer(
   server.put<{ Params: { id: string } }>(
     '/api/channels/:id',
     async (request) => {
+      await validatePendingMedia(request.body, request.params.id);
       await control.channels.save(request.body, request.params.id);
       logger.info('更新通道配置');
       return { ok: true };

@@ -6,12 +6,11 @@ export interface ChannelInput {
   type: ChannelType;
   enabled: boolean;
   host: string;
-  port: number;
+  port?: number;
   url: string;
   accessToken: string;
   secret: string;
   timeoutMs: number;
-  publicBaseUrl: string;
 }
 export interface ConsoleChannel extends ChannelInput {
   id: string;
@@ -101,7 +100,14 @@ export interface ConsoleRuntime {
   diskSampledAt: number | null;
   network: Array<{ name: string; addresses: Array<{ address: string; family: string; cidr: string | null }> }>;
 }
+export interface ConsoleMediaService {
+  state: 'starting' | 'listening' | 'disabled' | 'error';
+  host: string;
+  port: number;
+  error?: string;
+}
 export interface ConsoleStatus {
+  media?: ConsoleMediaService;
   runtime: ConsoleRuntime;
   serverTime: number;
   startedAt: number;

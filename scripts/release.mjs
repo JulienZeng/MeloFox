@@ -54,7 +54,7 @@ async function pack() {
     await mkdir(root); await mkdir(output, { recursive: true });
     await copyTree('dist', join(root, 'dist'), path => /\.(js|json|html|css|svg|png|ico|woff2?)$/.test(path));
     await copyTree('proto', join(root, 'proto'), path => path.endsWith('.proto'));
-    for (const file of ['LICENSE', 'package.json', 'pnpm-lock.yaml', 'config/config.example.yaml']) {
+    for (const file of ['LICENSE', 'CHANGELOG.md', 'package.json', 'pnpm-lock.yaml', 'config/config.example.yaml']) {
       await mkdir(dirname(join(root, file)), { recursive: true }); await copyFile(file, join(root, file));
     }
     const deployment = (await readFile('.env.example', 'utf8'))
@@ -69,7 +69,7 @@ async function pack() {
     await writeFile(join(root, '.env.example'), deployment);
     await writeFile(join(root, 'docker-compose.yml'), compose);
     await writeJson(join(root, 'build-info.json'), info);
-    await writeFile(join(root, 'README.md'), `# MeloFox ${info.version}\n\n支持 OneBot 11。此包包含编译后的服务、管理台和协议文件，适用于各平台 Node.js，不包含 Node.js、依赖包或 Chromium。\n\n## 本机运行\n\n安装 Node.js 20.12+（推荐 24）、pnpm 9.15.3，以及 ffmpeg/ffprobe 后执行：\n\n\`\`\`sh\npnpm install --prod --frozen-lockfile\npnpm exec playwright install chromium\npnpm start\n\`\`\`\n\nLinux 可将浏览器安装命令换为 \`pnpm exec playwright install --with-deps chromium\`。无需执行 build。\n\n## Docker 运行\n\n\`\`\`sh\ncp .env.example .env\ndocker compose pull\ndocker compose up -d --no-build\n\`\`\`\n\n端口与数据卷可在 .env 中配置；运行参数首次导入后在管理台设置。打开 http://127.0.0.1:3000，默认管理账号 melofox，初始密码从服务端 data/console/admin-token 读取（Docker 为 /data/console/admin-token）。首次登录须修改密码。升级前备份并保留原登录资料和数据目录。\n\n构建提交：${info.commit}\n`);
+    await writeFile(join(root, 'README.md'), `# MeloFox ${info.version}\n\n支持 OneBot 11。此包包含编译后的服务、管理台和协议文件，适用于各平台 Node.js，不包含 Node.js、依赖包或 Chromium。\n\n## 本机运行\n\n安装 Node.js 20.12+（推荐 24）、pnpm 9.15.3，以及 ffmpeg/ffprobe 后执行：\n\n\`\`\`sh\npnpm install --prod --frozen-lockfile\npnpm exec playwright install chromium\npnpm start\n\`\`\`\n\nLinux 可将浏览器安装命令换为 \`pnpm exec playwright install --with-deps chromium\`。无需执行 build。\n\n## Docker 运行\n\n\`\`\`sh\ncp .env.example .env\ndocker compose pull\ndocker compose up -d --no-build\n\`\`\`\n\n端口与数据卷可在 .env 中配置；运行参数首次导入后在管理台设置。默认仅映射管理台 3000 和媒体服务 3001。在设置中配置接收端可达的媒体公开地址；OneBot 通道初始为空，地址、端口和令牌在网络配置中按需添加。HTTP / 正向 WebSocket 如需从宿主机或外部访问，另行添加 Compose 端口映射。升级时以已保存或迁移后的端口为准，同步调整映射和反向代理，并保留已有通道的映射。打开 http://127.0.0.1:3000，默认管理账号 melofox，初始密码从服务端 data/console/admin-token 读取（Docker 为 /data/console/admin-token）。首次登录须修改密码。升级前备份并保留原登录资料和数据目录。\n\n构建提交：${info.commit}\n`);
     const env = { ...process.env, COPYFILE_DISABLE: '1' };
     command('tar', ['-czf', join(output, `${name}.tar.gz`), '-C', temporary, name], { env });
     // Remove a previous zip first: zip otherwise retains entries removed since the previous run.

@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { ConfigSchema, type AppConfig } from './schema.js';
+import { migrateMediaConfig } from './media-migration.js';
 export { ConfigSchema, type AppConfig } from './schema.js';
 
 /** Read legacy YAML/env only when importing a new installation. */
@@ -11,7 +12,7 @@ export function loadConfig(configPath?: string, options: { environment?: NodeJS.
   const absolutePath = resolve(options.directory ?? process.cwd(), selected || 'config/config.example.yaml');
   if (selected && !existsSync(absolutePath)) throw new Error(`Config file not found: ${absolutePath}`);
   const parsed = existsSync(absolutePath) ? parseYaml(readFileSync(absolutePath, 'utf8')) : {};
-  return ConfigSchema.parse(applyEnvOverrides(ConfigSchema.parse(parsed), environment));
+  return ConfigSchema.parse(applyEnvOverrides(ConfigSchema.parse(migrateMediaConfig(parsed)), environment));
 }
 
 function applyEnvOverrides(config: AppConfig, environment: NodeJS.ProcessEnv): AppConfig {
@@ -51,8 +52,7 @@ function applyEnvOverrides(config: AppConfig, environment: NodeJS.ProcessEnv): A
         ...config.onebot.http,
         enabled: envBoolean('ONEBOT_HTTP_ENABLED') ?? config.onebot.http.enabled,
         host: envString('ONEBOT_HTTP_HOST') ?? config.onebot.http.host,
-        port: envNumber('ONEBOT_HTTP_PORT') ?? config.onebot.http.port,
-        publicBaseUrl: envString('ONEBOT_HTTP_PUBLIC_BASE_URL', true) || config.onebot.http.publicBaseUrl
+        port: envNumber('ONEBOT_HTTP_PORT') ?? config.onebot.http.port
       },
       reverseWs: {
         ...config.onebot.reverseWs,
@@ -71,19 +71,27 @@ function applyEnvOverrides(config: AppConfig, environment: NodeJS.ProcessEnv): A
         enabled: envBoolean('ONEBOT_FORWARD_WS_ENABLED') ?? config.onebot.forwardWs.enabled,
         host: envString('ONEBOT_FORWARD_WS_HOST') ?? config.onebot.forwardWs.host,
         port: envNumber('ONEBOT_FORWARD_WS_PORT') ?? config.onebot.forwardWs.port
-      },
-      mediaCache: {
-        ...config.onebot.mediaCache,
-        dir: envString('MEDIA_CACHE_DIR') ?? config.onebot.mediaCache.dir,
-        ttlMs: envNumber('MEDIA_CACHE_TTL_MS') ?? config.onebot.mediaCache.ttlMs,
-        cleanupIntervalMs: envNumber('MEDIA_CACHE_CLEANUP_INTERVAL_MS') ?? config.onebot.mediaCache.cleanupIntervalMs,
-        maxBytes: envNumber('MEDIA_CACHE_MAX_BYTES') ?? config.onebot.mediaCache.maxBytes,
-        maxFiles: envNumber('MEDIA_CACHE_MAX_FILES') ?? config.onebot.mediaCache.maxFiles,
-        maxFileBytes: envNumber('MEDIA_CACHE_MAX_FILE_BYTES') ?? config.onebot.mediaCache.maxFileBytes,
+      }
+    },
+    media: {
+      ...config.media,
+      enabled: envBoolean('MEDIA_ENABLED') ?? config.media.enabled,
+      host: envString('MEDIA_HOST') ?? config.media.host,
+      port: envNumber('MEDIA_PORT') ?? config.media.port,
+      publicBaseUrl: envString('MEDIA_PUBLIC_BASE_URL', true) ?? legacyMediaUrl() ?? config.media.publicBaseUrl,
+      signingKey: envString('MEDIA_SIGNING_KEY', true) ?? config.media.signingKey,
+      cache: {
+        ...config.media.cache,
+        dir: envString('MEDIA_CACHE_DIR') ?? config.media.cache.dir,
+        ttlMs: envNumber('MEDIA_CACHE_TTL_MS') ?? config.media.cache.ttlMs,
+        cleanupIntervalMs: envNumber('MEDIA_CACHE_CLEANUP_INTERVAL_MS') ?? config.media.cache.cleanupIntervalMs,
+        maxBytes: envNumber('MEDIA_CACHE_MAX_BYTES') ?? config.media.cache.maxBytes,
+        maxFiles: envNumber('MEDIA_CACHE_MAX_FILES') ?? config.media.cache.maxFiles,
+        maxFileBytes: envNumber('MEDIA_CACHE_MAX_FILE_BYTES') ?? config.media.cache.maxFileBytes,
         transcodeVideoToH264:
-          envBoolean('MEDIA_TRANSCODE_VIDEO_TO_H264') ?? config.onebot.mediaCache.transcodeVideoToH264,
-        ffmpegPath: envString('MEDIA_FFMPEG_PATH') ?? config.onebot.mediaCache.ffmpegPath,
-        ffprobePath: envString('MEDIA_FFPROBE_PATH') ?? config.onebot.mediaCache.ffprobePath
+          envBoolean('MEDIA_TRANSCODE_VIDEO_TO_H264') ?? config.media.cache.transcodeVideoToH264,
+        ffmpegPath: envString('MEDIA_FFMPEG_PATH') ?? config.media.cache.ffmpegPath,
+        ffprobePath: envString('MEDIA_FFPROBE_PATH') ?? config.media.cache.ffprobePath
       }
     },
     network: {
@@ -114,6 +122,16 @@ function applyEnvOverrides(config: AppConfig, environment: NodeJS.ProcessEnv): A
       realtimeMediaTimeoutMs: envNumber('RUNTIME_REALTIME_MEDIA_TIMEOUT_MS') ?? config.runtime.realtimeMediaTimeoutMs
     }
   };
+
+  function legacyMediaUrl(): string | undefined {
+    const old = envString('ONEBOT_HTTP_PUBLIC_BASE_URL', true);
+    if (old === undefined || old === '') return old;
+    const url = new URL(old);
+    const oldPort = envNumber('ONEBOT_HTTP_PORT') ?? config.onebot.http.port ?? 3001;
+    if (Number(url.port || (url.protocol === 'https:' ? 443 : 80)) === oldPort)
+      url.port = String(envNumber('MEDIA_PORT') ?? config.media.port);
+    return url.href.replace(/\/$/, '');
+  }
 
   function envString(name: string, allowEmpty = false): string | undefined {
     const value = environment[name];

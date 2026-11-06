@@ -27,7 +27,7 @@ function details(fields: Record<string, unknown>): string | undefined {
 
 export function createLogger(config: AppConfig, output: { write(text: string): unknown; isTTY?: boolean } = process.stdout): Logger {
   const buffer = new LogBuffer();
-  const secrets = [config.web.token, config.onebot.accessToken, config.onebot.reverseHttp.secret].filter(Boolean);
+  const secrets = [config.web.token, config.onebot.accessToken, config.onebot.reverseHttp.secret, config.media.signingKey].filter(Boolean);
   const logger = pino({
     level: config.app.logLevel,
     base: { scope: 'MeloFox' },

@@ -115,6 +115,11 @@ onBeforeUnmount(() => { active = false; window.removeEventListener('beforeunload
         </article>
         <form v-else-if="draft && group" class="settings-card runtime-settings-form" novalidate @submit.prevent="save">
           <div class="section-heading"><h2>{{ group.title }}</h2></div>
+          <p v-if="group.id === 'media-service' && state.data?.media" :class="state.data.media.state === 'error' ? 'error-text' : 'muted'" role="status">
+            当前状态：{{ ({ starting: '正在启动', listening: '正在监听', disabled: '已停用', error: '启动失败' })[state.data.media.state] }}
+            · {{ state.data.media.host }}:{{ state.data.media.port }}
+            <span v-if="state.data.media.error"> · {{ state.data.media.error }}</span>
+          </p>
           <fieldset :disabled="saving || loading">
             <div v-for="field in group.fields" :key="field.path" class="setting-field" :class="{ 'setting-switch': field.kind === 'boolean' }">
               <label :for="'setting-' + field.path">{{ field.label }}<span v-if="field.unit" class="setting-unit">{{ field.unit }}</span></label>

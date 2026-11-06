@@ -23,27 +23,21 @@ douyin:
   hookMode: "network"
 
 onebot:
+  # 默认不创建网络通道；启动后在控制台「网络配置」按需添加。
   # *_rate_limited 接口共用当前账号队列；单位毫秒。
   rateLimitIntervalMs: 500
   accessToken: ""
-  http:
-    enabled: true
-    host: "127.0.0.1"
-    port: 3001
-    publicBaseUrl: "http://127.0.0.1:3001"
-  reverseWs:
-    enabled: false
-    url: "ws://127.0.0.1:6700/onebot/v11/ws"
-  reverseHttp:
-    enabled: false
-    url: "http://127.0.0.1:5701"
-    secret: ""
-    timeoutMs: 10000
-  forwardWs:
-    enabled: true
-    host: "127.0.0.1"
-    port: 3002
-  mediaCache:
+
+# 独立媒体下载服务，与 OneBot API/事件通道分别管理。
+media:
+  enabled: true
+  host: "127.0.0.1"
+  port: 3001
+  # 填写接收端可达地址；留空从监听地址推导，同网 Docker 可用 http://melofox:3001。
+  publicBaseUrl: ""
+  # 可选，至少 16 个字符；链接携带资源签名，密钥本身不会出现在链接中。
+  signingKey: ""
+  cache:
     dir: "./media-cache"
     ttlMs: 604800000
     cleanupIntervalMs: 600000

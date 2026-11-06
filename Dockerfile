@@ -53,8 +53,8 @@ ENV NODE_ENV=production \
     RUNTIME_MESSAGE_CACHE_DIR=/data/message-cache \
     WEB_HOST=0.0.0.0 \
     WEB_DATA_DIR=/data/console \
-    ONEBOT_HTTP_HOST=0.0.0.0 \
-    ONEBOT_FORWARD_WS_HOST=0.0.0.0
+    MEDIA_HOST=0.0.0.0 \
+    MEDIA_PORT=3001
 
 # 与原 Playwright Noble 镜像保持相同 UID/GID，沿用现有数据卷权限。
 RUN groupadd --gid 1001 pwuser \
@@ -82,7 +82,7 @@ RUN mkdir -p /data/config /data/douyin-profile /data/media-cache /data/message-c
 
 USER pwuser
 VOLUME ["/data"]
-EXPOSE 3000 3001 3002
+EXPOSE 3000 3001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["node", "docker/healthcheck.mjs"]
 ENTRYPOINT ["tini", "--"]
 CMD ["node", "dist/index.js"]

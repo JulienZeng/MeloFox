@@ -52,7 +52,7 @@ export async function startOneBotHttpServer(
 
   server.addHook('onRequest', async (request, reply) => {
     const authStatus = authorizationStatus(config, request);
-    if (!request.url.startsWith('/media/') && authStatus !== 200) {
+    if (authStatus !== 200) {
       return reply.code(authStatus).send({
         status: 'failed',
         retcode: 10001,
@@ -76,18 +76,6 @@ export async function startOneBotHttpServer(
     messages: bridge?.getCacheStats(),
     media: await mediaRegistry?.getStats()
   }));
-
-  server.get('/media/:id', async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
-    if (!mediaRegistry) {
-      await reply.code(404).send({
-        status: 'failed',
-        message: 'Media registry is not attached'
-      });
-      return;
-    }
-
-    await mediaRegistry.serve(request, reply);
-  });
 
   server.get('/_debug/page', async () => {
     if (!browser) {

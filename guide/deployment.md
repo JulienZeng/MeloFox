@@ -46,12 +46,25 @@ pnpm start
 
 OneBot 的地址、端口、令牌、签名密钥、启用状态仍在「网络配置」管理，修改即时应用。首次导入的启用通道保存为 `WEB_DATA_DIR/channels.json`，此后以该文件为准。已有通道不会被首次生成运行设置的过程覆盖。
 
-- **HTTP**：提供 OneBot API、媒体下载与原有调试接口。
+- **HTTP**：提供 OneBot API 与原有调试接口。
 - **正向 WebSocket**：本服务监听，应用主动连接。
 - **反向 WebSocket**：本服务主动连接应用，适用于 AstrBot。
 - **反向 HTTP**：向应用 POST 事件，支持 HMAC-SHA1 签名、磁盘队列重试、心跳、启用/停用生命周期，以及回复/撤回自身消息的快速操作。该通道中的签名密钥用于 `X-Signature`；Access Token 用于其他通道的 API 鉴权。
 
-图片和视频的媒体下载需要至少一个启用的 HTTP 通道。多个 HTTP 通道共用媒体缓存，对外生成链接时使用列表中第一个启用的 HTTP 通道。机器人在其他设备上时，请将该通道的「媒体公开地址」设为机器人能够访问的地址。监听 `0.0.0.0` 只表示绑定所有网卡，不能作为远程访问地址。
+### 独立媒体服务
+
+媒体服务在「设置 → 媒体服务」管理，默认端口 `3001`，应用启动后即监听，独立于 OneBot 通道和抖音会话。关闭全部 OneBot HTTP 通道、退出抖音或会话重连时，已有且未过期的缓存仍可下载。OneBot HTTP 不再注册 `/media/` 路由，媒体服务也不提供 OneBot API 或管理 API。
+
+- **监听地址和端口**：Docker 默认 `0.0.0.0:3001`，本机默认 `127.0.0.1:3001`。不能与管理台或启用的 OneBot HTTP / 正向 WS 通道重复。
+- **媒体公开地址**：接收端真正能访问的根地址；同网容器可填写 `http://melofox:3001` 或 `http://douyin-onebot:3001`，跨机器填写宿主机 IP/域名和映射端口。支持反向代理路径前缀，代理需将该前缀移除后转发到媒体服务。
+- **下载签名密钥**：可选，至少 16 个字符。配置后返回链接自动附带针对该资源的 HMAC 签名；支持直接 GET、HEAD 和视频 Range 请求，不需要接收端添加 OneBot Authorization 头。密钥不会出现在链接中，签名随缓存删除/过期失效，修改密钥后旧签名立即失效。留空允许持有资源链接者下载。
+- **媒体缓存**：在「设置 → 媒体缓存」管理容量、TTL 和转换，配置存储于 `media.cache`。以上设置保存后重启应用生效。媒体服务启动失败时，管理台仍可访问，媒体服务页显示运行状态和错误，可修正后重启。
+
+首次升级会先保留 `settings.json.v1.bak`，再将 `settings.json` 从版本 1 原子迁移到版本 2，保留缓存目录、缓存索引、登录状态和通道令牌；已有通道文件中的媒体地址随后移除。迁移以第一个已启用 HTTP 通道的保存值为准，缺失时使用原配置。直连地址使用新媒体端口，外部反向代理的域名、端口和路径保持原值；默认 `3001` 被现有监听占用时，从 `3002` 起依次跳过已配置的监听端口。已有 OneBot 通道不会删除或改端口，已保存的独立媒体配置也不因默认值变化而覆盖。迁移之后不再从 env 或 OneBot 通道覆盖媒体配置。
+
+**升级部署时需同步端口：** 查看「设置 → 媒体服务」迁移后的监听端口，将 Compose 的 `MEDIA_TARGET_PORT` 设为该端口，`MEDIA_PORT` 设为可用的宿主机端口，并保留已有 OneBot 通道所需映射。同网容器直接连接媒体容器端口即可；反向代理将 `/media/` 上游切换到该端口。指向旧 OneBot HTTP 入口的媒体链接不再提供下载，重新接收或通过 `get_image` / `get_record` / `get_file` 查询可获取新地址；已有缓存文件不会因此删除。迁移不会自动修改服务器上的 Compose 或代理配置。
+
+旧 `ONEBOT_HTTP_PUBLIC_BASE_URL` 仅保留首次导入兼容，新部署使用 `MEDIA_PUBLIC_BASE_URL`。媒体监听端口在控制台修改后，应同步调整 Compose 的 `MEDIA_TARGET_PORT` 和公开地址；`MEDIA_PORT` 控制宿主机映射端口。关闭媒体服务会停止 HTTP 下载，已注册缓存仍可用于本机 OneBot 发送。
 
 管理台默认监听 `127.0.0.1:3000`，使用 HttpOnly / SameSite 会话 Cookie，登录有效期 12 小时。首次导入时设置 `WEB_ENABLED=false` 可关闭管理台；此模式仍从持久化设置启动，使用其中保存的初始 OneBot 通道配置。
 
@@ -126,9 +139,9 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 
 使用已发布镜像时，将 `.env` 的 `IMAGE_NAME` / `IMAGE_TAG` 改为对应仓库和标签，执行 `docker compose pull`、`docker compose up -d --no-build --pull never`，无需在部署机编译。`docker compose build` 使用 Dockerfile 默认构建参数；需要构建代理或覆盖构建参数时使用下方脚本。
 
-打开 http://127.0.0.1:3000，使用 `melofox` 和初始密码登录并完成改密，再在「抖音账号」扫码。Compose 内部端口固定为 3000/3001/3002，`.env` 的 `*_PORT` 控制宿主机端口，`*_BIND` 控制宿主机绑定 IP；首次导入时，容器的 `*_HOST`、内部端口、数据目录使用 Compose 中的固定值，ffmpeg/ffprobe 路径可在设置页调整。容器强制无头运行。管理端口默认只绑定宿主机回环地址；远程访问按需修改 `WEB_BIND` 并完成管理账号的首次改密。
+打开 http://127.0.0.1:3000，使用 `melofox` 和初始密码登录并完成改密，再在「抖音账号」扫码。Compose 默认仅映射管理台 3000 和媒体服务 3001，网络配置初始为空，不预置任何 OneBot 通道或映射。`.env` 的 `WEB_PORT` / `MEDIA_PORT` 控制宿主机端口，`WEB_BIND` / `MEDIA_BIND` 控制宿主机绑定 IP；首次导入时，管理台和媒体服务的监听地址、内部端口、数据目录使用 Compose 中的固定值，ffmpeg/ffprobe 路径可在设置页调整。容器强制无头运行。管理端口默认只绑定宿主机回环地址；远程访问按需修改 `WEB_BIND` 并完成管理账号的首次改密。
 
-反向 WS/HTTP 地址必须能从容器访问。机器人在宿主机时可用 `host.docker.internal`；同一个 Docker 网络的机器人可用服务名。`ONEBOT_HTTP_PUBLIC_BASE_URL` 是机器人读取媒体的地址，需要从机器人所在环境访问验证：跨机器填宿主机 IP/域名和映射端口；同网容器可用 `http://douyin-onebot:3001`。机器人在其他容器时，其 `127.0.0.1` 不代表网关。已有管理台通道以持久化配置为准，改 env 只影响首次导入；容器内新增 HTTP/正向 WS 通道时监听 `0.0.0.0`，使用新端口还需增加 Compose 映射。
+反向 WS/HTTP 地址必须能从容器访问。机器人在宿主机时可用 `host.docker.internal`；同一个 Docker 网络的机器人可用服务名。「设置 → 媒体服务 → 媒体公开地址」是机器人读取媒体的地址，需要从机器人所在环境访问验证：跨机器填宿主机 IP/域名和映射端口；同网容器可用 `http://douyin-onebot:3001`。机器人在其他容器时，其 `127.0.0.1` 不代表网关。已有管理台通道以持久化配置为准，改 env 只影响首次导入；容器内新增 HTTP/正向 WS 通道时监听 `0.0.0.0`，使用新端口还需增加 Compose 映射。
 
 所有持久状态位于 `/data`：`config/`、`douyin-profile/`、`media-cache/`、`message-cache/`、`console/`。默认命名卷为 `DOCKER_DATA_VOLUME=douyin-onebot-data`，新卷自动继承镜像目录权限；多实例使用不同卷名和宿主机端口。`docker compose down` 保留数据；`down -v` 会删除该卷。旧版的宿主机 `./data` 绑定目录不会自动迁移：停掉旧容器并备份后，将原有目录及已生成的 `config/` 复制到新卷并设置为 `pwuser` 所有，或通过 Compose override 将 `/data` 继续绑定到原目录，并保证容器用户有写权限；迁移完成前保留原数据。
 
