@@ -56,11 +56,10 @@ ENV NODE_ENV=production \
     MEDIA_HOST=0.0.0.0 \
     MEDIA_PORT=3001
 
-# 与原 Playwright Noble 镜像保持相同 UID/GID，沿用现有数据卷权限。
-RUN groupadd --gid 1001 pwuser \
-  && useradd --uid 1001 --gid pwuser --create-home --shell /bin/bash pwuser
-COPY --from=prod-deps --chown=pwuser:pwuser /app/package.json /app/pnpm-lock.yaml ./
-COPY --from=prod-deps --chown=pwuser:pwuser /app/node_modules ./node_modules
+# 容器内使用 root，直接读写宿主机绑定目录，无需额外初始化服务或修改目录属主。
+USER root
+COPY --from=prod-deps /app/package.json /app/pnpm-lock.yaml ./
+COPY --from=prod-deps /app/node_modules ./node_modules
 # 现有 headless: true 且未设置 channel 的启动方式使用 headless shell。
 # 不下载完整 Chromium、Firefox 或 WebKit；CLI 与生产依赖使用同一锁定版本。
 # 下载缓存仅保留在 BuildKit，网络中断后可复用，不进入运行镜像。
@@ -72,16 +71,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   && node node_modules/playwright/cli.js install --with-deps --only-shell chromium \
   && chmod -R a+rX /ms-playwright \
   && rm -rf /var/lib/apt/lists/* /root/.cache /root/.npm
-COPY --from=build --chown=pwuser:pwuser /app/dist ./dist
-COPY --chown=pwuser:pwuser LICENSE ./LICENSE
-COPY --chown=pwuser:pwuser proto ./proto
-COPY --chown=pwuser:pwuser config/config.example.yaml ./config/config.example.yaml
-COPY --chown=pwuser:pwuser docker/healthcheck.mjs ./docker/healthcheck.mjs
-RUN mkdir -p /data/config /data/douyin-profile /data/media-cache /data/message-cache /data/console \
-  && chown -R pwuser:pwuser /data
+COPY --from=build /app/dist ./dist
+COPY LICENSE ./LICENSE
+COPY proto ./proto
+COPY config/config.example.yaml ./config/config.example.yaml
+COPY docker/healthcheck.mjs ./docker/healthcheck.mjs
+RUN mkdir -p /data/config /data/douyin-profile /data/media-cache /data/message-cache /data/console
 
-USER pwuser
-VOLUME ["/data"]
 EXPOSE 3000 3001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["node", "docker/healthcheck.mjs"]
 ENTRYPOINT ["tini", "--"]

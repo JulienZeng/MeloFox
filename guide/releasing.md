@@ -85,7 +85,7 @@ git push origin v1.2.3
 每个 Release 包含：
 
 - `melofox-1.2.3.tar.gz`、`melofox-1.2.3.zip`：编译后的通用 Node.js 包，包含后端、管理台、协议文件、依赖清单、示例配置、运行说明、更新日志和 MIT 许可证。
-- `docker-compose.yml`、`melofox.env.example`：用于直接拉取该版本镜像；将后者复制为 `.env`。发布用 Compose 已移除本地 build，避免下载后缺少源码或 Dockerfile。
+- `docker-compose.yml`、`melofox.env.example`：用于直接拉取该版本镜像；将后者复制为 `.env`。发布用 Compose 已移除本地 build，避免下载后缺少源码或 Dockerfile。仅启动应用容器，全部状态绑定到同目录的 `./data`，无需手动创建目录或修改权限。
 - `build-info.json`：版本、tag、源码提交及镜像仓库。
 - `image-digest.txt`：合并后的多架构镜像固定引用。
 - `SHA256SUMS`：全部附件的 SHA256 校验和。
@@ -113,7 +113,7 @@ docker compose up -d --no-build
 
 新安装仅默认映射管理台 `3000` 和媒体服务 `3001`，OneBot 通道按需创建。升级到独立媒体服务的版本时，按实际迁移后的媒体端口调整 Compose 映射和反向代理，并保留原 OneBot 通道的映射，具体见[媒体服务迁移](deployment.md#独立媒体服务)。
 
-已有部署不要覆盖现有 `.env` 和数据卷。将 `IMAGE_NAME` 设为配置的 Docker Hub 仓库，将 `IMAGE_TAG` 改为目标版本后更新即可；使用精确版本可以避免自动跟随 latest。
+已有部署不要覆盖现有 `.env` 和数据目录。旧命名卷按部署文档迁移到 `./data`；全新初始化则使用空目录，旧卷不会自动导入。将 `IMAGE_NAME` 设为配置的 Docker Hub 仓库，将 `IMAGE_TAG` 改为目标版本后更新即可；使用精确版本可以避免自动跟随 latest。
 
 下载全部附件后，在 Linux 执行 `sha256sum --check SHA256SUMS`，macOS 执行 `shasum -a 256 --check SHA256SUMS`。只下载部分附件时，只校验对应条目。
 

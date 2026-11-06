@@ -1,5 +1,5 @@
 services:
-  # MeloFox 服务；保留历史服务名及数据卷名，兼容已有部署和服务发现。
+  # MeloFox 服务；保留历史服务名，兼容已有部署和服务发现。
   douyin-onebot:
     image: ${IMAGE_NAME:-melofox}:${IMAGE_TAG:-latest}
     # 本地单架构可 docker compose build；多架构/构建代理见 .build.env 和 build-multiarch.sh。
@@ -7,6 +7,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ${CONTAINER_NAME:-douyin-onebot}
+    # 兼容旧镜像的 pwuser 默认值，直接写入绑定目录，无需手动调整宿主机权限。
+    user: "0:0"
     restart: unless-stopped
     shm_size: ${DOCKER_SHM_SIZE:-1gb}
     stop_grace_period: ${DOCKER_STOP_GRACE_PERIOD:-120s}
@@ -39,12 +41,8 @@ services:
       MEDIA_CACHE_DIR: /data/media-cache
       RUNTIME_MESSAGE_CACHE_DIR: /data/message-cache
     volumes:
-      # 命名卷继承镜像 /data 的 pwuser 权限，不依赖宿主机目录属主。
-      - douyin-data:/data
+      # 所有持久化文件都写入 Compose 所在目录的 data/，不使用命名卷。
+      - ./data:/data
     ports:
       - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3000}:3000"
       - "${MEDIA_BIND:-127.0.0.1}:${MEDIA_PORT:-3001}:${MEDIA_TARGET_PORT:-3001}"
-
-volumes:
-  douyin-data:
-    name: ${DOCKER_DATA_VOLUME:-douyin-onebot-data}

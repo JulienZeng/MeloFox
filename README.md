@@ -73,7 +73,7 @@ docker compose up -d --no-build --pull never
 docker compose exec douyin-onebot cat /data/console/admin-token
 ```
 
-默认构建本地镜像 `melofox:latest`，基于 Node 24 Debian slim，包含已打包的后端和 Vue 管理台，以及无头模式使用的 Chromium headless shell、ffmpeg / ffprobe。仅安装所需浏览器及系统依赖，容器以非 root 用户运行。
+默认构建本地镜像 `melofox:latest`，基于 Node 24 Debian slim，包含已打包的后端和 Vue 管理台，以及无头模式使用的 Chromium headless shell、ffmpeg / ffprobe。仅安装所需浏览器及系统依赖，容器内默认以 root 运行。
 
 | 服务 | 默认宿主机地址 | 用途 |
 | --- | --- | --- |
@@ -82,7 +82,7 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 
 以上端口映射由 `.env` 的 `WEB_*` / `MEDIA_*` 配置。OneBot 通道无预设地址或端口，按需在「网络配置」添加；HTTP / 正向 WebSocket 通道如需从宿主机或外部访问，须自行添加对应 Compose 端口映射。反向连接宿主机上的机器人可使用 `host.docker.internal`。
 
-为兼容现有部署，Compose 服务名仍为 `douyin-onebot`，默认数据卷仍为 `douyin-onebot-data`。卷内 `/data` 保存登录资料、通道配置、消息和媒体缓存。`docker compose down` 保留数据，`down -v` 会删除数据卷。**旧版 `./data` 绑定目录不会自动迁入命名卷**，升级前按[数据迁移说明](guide/deployment.md#docker)处理。
+Compose 只有一个 `douyin-onebot` 服务，使用 `./data:/data` 将所有持久化状态保存在 Compose 文件同目录。目录自动创建，无需手动建目录或改权限。`docker compose down` 和 `down -v` 都会保留这个宿主机目录；需要重置时，停服务后备份并移走整个 `./data`。**旧命名卷不会自动复制或删除**；保留旧数据时按[迁移说明](guide/deployment.md#docker)处理。
 
 应用运行参数在首次启动时从 `.env` / YAML 导入，缺失项使用默认值，然后保存为 `/data/config/settings.json`（本机为 `data/config/settings.json`）。后续启动只读取保存的设置，不再从 env 覆盖。日志、消息处理、缓存、超时和下载代理在控制台「设置」修改，保存后重启服务生效；OneBot 地址与令牌在「网络配置」即时管理。Compose 仅保留容器部署参数和首次初始化的固定路径/端口，需要 Docker Compose 2.24+。
 

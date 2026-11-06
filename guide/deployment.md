@@ -124,7 +124,7 @@ Dockerfile 基于 `node:24-bookworm-slim`，使用多阶段构建：Node 后端�
 
 容器沿用无头模式，只安装其实际使用的 Chromium headless shell 及对应系统依赖，保留 ffmpeg/ffprobe、中文字体和 tini。浏览器通过生产依赖中的 Playwright CLI 下载，`PLAYWRIGHT_VERSION` 与锁文件不一致时构建失败；不再继承包含 Firefox、WebKit 和完整 Chromium 的通用镜像。此方式保持现有 `headless: true`、未设置 `channel` 的启动行为，管理台截图与官方页面辅助验证仍可使用，参见 [Playwright headless shell](https://playwright.dev/docs/browsers#chromium-headless-shell)。Docker 镜像用于无头运行，本机的有界面运行方式不受影响。
 
-容器继续以 `pwuser`（UID/GID `1001:1001`）运行，与原 Playwright Noble 镜像一致，可沿用已有数据卷。`NODE_IMAGE` 可在 `.build.env` 中覆盖为同一 Node Debian slim 镜像的可信镜像源或固定 digest；旧 `.build.env` 未配置时使用默认值。apt 下载包缓存在 BuildKit 中供重试复用，不进入运行镜像；构建结束清理 apt 索引及其他下载缓存。
+容器内默认以 root 运行，直接读写绑定目录。Compose 已设置运行用户，可兼容默认使用 `pwuser` 的旧镜像，无需部署者另行设置 UID/GID。`NODE_IMAGE` 可在 `.build.env` 中覆盖为同一 Node Debian slim 镜像的可信镜像源或固定 digest；旧 `.build.env` 未配置时使用默认值。apt 下载包缓存在 BuildKit 中供重试复用，不进入运行镜像；构建结束清理 apt 索引及其他下载缓存。
 
 首次本地构建并部署（已有 `.env` 时直接编辑，不覆盖）：
 
@@ -143,9 +143,15 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 
 反向 WS/HTTP 地址必须能从容器访问。机器人在宿主机时可用 `host.docker.internal`；同一个 Docker 网络的机器人可用服务名。「设置 → 媒体服务 → 媒体公开地址」是机器人读取媒体的地址，需要从机器人所在环境访问验证：跨机器填宿主机 IP/域名和映射端口；同网容器可用 `http://douyin-onebot:3001`。机器人在其他容器时，其 `127.0.0.1` 不代表网关。已有管理台通道以持久化配置为准，改 env 只影响首次导入；容器内新增 HTTP/正向 WS 通道时监听 `0.0.0.0`，使用新端口还需增加 Compose 映射。
 
-所有持久状态位于 `/data`：`config/`、`douyin-profile/`、`media-cache/`、`message-cache/`、`console/`。默认命名卷为 `DOCKER_DATA_VOLUME=douyin-onebot-data`，新卷自动继承镜像目录权限；多实例使用不同卷名和宿主机端口。`docker compose down` 保留数据；`down -v` 会删除该卷。旧版的宿主机 `./data` 绑定目录不会自动迁移：停掉旧容器并备份后，将原有目录及已生成的 `config/` 复制到新卷并设置为 `pwuser` 所有，或通过 Compose override 将 `/data` 继续绑定到原目录，并保证容器用户有写权限；迁移完成前保留原数据。
+所有持久状态绑定到 **Compose 文件同目录的 `./data` → 容器 `/data`**，包含 `config/`、`douyin-profile/`、`media-cache/`、`message-cache/`、`console/`。默认不创建命名卷或匿名卷，不再使用 `DOCKER_DATA_VOLUME`。多实例使用不同部署目录和宿主机端口。
 
-健康检查只确认管理台 HTTP 或（管理台关闭时）OneBot HTTP 服务可用，不把未扫码/IM 离线视为容器故障；两种 HTTP 入口都关闭时跳过探测。`unhealthy` 是诊断状态，Docker 不会仅因该状态自动重启容器；`restart: unless-stopped` 处理进程退出后的重启。`docker compose ps` 查看状态，`docker compose logs --tail=100` 查看日志。共享内存、停止宽限、日志轮转均可通过已注释的 Docker 环境变量调整。
+首次启动时，Docker 自动创建 `./data`，应用按需创建各子目录。直接执行 `docker compose up -d` 即可，无需预先执行 `mkdir`、`chown` 或 `chmod`，也没有单独的初始化容器。
+
+`docker compose down` 与 `down -v` 都不会删除绑定的宿主机目录。需要完全重置时，先停止服务，再备份并移走整个 `./data`，下次启动会创建新目录；只删除 `config/` 而保留 `console/` 会留下旧通道和管理账号。
+
+旧部署使用的命名卷（如 `douyin-onebot-data`）不会自动迁移或删除。需要保留旧状态时，停掉旧服务并备份，使用 `docker volume inspect` 确认实际卷，将完整数据复制到新 `./data` 并保留权限；从零部署则保持 `./data` 为空。不要把两个实例的数据混用，旧卷确认不再需要后再单独清理。
+
+健康检查优先检查管理台 HTTP；管理台关闭时依次检查媒体服务和 OneBot HTTP，不把未扫码/IM 离线视为容器故障；所有 HTTP 入口都关闭时跳过探测。`unhealthy` 是诊断状态，Docker 不会仅因该状态自动重启容器；`restart: unless-stopped` 处理进程退出后的重启。`docker compose ps` 查看状态，`docker compose logs --tail=100` 查看日志。共享内存、停止宽限、日志轮转均可通过已注释的 Docker 环境变量调整。
 
 ### 镜像构建与代理
 
@@ -170,4 +176,4 @@ BUILD_ENV_FILE=/path/to/build.env ./build-multiarch.sh
 
 项目名称为 **MeloFox（音狐）**，包名及 `get_version_info.app_name` 为 `melofox`；协议版本继续为 `11`。管理台、启动日志、`#dy` 回复与 HTTP 健康接口均使用新名称，新示例的镜像名为 `melofox`。
 
-已有部署继续使用原配置：Compose 服务名和默认容器名 `douyin-onebot`、数据卷名 `douyin-onebot-data`、构建器名 `douyin-onebot-builder`、`DOUYIN_ONEBOT_*` 环境变量，以及原数据目录和浏览器主题偏好键均保留。因此，`docker compose exec` 仍使用 `douyin-onebot` 服务名。已有 `.env` / `.build.env` 中的仓库地址和代理值不自动改写；更换镜像仓库时自行同步两份文件的 `IMAGE_NAME` / `IMAGE_TAG`。
+Compose 服务名和默认容器名 `douyin-onebot`、构建器名 `douyin-onebot-builder`、`DOUYIN_ONEBOT_*` 环境变量，以及浏览器主题偏好键均保留。持久化现改为 Compose 同目录的 `./data`，旧命名卷请按上方迁移说明处理。`docker compose exec` 仍使用 `douyin-onebot` 服务名。已有 `.env` / `.build.env` 中的仓库地址和代理值不自动改写；更换镜像仓库时自行同步两份文件的 `IMAGE_NAME` / `IMAGE_TAG`。
