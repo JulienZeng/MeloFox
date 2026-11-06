@@ -39,6 +39,7 @@ RUN pnpm install --prod --frozen-lockfile --registry="${NPM_REGISTRY}" \
 
 # 不携带源码、Vite、Vue 编译器或构建阶段的 pnpm/npm registry 配置。
 FROM ${NODE_IMAGE} AS runtime
+LABEL org.opencontainers.image.licenses="MIT"
 WORKDIR /app
 ENV NODE_ENV=production \
     MELOFOX_CONFIG_DIR=/data/config \
@@ -72,6 +73,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   && chmod -R a+rX /ms-playwright \
   && rm -rf /var/lib/apt/lists/* /root/.cache /root/.npm
 COPY --from=build --chown=pwuser:pwuser /app/dist ./dist
+COPY --chown=pwuser:pwuser LICENSE ./LICENSE
 COPY --chown=pwuser:pwuser proto ./proto
 COPY --chown=pwuser:pwuser config/config.example.yaml ./config/config.example.yaml
 COPY --chown=pwuser:pwuser docker/healthcheck.mjs ./docker/healthcheck.mjs

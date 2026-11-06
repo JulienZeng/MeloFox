@@ -170,3 +170,7 @@ dist/                构建产物
 - [OneBot 11](https://github.com/botuniverse/onebot-11)：通信、API、消息段与事件规范。
 - [DouYin_Spider](https://github.com/cv-cat/DouYin_Spider/tree/fc8b9c2490a9561265425c26058290f01c064eda)：抖音私信消息结构和身份安全接口参考。
 - [NapCatQQ](https://github.com/NapNeko/NapCatQQ/blob/98d781d19815d1625b24d717ce280ecf0a4f6d0c/packages/napcat-plugin-builtin/index.ts#L303-L375)：内置状态命令的交互参考。
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。

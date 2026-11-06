@@ -2,6 +2,7 @@
   "name": "melofox",
   "version": "0.1.0",
   "description": "MeloFox — a OneBot 11 gateway for Douyin group chats and existing private conversations.",
+  "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

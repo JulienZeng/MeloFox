@@ -54,7 +54,7 @@ async function pack() {
     await mkdir(root); await mkdir(output, { recursive: true });
     await copyTree('dist', join(root, 'dist'), path => /\.(js|json|html|css|svg|png|ico|woff2?)$/.test(path));
     await copyTree('proto', join(root, 'proto'), path => path.endsWith('.proto'));
-    for (const file of ['package.json', 'pnpm-lock.yaml', 'config/config.example.yaml']) {
+    for (const file of ['LICENSE', 'package.json', 'pnpm-lock.yaml', 'config/config.example.yaml']) {
       await mkdir(dirname(join(root, file)), { recursive: true }); await copyFile(file, join(root, file));
     }
     const deployment = (await readFile('.env.example', 'utf8'))

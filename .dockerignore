@@ -1,6 +1,7 @@
 # 白名单上下文：本机登录态、令牌、env、抓包、缓存及 Git 历史均不发送给构建器。
 **
 !package.json
+!LICENSE
 !pnpm-lock.yaml
 !tsconfig.json
 !src/

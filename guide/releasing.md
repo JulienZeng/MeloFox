@@ -60,7 +60,7 @@ git push origin v1.2.3
 
 每个 Release 包含：
 
-- `melofox-1.2.3.tar.gz`、`melofox-1.2.3.zip`：编译后的通用 Node.js 包，包含后端、管理台、协议文件、依赖清单、示例配置和运行说明。
+- `melofox-1.2.3.tar.gz`、`melofox-1.2.3.zip`：编译后的通用 Node.js 包，包含后端、管理台、协议文件、依赖清单、示例配置、运行说明和 MIT 许可证。
 - `docker-compose.yml`、`melofox.env.example`：用于直接拉取该版本镜像；将后者复制为 `.env`。发布用 Compose 已移除本地 build，避免下载后缺少源码或 Dockerfile。
 - `build-info.json`：版本、tag、源码提交及镜像仓库。
 - `image-digest.txt`：合并后的多架构镜像固定引用。
