@@ -30,7 +30,7 @@ export async function registerConsoleDevAssets(
     // Close upgraded HMR sockets before Fastify waits for the HTTP server to close.
     server.addHook('preClose', async () => { await vite.close(); });
     server.addHook('onRequest', async (request, reply) => {
-      if (!['GET', 'HEAD'].includes(request.method) || request.url.startsWith('/api/')) return;
+      if (!['GET', 'HEAD'].includes(request.method) || request.url.startsWith('/api/') || request.routeOptions.url === '/healthz') return;
       // Vite writes to the raw response, so copy Fastify's security headers first.
       for (const [name, value] of Object.entries(reply.getHeaders())) {
         if (value !== undefined) reply.raw.setHeader(name, value);

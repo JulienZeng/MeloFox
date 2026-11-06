@@ -68,6 +68,7 @@ export async function startGatewaySession(config: AppConfig, logger: AppLogger, 
     browser = await startBrowserRuntime(config, logger, { onNetworkEvent: event => { realtime.enqueue(event); } });
     if (console) { console.browser = browser; console.recover = recover; console.error = undefined; }
     bridge = new DouyinBridge(browser.page, logger, {
+      mediaProxy: config.network,
       requestRestart: delay => restart.request(delay),
       actionTimeoutMs: config.runtime.actionTimeoutMs,
       logMessageContent: config.app.logMessageContent,

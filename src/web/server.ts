@@ -1,6 +1,9 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppConfig } from '../config/index.js';
+import { RuntimeSettingsStore } from '../config/settings.js';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { loggerBuffer, scopedLogger, type AppLogger } from '../logger/index.js';
 import { LogBuffer } from '../logger/buffer.js';
 import type { BrowserRuntime } from '../browser/chromium.js';
@@ -70,7 +73,7 @@ export async function createConsoleServer(
   config: AppConfig,
   logger: AppLogger,
   control: ConsoleControl,
-  options: { development?: boolean } = {}
+  options: { development?: boolean; settings?: RuntimeSettingsStore; restart?: () => void } = {}
 ): Promise<FastifyInstance> {
   logger = scopedLogger(logger, '管理台');
   control.logs = loggerBuffer(logger);
@@ -85,6 +88,8 @@ export async function createConsoleServer(
   const assist = new LoginAssist(() => control.browser);
   control.assisting = () => assist.active;
   const server = Fastify({ bodyLimit: 16 * 1024, requestTimeout: 15_000 });
+  const instanceId = randomUUID();
+  let restartPending = false, restartStarted = false;
   let developmentNonce: string | undefined;
   server.addHook('onRequest', async (request, reply) => {
     reply
@@ -136,6 +141,36 @@ export async function createConsoleServer(
     });
   });
   await registerConsoleAuthentication(server, config, logger);
+  // Public readiness exposes no account/configuration details. The browser uses
+  // the boot ID to distinguish a new process from the old, still-draining one.
+  server.get('/healthz', async () => ({ instanceId, status: restartPending ? 'restarting' : 'ready' }));
+  server.addHook('preHandler', async (request, reply) => {
+    if (restartPending && !['GET', 'HEAD'].includes(request.method) && request.routeOptions.url !== '/api/service/restart')
+      return reply.code(503).send({ message: '服务正在重启，请等待恢复后操作' });
+  });
+  server.post('/api/service/restart', {
+    onResponse: async (_request, reply) => {
+      // Send the acknowledgement before closing the HTTP connection. Repeated
+      // clicks/requests belong to the same restart and cannot schedule another.
+      if (reply.statusCode === 202 && !restartStarted) {
+        restartStarted = true;
+        options.restart!();
+      }
+    },
+  }, async (_request, reply) => {
+    if (!options.restart) return reply.code(503).send({ message: '当前启动方式未接入服务重启，请通过 MeloFox 启动入口运行' });
+    restartPending = true;
+    return reply.code(202).send({ instanceId, status: 'restarting' });
+  });
+  if (options.settings) await options.settings.forgetInitialPassword();
+  let settings = options.settings;
+  const getSettings = async () => settings ??= await RuntimeSettingsStore.fromConfig(config, join(config.web.dataDir, 'settings.json'));
+  server.get('/api/settings', async () => (await getSettings()).snapshot());
+  server.put('/api/settings', async request => {
+    const result = await (await getSettings()).save(request.body);
+    logger.info(result.restartRequired ? '运行设置已保存，重启 MeloFox 后生效' : '运行设置已保存');
+    return result;
+  });
   server.addHook('onReady', () => control.metrics.start(config.web.dataDir));
   server.addHook('onClose', () => control.metrics.stop());
   if (options.development) {

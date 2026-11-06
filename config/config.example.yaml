@@ -1,3 +1,4 @@
+# 可选的首次导入模板；保存 settings.json 后不再读取，运行参数请在控制台设置页修改。
 web:
   enabled: true
   host: "127.0.0.1"
@@ -51,6 +52,12 @@ onebot:
     maxFileBytes: 134217728
     transcodeVideoToH264: true
     ffmpegPath: "ffmpeg"
+
+# 媒体下载代理，不代理浏览器或 OneBot 连接。
+network:
+  httpProxy: ""
+  httpsProxy: ""
+  noProxy: "localhost,127.0.0.1,::1"
 
 runtime:
   reconnectIntervalMs: 5000

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 
-/** Preserve shell/container overrides while loading the existing local deployment profile. */
+/** First-import helper: preserve explicit overrides; callers must skip this once settings are saved. */
 export function loadStartupEnvironment(
   directory = process.cwd(),
   environment: NodeJS.ProcessEnv = process.env

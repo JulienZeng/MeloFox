@@ -1,107 +1,20 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { z } from 'zod';
+import { ConfigSchema, type AppConfig } from './schema.js';
+export { ConfigSchema, type AppConfig } from './schema.js';
 
-const ConfigSchema = z.object({
-  web: z.object({
-    enabled: z.boolean().default(true),
-    host: z.string().default('127.0.0.1'),
-    port: z.number().int().min(1).max(65535).default(3000),
-    token: z.string().default(''),
-    dataDir: z.string().min(1).default('./data/console')
-  }).default({}),
-  app: z.object({
-    selfId: z.string().min(1),
-    logLevel: z.string().default('info'),
-    logFormat: z.enum(['pretty', 'json']).default('pretty'),
-    logMessageContent: z.boolean().default(true)
-  }),
-  browser: z.object({
-    userDataDir: z.string().min(1),
-    headless: z.boolean().default(true),
-    douyinUrl: z.string().url()
-  }),
-  douyin: z.object({
-    messagePageUrl: z.string().url(),
-    hookMode: z.enum(['network', 'injection', 'dom']).default('network')
-  }),
-  onebot: z.object({
-    rateLimitIntervalMs: z.number().int().min(0).max(60000).default(500),
-    accessToken: z.string().default(''),
-    http: z.object({
-      enabled: z.boolean().default(true),
-      host: z.string().default('127.0.0.1'),
-      port: z.number().int().positive().default(3001),
-      publicBaseUrl: z.string().url().optional()
-    }),
-    reverseWs: z.object({
-      enabled: z.boolean().default(false),
-      url: z.string().url()
-    }),
-    reverseHttp: z.object({
-      enabled: z.boolean().default(false),
-      url: z.string().url().refine(value => {
-        const url = new URL(value);
-        return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.hash;
-      }).default('http://127.0.0.1:5701'),
-      secret: z.string().max(512).default(''),
-      timeoutMs: z.number().int().min(100).max(60000).default(10000)
-    }).default({}),
-    forwardWs: z.object({
-      enabled: z.boolean().default(true),
-      host: z.string().default('127.0.0.1'),
-      port: z.number().int().positive().default(3002)
-    }),
-    mediaCache: z.object({
-      dir: z.string().min(1).default('./media-cache'),
-      ttlMs: z.number().int().positive().default(7 * 86400000),
-      cleanupIntervalMs: z.number().int().positive().default(10 * 60 * 1000),
-      maxBytes: z.number().int().positive().safe().default(1024 * 1024 * 1024),
-      maxFiles: z.number().int().positive().default(1000),
-      maxFileBytes: z.number().int().positive().safe().default(128 * 1024 * 1024),
-      transcodeVideoToH264: z.boolean().default(true),
-      ffmpegPath: z.string().min(1).default('ffmpeg'),
-      ffprobePath: z.string().min(1).default('ffprobe')
-    })
-  }),
-  runtime: z.object({
-    reconnectIntervalMs: z.number().int().positive().default(5000),
-    actionTimeoutMs: z.number().int().positive().default(15000),
-    videoSendTimeoutMs: z.number().int().positive().default(120000),
-    fileSendAllowedDirs: z.array(z.string().min(1)).default([]),
-    fileSendEnabled: z.boolean().default(false),
-    shareAsText: z.boolean().default(false),
-    stickerAsText: z.boolean().default(true),
-    heartbeatIntervalMs: z.number().int().positive().default(30000),
-    sessionCheckIntervalMs: z.number().int().positive().default(30000),
-    imDisconnectGraceMs: z.number().int().positive().default(60000),
-    messageCacheLimit: z.number().int().positive().default(10000),
-    messageCacheTtlMs: z.number().int().positive().default(7 * 86400000),
-    messageCachePersist: z.boolean().default(true),
-    messageCacheDir: z.string().min(1).default('./message-cache'),
-    messageCacheFlushIntervalMs: z.number().int().positive().default(5000),
-    realtimeQueueLimit: z.number().int().positive().default(10000),
-    realtimeMediaConcurrency: z.number().int().positive().default(2),
-    realtimeMediaDetailWaitMs: z.number().int().positive().default(5000),
-    realtimeMediaTimeoutMs: z.number().int().positive().default(120000)
-  })
-});
-
-export type AppConfig = z.infer<typeof ConfigSchema>;
-
-export function loadConfig(configPath = process.env.DOUYIN_ONEBOT_CONFIG ?? 'config/config.example.yaml'): AppConfig {
-  const absolutePath = resolve(process.cwd(), configPath);
-  if (!existsSync(absolutePath)) {
-    throw new Error(`Config file not found: ${absolutePath}`);
-  }
-
-  const raw = readFileSync(absolutePath, 'utf8');
-  const parsed = parseYaml(raw);
-  return ConfigSchema.parse(applyEnvOverrides(ConfigSchema.parse(parsed)));
+/** Read legacy YAML/env only when importing a new installation. */
+export function loadConfig(configPath?: string, options: { environment?: NodeJS.ProcessEnv; directory?: string } = {}): AppConfig {
+  const environment = options.environment ?? process.env;
+  const selected = configPath ?? environment.DOUYIN_ONEBOT_CONFIG;
+  const absolutePath = resolve(options.directory ?? process.cwd(), selected || 'config/config.example.yaml');
+  if (selected && !existsSync(absolutePath)) throw new Error(`Config file not found: ${absolutePath}`);
+  const parsed = existsSync(absolutePath) ? parseYaml(readFileSync(absolutePath, 'utf8')) : {};
+  return ConfigSchema.parse(applyEnvOverrides(ConfigSchema.parse(parsed), environment));
 }
 
-function applyEnvOverrides(config: AppConfig): AppConfig {
+function applyEnvOverrides(config: AppConfig, environment: NodeJS.ProcessEnv): AppConfig {
   return {
     ...config,
     web: {
@@ -115,7 +28,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     app: {
       ...config.app,
       selfId: envString('APP_SELF_ID') ?? config.app.selfId,
-      logLevel: envString('APP_LOG_LEVEL') ?? config.app.logLevel,
+      logLevel: (envString('APP_LOG_LEVEL') as AppConfig['app']['logLevel'] | undefined) ?? config.app.logLevel,
       logFormat: (envString('APP_LOG_FORMAT') as AppConfig['app']['logFormat'] | undefined) ?? config.app.logFormat,
       logMessageContent: envBoolean('APP_LOG_MESSAGE_CONTENT') ?? config.app.logMessageContent
     },
@@ -173,6 +86,11 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
         ffprobePath: envString('MEDIA_FFPROBE_PATH') ?? config.onebot.mediaCache.ffprobePath
       }
     },
+    network: {
+      httpProxy: envString('http_proxy', true) ?? envString('HTTP_PROXY', true) ?? config.network.httpProxy,
+      httpsProxy: envString('https_proxy', true) ?? envString('HTTPS_PROXY', true) ?? config.network.httpsProxy,
+      noProxy: envString('no_proxy', true) ?? envString('NO_PROXY', true) ?? config.network.noProxy
+    },
     runtime: {
       ...config.runtime,
       reconnectIntervalMs: envNumber('RUNTIME_RECONNECT_INTERVAL_MS') ?? config.runtime.reconnectIntervalMs,
@@ -196,41 +114,41 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
       realtimeMediaTimeoutMs: envNumber('RUNTIME_REALTIME_MEDIA_TIMEOUT_MS') ?? config.runtime.realtimeMediaTimeoutMs
     }
   };
-}
 
-function envString(name: string, allowEmpty = false): string | undefined {
-  const value = process.env[name];
-  if (value === undefined) {
-    return undefined;
+  function envString(name: string, allowEmpty = false): string | undefined {
+    const value = environment[name];
+    if (value === undefined) {
+      return undefined;
+    }
+    if (!allowEmpty && value === '') {
+      return undefined;
+    }
+    return value;
   }
-  if (!allowEmpty && value === '') {
-    return undefined;
-  }
-  return value;
-}
 
-function envNumber(name: string): number | undefined {
-  const value = envString(name);
-  if (value === undefined) {
-    return undefined;
+  function envNumber(name: string): number | undefined {
+    const value = envString(name);
+    if (value === undefined) {
+      return undefined;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`Invalid numeric environment variable ${name}: ${value}`);
+    }
+    return parsed;
   }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`Invalid numeric environment variable ${name}: ${value}`);
-  }
-  return parsed;
-}
 
-function envBoolean(name: string): boolean | undefined {
-  const value = envString(name)?.toLowerCase();
-  if (value === undefined) {
-    return undefined;
+  function envBoolean(name: string): boolean | undefined {
+    const value = envString(name)?.toLowerCase();
+    if (value === undefined) {
+      return undefined;
+    }
+    if (['1', 'true', 'yes', 'y', 'on'].includes(value)) {
+      return true;
+    }
+    if (['0', 'false', 'no', 'n', 'off'].includes(value)) {
+      return false;
+    }
+    throw new Error(`Invalid boolean environment variable ${name}: ${environment[name]}`);
   }
-  if (['1', 'true', 'yes', 'y', 'on'].includes(value)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'n', 'off'].includes(value)) {
-    return false;
-  }
-  throw new Error(`Invalid boolean environment variable ${name}: ${process.env[name]}`);
 }

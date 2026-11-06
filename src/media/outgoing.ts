@@ -1,4 +1,5 @@
 import { Agent, EnvHttpProxyAgent } from 'undici';
+import type { AppConfig } from '../config/index.js';
 
 export interface MediaDownloadOptions { cache?: boolean; proxy?: boolean; timeout?: number }
 
@@ -22,7 +23,8 @@ export class OutgoingMediaCache {
   private readonly items = new Map<string, { bytes: Buffer; expires: number }>();
   private bytes = 0;
   private generation = 0;
-  constructor(private readonly capacity = 64 * 1024 * 1024, private readonly ttlMs = 10 * 60 * 1000) {}
+  constructor(private readonly capacity = 64 * 1024 * 1024, private readonly ttlMs = 10 * 60 * 1000,
+    private readonly proxySettings?: AppConfig['network']) {}
   clear(): void { this.generation++; this.items.clear(); this.bytes = 0; }
   async download(url: URL, options: MediaDownloadOptions, maxBytes: number, parentSignal: AbortSignal): Promise<Buffer> {
     parentSignal.throwIfAborted();
@@ -32,7 +34,7 @@ export class OutgoingMediaCache {
       if (cached.bytes.length > maxBytes) throw new Error('File exceeds maximum size');
       this.items.delete(key); this.items.set(key, cached); return Buffer.from(cached.bytes);
     }
-    const bytes = await downloadMedia(url, options, maxBytes, parentSignal);
+    const bytes = await downloadMedia(url, options, maxBytes, parentSignal, this.proxySettings);
     parentSignal.throwIfAborted();
     if (options.cache !== false && bytes.length <= this.capacity && generation === this.generation) {
       const previous = this.items.get(key); if (previous) { this.bytes -= previous.bytes.length; this.items.delete(key); }
@@ -45,11 +47,13 @@ export class OutgoingMediaCache {
   }
 }
 
-export async function downloadMedia(url: URL, options: MediaDownloadOptions, maxBytes: number, parentSignal: AbortSignal): Promise<Buffer> {
+export async function downloadMedia(url: URL, options: MediaDownloadOptions, maxBytes: number, parentSignal: AbortSignal,
+  proxySettings?: AppConfig['network']): Promise<Buffer> {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid media URL');
   const signal = options.timeout === undefined ? parentSignal : AbortSignal.any([parentSignal, AbortSignal.timeout(Math.ceil(options.timeout * 1000))]);
   signal.throwIfAborted();
-  const dispatcher = options.proxy === false ? new Agent() : new EnvHttpProxyAgent();
+  // Pass all three values (including empty strings) so saved settings never fall back to process env.
+  const dispatcher = options.proxy === false ? new Agent() : new EnvHttpProxyAgent(proxySettings);
   let response: Response | undefined;
   try {
     response = await fetch(url, { signal, dispatcher } as RequestInit);

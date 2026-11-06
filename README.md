@@ -42,7 +42,7 @@ pnpm exec playwright install chromium
 cp .env.example .env
 ```
 
-编辑 `.env` 中的通道地址和令牌。本机 Node 连接同一台机器上的机器人时，将 `ONEBOT_REVERSE_WS_URL` 改为机器人的实际地址，例如 `ws://127.0.0.1:6700/onebot/v11/ws`。Linux 可用 `pnpm exec playwright install --with-deps chromium` 安装浏览器及系统依赖；ffmpeg / ffprobe 需另外安装。
+启动后在控制台「网络配置」设置通道地址和令牌。本机 Node 连接同一台机器上的机器人时，反向 WebSocket 地址可填写 `ws://127.0.0.1:6700/onebot/v11/ws`，以机器人实际配置为准。需要预置时可取消 `.env` 中相应首次导入项的注释。Linux 可用 `pnpm exec playwright install --with-deps chromium` 安装浏览器及系统依赖；ffmpeg / ffprobe 需另外安装。
 
 生产运行先打包：
 
@@ -85,6 +85,8 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 
 为兼容现有部署，Compose 服务名仍为 `douyin-onebot`，默认数据卷仍为 `douyin-onebot-data`。卷内 `/data` 保存登录资料、通道配置、消息和媒体缓存。`docker compose down` 保留数据，`down -v` 会删除数据卷。**旧版 `./data` 绑定目录不会自动迁入命名卷**，升级前按[数据迁移说明](guide/deployment.md#docker)处理。
 
+应用运行参数在首次启动时从 `.env` / YAML 导入，缺失项使用默认值，然后保存为 `/data/config/settings.json`（本机为 `data/config/settings.json`）。后续启动只读取保存的设置，不再从 env 覆盖。日志、消息处理、缓存、超时和下载代理在控制台「设置」修改，保存后重启服务生效；OneBot 地址与令牌在「网络配置」即时管理。Compose 仅保留容器部署参数和首次初始化的固定路径/端口，需要 Docker Compose 2.24+。
+
 多架构构建和代理参数放在 `.build.env`，参考 [`.build.env.example`](.build.env.example)。脚本支持 `push`、`load`、`cache` 及 `--dry-run`；使用方法见[镜像构建与代理](guide/deployment.md#镜像构建与代理)。若使用自己已发布的镜像，在 `.env` 设置对应仓库和标签，执行 `docker compose pull` 后启动即可。
 
 ## 接入机器人
@@ -113,11 +115,11 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 
 | 文件 | 用途 |
 | --- | --- |
-| [`.env.example`](.env.example) → `.env` | 本机运行及 Compose 配置，每个变量均有用途与范围注释 |
+| [`.env.example`](.env.example) → `.env` | 容器部署与应用首次导入配置，每个变量均有用途与范围注释 |
 | [`.build.env.example`](.build.env.example) → `.build.env` | 镜像仓库、平台、输出方式和构建代理 |
 | [`config/config.example.yaml`](config/config.example.yaml) | 应用默认配置，可通过 `DOUYIN_ONEBOT_CONFIG` 指定其他文件 |
 
-本机配置优先级为**进程环境变量 > env 文件 > YAML**。默认读 `.env`，不存在时兼容 `.env.astrbot`；可通过进程环境变量 `DOUYIN_ONEBOT_ENV_FILE` 指定其他文件。Docker 的内部端口、路径和无头浏览器配置由 Compose 固定，`.env` 中相关变量的作用范围以注释为准。
+仅首次导入遵循**进程环境变量 > env 文件 > YAML > 内置默认值**。本机默认读 `.env`，不存在时兼容 `.env.astrbot`；首次导入可通过 `DOUYIN_ONEBOT_ENV_FILE` 指定其他文件。之后以 `settings.json` 和控制台保存的通道配置为准。Docker 的端口映射、数据卷与容器资源限制仍由 Compose 管理。
 
 登录资料、令牌和数据目录应持久保留；`.dockerignore` 会将它们排除在镜像构建上下文之外。更名沿用原配置变量和目录，已有部署无需重建登录资料，详见[更名兼容说明](guide/deployment.md#更名后的兼容性)。
 
@@ -132,15 +134,17 @@ pnpm test       # 自动打包前端后运行测试
 
 管理台按运行概览、抖音账号、网络配置、日志和设置组织，提供通道搜索、实时日志以及管理账号修改。界面保留狐橙配色，操作区直接展示状态和配置。
 
+在「设置」保存修改后，可点击「重启服务」。MeloFox 会关闭通道和 Chromium、保存缓存，随后启动新进程并加载已保存的设置；本机与 Docker 均可使用。页面等待服务恢复后返回管理台登录页，已保存的抖音登录资料继续保留。
+
 日志页与终端使用同一份后端日志，每秒增量更新，支持级别筛选、关键词搜索、暂停显示、自动滚动和下载当前筛选结果。服务端仅保留本次运行最近最多 1,000 条日志（同时限制为约 4 MiB），重启后重新开始；需要长期留存时使用 Docker 日志或进程管理器的日志配置。「清空视图」只影响当前页面。
 
-默认日志格式为 `时间 [级别] [模块] 内容`，收发消息显示方向、私聊或群聊对象与最多 180 字符的摘要，媒体显示类型。设置 `APP_LOG_MESSAGE_CONTENT=false` 可隐藏消息内容，只显示对象和类型；令牌、Cookie、密码等凭据字段统一脱敏。`APP_LOG_FORMAT=json` 可切换终端为结构化日志，管理台仍按可读格式显示；`APP_LOG_LEVEL` 同时控制终端与管理台的日志级别。
+默认日志格式为 `时间 [级别] [模块] 内容`，收发消息显示方向、私聊或群聊对象与最多 180 字符的摘要，媒体显示类型。在「设置 → 消息与日志」关闭消息摘要可隐藏内容，只显示对象和类型；令牌、Cookie、密码等凭据字段统一脱敏。该页面还可将终端日志切换为 JSON，并统一调整终端与管理台的日志级别；保存后重启服务生效。
 
 概览展示当前抖音账号的昵称与头像、完整系统信息、CPU 总体及逐核使用率、MeloFox 主进程和 Chromium 进程组的 CPU / 常驻内存、JS 堆、磁盘、网卡及四类通道统计。通道总数等于就绪、等待、异常、停用四类之和。资源指标每 2 秒采样，页面每 4 秒刷新；不可用或过期的数据会明确标示。深色主题使用深墨色卡片、明亮文字与狐狸橙强调色，支持毛玻璃和减少透明度偏好。统计范围见[概览指标说明](guide/deployment.md#概览指标)。
 
 页面组织参考 [NapCat WebUI](https://github.com/NapNeko/NapCatQQ/tree/main/packages/napcat-webui-frontend) 和 [SnowLuma WebUI](https://github.com/SnowLuma/SnowLuma/tree/main/packages/webui)，按 MeloFox 的抖音会话与 OneBot 通道功能实现。
 
-管理台使用 Vue 3、TypeScript 和 Vue Router。`pnpm dev` 支持前端热更新；修改后端、env 或 Vite 配置需要重启。生产环境由 Node 直接提供 `dist/web/public/` 静态资源，无需单独运行 Vite 或依赖外部 CDN。页面使用 Hash 路由，支持刷新和浏览器前进、返回。
+管理台使用 Vue 3、TypeScript 和 Vue Router。`pnpm dev` 支持前端热更新；修改后端或 Vite 配置需要重启；运行参数在设置页保存后重启生效，旧 env 不再覆盖。生产环境由 Node 直接提供 `dist/web/public/` 静态资源，无需单独运行 Vite 或依赖外部 CDN。页面使用 Hash 路由，支持刷新和浏览器前进、返回。
 
 部署时必须携带构建产物。将产物复制到其他机器、仅安装生产依赖的步骤见[本机生产部署](guide/deployment.md#本机生产部署)。
 

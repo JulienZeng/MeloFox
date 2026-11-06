@@ -29,6 +29,8 @@ export function createConsole() {
     editor: undefined as { id?: string; initial?: ChannelInput } | undefined,
     deleting: undefined as ConsoleChannel | undefined,
     assist: false,
+    restartDialog: false,
+    restarting: false,
     pendingChannels: new Set<string>(),
     toast: undefined as { message: string; error: boolean } | undefined,
   });
@@ -83,7 +85,7 @@ export function createConsole() {
     }, 4000);
   }
   async function refresh() {
-    if (!state.authenticated || state.auth?.mustChangePassword) return false;
+    if (!state.authenticated || state.auth?.mustChangePassword || state.restarting) return false;
     const id = ++refreshId,
       loginAtStart = loginVersion;
     state.refreshBusy = true;
@@ -207,6 +209,7 @@ export function createConsole() {
   }
   async function pollLogin(manual = false) {
     if (
+      state.restarting ||
       !state.login ||
       state.loginBusy ||
       loginPolling ||
@@ -296,6 +299,15 @@ export function createConsole() {
       ? { id: channel.id, initial: channelInput(channel) }
       : {};
   }
+  function prepareServiceRestart() {
+    state.restarting = true;
+    api.reset();
+    refreshId++;
+    loginVersion++;
+    state.refreshBusy = false;
+    state.loginBusy = false;
+    closeDialogs();
+  }
   function start(isAccountView: () => boolean) {
     void restoreSession();
     const statusTimer = setInterval(() => {
@@ -336,6 +348,7 @@ export function createConsole() {
     toggleChannel,
     openChannel,
     closeDialogs,
+    prepareServiceRestart,
     start,
   };
 }

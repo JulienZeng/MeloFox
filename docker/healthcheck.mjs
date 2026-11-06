@@ -1,8 +1,8 @@
-import { loadConfig } from '../dist/config/index.js';
+import { readSavedConfig } from '../dist/config/settings.js';
 
 // 只检查管理服务或 HTTP 监听存活；未扫码、IM 离线不等于容器进程损坏。
 try {
-  const config = loadConfig();
+  const config = await readSavedConfig();
   const web = config.web.enabled;
   if (!web && !config.onebot.http.enabled) process.exit(0); // 无 HTTP 入口时跳过。
   const port = web ? config.web.port : config.onebot.http.port;

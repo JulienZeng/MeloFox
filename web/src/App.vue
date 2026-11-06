@@ -10,6 +10,7 @@ import ThemeControl from "./components/ThemeControl.vue";
 import ChannelDialog from "./components/ChannelDialog.vue";
 import DeleteChannelDialog from "./components/DeleteChannelDialog.vue";
 import AssistDialog from "./components/AssistDialog.vue";
+import RestartServiceDialog from "./components/RestartServiceDialog.vue";
 
 const store = createConsole(),
   { state } = store;
@@ -151,6 +152,7 @@ onUnmounted(() => {
     <AssistDialog v-if="state.assist" />
   </div>
   <main v-else class="auth-screen"><section class="auth-card"><h1>正在连接管理服务</h1><p class="error-text">{{ state.connectionError }}</p><button class="secondary" @click="store.refresh">重试</button><button class="text-button auth-exit" @click="store.logout">退出登录</button></section></main>
+  <RestartServiceDialog v-if="state.restartDialog" />
   <div
     id="toast"
     class="toast"

@@ -26,13 +26,23 @@ pnpm start
 
 目标机器仍需安装 Chromium 的系统依赖及 ffmpeg / ffprobe；登录状态和通道配置继续使用原来的持久数据目录。构建机器先安装完整依赖再运行 `pnpm build`；生产环境仅安装依赖并启动已生成的产物，不在删去开发依赖后执行构建。前端所需的 Vue、路由和构建工具都在构建阶段处理。
 
-## 配置优先级与通道持久化
+## 首次初始化与控制台设置
 
-运行参数参考 [`.env.example`](../.env.example)，构建参数参考 [`.build.env.example`](../.build.env.example)。两个文件用途独立；已有本机 env 直接编辑，不覆盖现有值。
+应用参数只在首次启动时导入：进程环境变量 > `.env`（本机没有时回退 `.env.astrbot`）> 可选 YAML > 内置默认值。未提供 env 或 YAML 也可启动。首次导入可通过进程环境中的 `DOUYIN_ONEBOT_ENV_FILE` 选择 env，通过 `DOUYIN_ONEBOT_CONFIG` 选择 YAML。参数示例见 [`.env.example`](../.env.example)。
 
-本机启动配置优先级为：进程环境变量 > `.env`（没有时回退 `.env.astrbot`）> YAML。默认 YAML 为 `config/config.example.yaml`。可用进程环境中的 `DOUYIN_ONEBOT_ENV_FILE` 选择其他 env，用 `DOUYIN_ONEBOT_CONFIG` 选择其他 YAML。Compose 使用自己的 `.env` 插值机制，只把 `docker-compose.yml` 列出的环境变量传入容器。
+首次启动自动生成 `data/config/settings.json`，Docker 中为 `/data/config/settings.json`。**此文件存在后，后续启动直接读取它，不再加载应用 env 或 YAML；修改旧环境变量不会覆盖设置。** 升级已有部署时自动导入一次当时的配置，保留现有管理账号、通道与抖音登录资料。
 
-首次启动先加载本地环境文件，再将 YAML / 环境变量中的启用通道导入 `data/console/channels.json`。此后以该文件为准，通过网页管理，修改旧的 `ONEBOT_*` 环境变量不会覆盖已有通道。管理台数据目录可用 `WEB_DATA_DIR` 修改。文件包含通道令牌，目录和文件分别以 0700 / 0600 权限创建。
+控制台「设置」提供消息与日志、连接与超时、媒体缓存与转换、消息缓存与队列、下载代理、高级设置。修改后点击「保存设置」，再点击「重启服务」应用；有未保存的修改时须先保存或撤销。多个页面同时编辑时，旧版本提交会被拒绝，避免覆盖较新的设置。
+
+「重启服务」适用于 `pnpm dev`、`pnpm start`、`node dist/index.js` 及 Docker。启动入口保留一个轻量启动进程，收到管理台请求后，业务进程先关闭通道与 Chromium、写入缓存，再退出；启动进程等待其退出后创建新进程，重新加载已保存的设置。容器保持运行，无需挂载 Docker socket。重启会短暂中断消息连接并使管理台登录会话失效，页面自动等待恢复后返回登录页，抖音登录资料不被清除；90 秒内未恢复时可继续等待，并查看终端或容器日志。清理失败时不会直接创建新进程，启动/运行异常仍交由 Docker 或外部进程管理器处理。
+
+也可使用 `docker compose restart douyin-onebot` 或在本机停止后重新启动。Ctrl+C 和容器停止信号会关闭整个服务，不会触发自动重启。OneBot 的 `set_restart` 仍只重建抖音网关会话，不代替管理台的完整服务重启。
+
+管理台监听地址、数据目录和浏览器模式属于首次初始化参数，在「部署信息」只读显示。持久配置目录默认固定为项目目录下的 `data/config`；需要自定义时，在启动进程中持续设置 `MELOFOX_CONFIG_DIR=/实际目录`，不要放进 `.env`，因为后续启动不会读取 `.env`。Docker 已将该定位变量固定为 `/data/config`。这是每次启动用于定位配置文件的唯一应用环境变量。
+
+配置目录与文件分别以 0700 / 0600 权限创建，保存采用原子替换；损坏或不兼容的文件会使启动报错，不会悄悄使用 env 覆盖。备份时同时保留 `settings.json` 和原有持久目录。若需重新导入，先停止服务，备份并移走该文件，再重新启动；保留 `channels.json` 和账号文件可继续沿用原有通道和登录状态。
+
+OneBot 的地址、端口、令牌、签名密钥、启用状态仍在「网络配置」管理，修改即时应用。首次导入的启用通道保存为 `WEB_DATA_DIR/channels.json`，此后以该文件为准。已有通道不会被首次生成运行设置的过程覆盖。
 
 - **HTTP**：提供 OneBot API、媒体下载与原有调试接口。
 - **正向 WebSocket**：本服务监听，应用主动连接。
@@ -41,7 +51,7 @@ pnpm start
 
 图片和视频的媒体下载需要至少一个启用的 HTTP 通道。多个 HTTP 通道共用媒体缓存，对外生成链接时使用列表中第一个启用的 HTTP 通道。机器人在其他设备上时，请将该通道的「媒体公开地址」设为机器人能够访问的地址。监听 `0.0.0.0` 只表示绑定所有网卡，不能作为远程访问地址。
 
-管理台默认监听 `127.0.0.1:3000`，使用 HttpOnly / SameSite 会话 Cookie，登录有效期 12 小时。设置 `WEB_ENABLED=false` 可关闭管理台，恢复完全由 YAML / 环境变量控制的原有启动方式。
+管理台默认监听 `127.0.0.1:3000`，使用 HttpOnly / SameSite 会话 Cookie，登录有效期 12 小时。首次导入时设置 `WEB_ENABLED=false` 可关闭管理台；此模式仍从持久化设置启动，使用其中保存的初始 OneBot 通道配置。
 
 ## 管理账号与首次登录
 
@@ -53,7 +63,7 @@ pnpm start
 
 日常修改在「设置 → 管理账号」进行，需要当前密码，保存后其他登录会话失效。浏览器使用 HttpOnly / SameSite 会话 Cookie，不把密码存到 localStorage。完整会话有效期 12 小时，首次改密会话有效期 10 分钟。
 
-忘记账号或密码时，停止服务，在服务端私下备份并移走 `admin-credentials.json`，确认 `WEB_TOKEN` 或 `admin-token` 中的初始密码后重新启动，再用 `melofox` 完成首次改密。仅处理该凭据文件，保留登录资料、通道和缓存目录。损坏的凭据文件会使管理服务启动失败，不会自动恢复初始密码。
+忘记账号或密码时，停止服务，在服务端私下备份并移走 `admin-credentials.json`，确认或重新设置 `admin-token` 中的初始密码后重新启动（已有运行设置不会重新读取 `WEB_TOKEN`），再用 `melofox` 完成首次改密。仅处理该凭据文件，保留登录资料、通道和缓存目录。损坏的凭据文件会使管理服务启动失败，不会自动恢复初始密码。
 
 ## 概览指标
 
@@ -79,11 +89,11 @@ Chromium 使用当前浏览器实例的 [CDP 会话](https://playwright.dev/docs
 
 ## 日志与连接排查
 
-本机和 Docker 默认使用 `APP_LOG_FORMAT=pretty`，显示可读时间、日志级别、消息及错误详情；非终端输出不带 ANSI 颜色。需要对接日志采集器时设为 `json`。`NODE_ENV=production` 不再切换日志格式，详细程度仍由 `APP_LOG_LEVEL` 控制。修改 Compose 环境变量后需重新创建容器，单纯 `docker restart` 不会更新环境。
+本机和 Docker 默认使用易读文本日志，显示时间、级别、消息及错误详情；非终端输出不带 ANSI 颜色。日志级别、格式和消息摘要在「设置 → 消息与日志」调整，保存后重启服务生效。需要对接日志采集器时选择 JSON。已有设置不会被 Compose 的旧日志环境变量覆盖。
 
 `ECONNREFUSED` 表示反向 WebSocket 目标地址/端口拒绝连接。请在管理台「网络配置」检查反向 WS 地址：同一自定义 Docker 网络可使用机器人服务名与容器内监听端口；不同网络可使用 `host.docker.internal` 与机器人发布到宿主机的端口，例如 `6189:6189` 对应 `ws://host.docker.internal:6189/ws`（路径以机器人配置为准）。机器人必须启动对应 WS 服务，路径和 token 也需匹配。尚未配置机器人时可先禁用该通道；已有通道由管理台持久化，修改 `ONEBOT_REVERSE_WS_URL` 不会覆盖它。连接失败仍按重连间隔重试，相同错误每分钟汇总一次，错误变化或连接恢复会立即记录。通道卡片显示最近一次失败原因及排查方向，连接恢复后清除。
 
-`抖音 IM 请求未完成` / `Failed to fetch` 表示浏览器中的抖音接口请求失败，不能仅凭这条错误判断为未登录或浏览器缺失。先检查管理台抖音登录/验证状态，再检查容器到 `www.douyin.com`、`imapi.douyin.com` 的 DNS、HTTPS 及网络访问；运行期 `HTTP_PROXY` / `HTTPS_PROXY` 当前仅用于媒体下载，不会代理 Chromium。错误详情会保留具体接口及原始原因。管理台已启动时，这类会话错误不会关闭管理服务。
+`抖音 IM 请求未完成` / `Failed to fetch` 表示浏览器中的抖音接口请求失败，不能仅凭这条错误判断为未登录或浏览器缺失。先检查管理台抖音登录/验证状态，再检查容器到 `www.douyin.com`、`imapi.douyin.com` 的 DNS、HTTPS 及网络访问；「设置 → 下载代理」当前仅用于出站媒体 URL 下载，不会代理 Chromium。错误详情会保留具体接口及原始原因。管理台已启动时，这类会话错误不会关闭管理服务。
 
 ## 登录与会话恢复
 
@@ -92,6 +102,8 @@ Chromium 使用当前浏览器实例的 [CDP 会话](https://playwright.dev/docs
 管理服务独立于抖音会话，后台会话启动失败时仍可打开网页管理配置。登录 API 在后台会话就绪后可用。登录凭据保存在 `WEB_DATA_DIR/douyin-session.json`，文件权限为 0600；下次启动先恢复凭据再加载消息服务。`browser.userDataDir` 同时保留 Chromium 运行资料。二维码、手机确认及官方验证由用户完成。官方返回风险验证等错误时，管理台显示原始错误码和说明，不把它当作登录成功。
 
 ## Docker
+
+需要 Docker Compose 2.24+，以支持可选的 `env_file`。Compose 通过可选 `.env` 导入首次配置，不再逐项列出业务参数；没有 `.env` 时直接使用默认值。镜像、端口映射、数据卷、共享内存和日志轮转仍由 Compose 管理。
 
 Dockerfile 基于 `node:24-bookworm-slim`，使用多阶段构建：Node 后端及 Vue 管理台固定在构建机原生架构（`BUILDPLATFORM`）编译，生成跨架构通用的 JS 和静态资源；生产依赖分别在目标架构安装。运行镜像只复制对应架构的生产依赖、`dist/`、协议及配置，不复制编译阶段的 `node_modules`。
 
@@ -112,17 +124,17 @@ docker compose exec douyin-onebot cat /data/console/admin-token
 
 使用已发布镜像时，将 `.env` 的 `IMAGE_NAME` / `IMAGE_TAG` 改为对应仓库和标签，执行 `docker compose pull`、`docker compose up -d --no-build --pull never`，无需在部署机编译。`docker compose build` 使用 Dockerfile 默认构建参数；需要构建代理或覆盖构建参数时使用下方脚本。
 
-打开 http://127.0.0.1:3000，使用 `melofox` 和初始密码登录并完成改密，再在「抖音账号」扫码。Compose 内部端口固定为 3000/3001/3002，`.env` 的 `*_PORT` 控制宿主机端口，`*_BIND` 控制宿主机绑定 IP；本机 Node 部署的 `*_HOST`、数据目录、ffmpeg 路径不覆盖容器内固定值。容器强制无头运行。管理端口默认只绑定宿主机回环地址；远程访问按需修改 `WEB_BIND` 并完成管理账号的首次改密。
+打开 http://127.0.0.1:3000，使用 `melofox` 和初始密码登录并完成改密，再在「抖音账号」扫码。Compose 内部端口固定为 3000/3001/3002，`.env` 的 `*_PORT` 控制宿主机端口，`*_BIND` 控制宿主机绑定 IP；首次导入时，容器的 `*_HOST`、内部端口、数据目录使用 Compose 中的固定值，ffmpeg/ffprobe 路径可在设置页调整。容器强制无头运行。管理端口默认只绑定宿主机回环地址；远程访问按需修改 `WEB_BIND` 并完成管理账号的首次改密。
 
 反向 WS/HTTP 地址必须能从容器访问。机器人在宿主机时可用 `host.docker.internal`；同一个 Docker 网络的机器人可用服务名。`ONEBOT_HTTP_PUBLIC_BASE_URL` 是机器人读取媒体的地址，需要从机器人所在环境访问验证：跨机器填宿主机 IP/域名和映射端口；同网容器可用 `http://douyin-onebot:3001`。机器人在其他容器时，其 `127.0.0.1` 不代表网关。已有管理台通道以持久化配置为准，改 env 只影响首次导入；容器内新增 HTTP/正向 WS 通道时监听 `0.0.0.0`，使用新端口还需增加 Compose 映射。
 
-所有持久状态位于 `/data`：`douyin-profile/`、`media-cache/`、`message-cache/`、`console/`。默认命名卷为 `DOCKER_DATA_VOLUME=douyin-onebot-data`，新卷自动继承镜像目录权限；多实例使用不同卷名和宿主机端口。`docker compose down` 保留数据；`down -v` 会删除该卷。旧版的宿主机 `./data` 绑定目录不会自动迁移：停掉旧容器并备份后，将上述四个目录复制到新卷并设置为 `pwuser` 所有，或通过 Compose override 将 `/data` 继续绑定到原目录，并保证容器用户有写权限；迁移完成前保留原数据。
+所有持久状态位于 `/data`：`config/`、`douyin-profile/`、`media-cache/`、`message-cache/`、`console/`。默认命名卷为 `DOCKER_DATA_VOLUME=douyin-onebot-data`，新卷自动继承镜像目录权限；多实例使用不同卷名和宿主机端口。`docker compose down` 保留数据；`down -v` 会删除该卷。旧版的宿主机 `./data` 绑定目录不会自动迁移：停掉旧容器并备份后，将原有目录及已生成的 `config/` 复制到新卷并设置为 `pwuser` 所有，或通过 Compose override 将 `/data` 继续绑定到原目录，并保证容器用户有写权限；迁移完成前保留原数据。
 
 健康检查只确认管理台 HTTP 或（管理台关闭时）OneBot HTTP 服务可用，不把未扫码/IM 离线视为容器故障；两种 HTTP 入口都关闭时跳过探测。`unhealthy` 是诊断状态，Docker 不会仅因该状态自动重启容器；`restart: unless-stopped` 处理进程退出后的重启。`docker compose ps` 查看状态，`docker compose logs --tail=100` 查看日志。共享内存、停止宽限、日志轮转均可通过已注释的 Docker 环境变量调整。
 
 ### 镜像构建与代理
 
-首次复制 `.build.env.example` 为 `.build.env`，修改镜像仓库、标签及平台。该文件由 Bash `source` 加载，按文件中注释配置；运行配置留在 `.env`。已有 `.build.env` 可直接补充新参数，不需要覆盖本机仓库或代理值。
+首次复制 `.build.env.example` 为 `.build.env`，修改镜像仓库、标签及平台。该文件由 Bash `source` 加载，按文件中注释配置；应用运行参数通过控制台管理，`.env` 仅用于首次导入和容器部署。已有 `.build.env` 可直接补充新参数，不需要覆盖本机仓库或代理值。
 
 ```sh
 ./build-multiarch.sh --dry-run  # 校验参数并预览，代理值脱敏，不调用 Docker
@@ -137,7 +149,7 @@ BUILD_ENV_FILE=/path/to/build.env ./build-multiarch.sh
 
 已有构建器不会被自动重建，修改其拉取代理需手动配置该构建器；Docker daemon 拉取 BuildKit 镜像的代理由 Docker 设置控制，BuildKit 拉取基础镜像及推送镜像使用构建器自身的网络与代理。[Docker 代理构建参数](https://docs.docker.com/build/building/variables/#proxy-arguments)不会写成最终镜像的 `ENV`；私有仓库登录使用 Docker 凭据管理，不在 env 中填写登录密码。
 
-运行期媒体下载代理独立配置在 `.env`；它不自动代理浏览器或 OneBot 连接。`.dockerignore` 使用白名单，登录态、所有 env、令牌、抓包和缓存不进入构建上下文。示例 env 的每个变量都附有用途、范围或单位说明。
+运行期媒体下载代理在控制台「设置 → 下载代理」管理，首次启动可从 `.env` 导入；保存后的代理值（包括留空直连）会覆盖旧进程环境，不自动代理浏览器或 OneBot 连接。`.dockerignore` 使用白名单，登录态、所有 env、令牌、抓包和缓存不进入构建上下文。示例 env 的每个变量都附有用途、范围或单位说明。
 
 ## 更名后的兼容性
 

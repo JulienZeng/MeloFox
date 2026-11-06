@@ -41,6 +41,7 @@ RUN pnpm install --prod --frozen-lockfile --registry="${NPM_REGISTRY}" \
 FROM ${NODE_IMAGE} AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
+    MELOFOX_CONFIG_DIR=/data/config \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
@@ -74,7 +75,7 @@ COPY --from=build --chown=pwuser:pwuser /app/dist ./dist
 COPY --chown=pwuser:pwuser proto ./proto
 COPY --chown=pwuser:pwuser config/config.example.yaml ./config/config.example.yaml
 COPY --chown=pwuser:pwuser docker/healthcheck.mjs ./docker/healthcheck.mjs
-RUN mkdir -p /data/douyin-profile /data/media-cache /data/message-cache /data/console \
+RUN mkdir -p /data/config /data/douyin-profile /data/media-cache /data/message-cache /data/console \
   && chown -R pwuser:pwuser /data
 
 USER pwuser

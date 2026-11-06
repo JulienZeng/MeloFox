@@ -3,6 +3,7 @@ import { buildInteractiveEmoji } from './interactive-emoji.js';
 import { dyCommandReply, isDyCommand } from './local-command.js';
 import { buildGroupCard } from './group-card.js';
 import { OutgoingMediaCache } from '../media/outgoing.js';
+import type { AppConfig } from '../config/index.js';
 import { groupNotices, modifiedGroupMembers, removedAdminNotices, type DouyinGroupNotice } from './group-notice.js';
 import { prepareForward, readForwardRecords } from './forward.js';
 import { buildLocationContent } from './card-compat.js';
@@ -84,6 +85,7 @@ export function createDouyinBridgeCache(limit = 10000, ttlMs = 7 * 86400000): Do
 }
 
 export interface DouyinBridgeOptions {
+  mediaProxy?: AppConfig['network'];
   requestRestart?: (delayMs: number) => void;
   enableDomMessageCapture?: boolean;
   logMessageContent?: boolean;
@@ -109,7 +111,7 @@ export class DouyinBridge {
   reportDeferredActionFailure(action: string, retcode: number): void {
     this.logger.warn({ action, retcode }, 'OneBot 异步操作失败，不自动重试');
   }
-  private readonly outgoingMedia = new OutgoingMediaCache();
+  private readonly outgoingMedia: OutgoingMediaCache;
   clearOutgoingMediaCache(): void { this.outgoingMedia.clear(); }
 
   private readonly stickerCatalog = new BoundedCache<{ accountId: string; message: NativeMessageContent }>(1000, 3600000, Date.now, false);
@@ -146,6 +148,7 @@ export class DouyinBridge {
     private readonly options: DouyinBridgeOptions = {}
   ) {
     this.logger = scopedLogger(logger, '抖音');
+    this.outgoingMedia = new OutgoingMediaCache(undefined, undefined, options.mediaProxy);
     this.identitySecurity = new IdentitySecurityProvider(page, () => this.accountId);
     this.cache = options.cache ?? createDouyinBridgeCache(options.messageCacheLimit, options.messageCacheTtlMs);
     this.messageCache = this.cache.messages;
